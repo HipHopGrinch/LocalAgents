@@ -1,0 +1,109 @@
+# LocalAgents Studio - Project History & Technical Overview
+
+## 1. Project Background & Motivation
+**LocalAgents Studio** was created to bridge a critical capability gap in modern AI coding environments: tools like Google Antigravity and Cursor rely heavily on cloud-hosted frontier LLMs and lack first-class native multi-agent execution targeting locally hosted Ollama/vLLM endpoints across a local hardware cluster.
+
+As a multi-GPU power user with diverse local compute available:
+- **Main Rig (Windows Desktop):** NVIDIA GeForce RTX 5070 Ti (16 GB VRAM, ~896 GB/s memory bandwidth)
+- **Linux Server (`ubuntu` / `192.168.1.74`):** NVIDIA GeForce GTX 1080 Ti (11 GB VRAM, ~484 GB/s memory bandwidth)
+- **ROG Laptop (`ROGLaptop` / `192.168.1.80`):** NVIDIA GeForce RTX 3060 Laptop (6 GB VRAM, ~336 GB/s memory bandwidth)
+- **Frontier APIs (Optional Fallback):** Grok / OpenAI API integration when frontier reasoning is explicitly required.
+
+The core goal of LocalAgents Studio is to eliminate costly API token consumption by maximizing local hardware utilization, parallelizing code generation tasks across multiple physical GPU nodes simultaneously, and providing a standalone desktop IDE (built on Electron, React 19, Vite, TailwindCSS, and Monaco Editor) with direct filesystem execution capabilities.
+
+---
+
+## 2. Architecture & Design Principles
+
+### A. Electron & React Dual-Process Architecture
+- **Main Process (`electron/main.cjs`):**
+  - Manages native OS operations, Electron BrowserWindow lifecycle, and IPC handlers.
+  - Safe filesystem access for the explorer (`readFile`, `writeFile`, `createFile`, `createFolder`, `deleteTarget`, `readDir`).
+  - Agent tools are **workspace-scoped** via `tools:exec` (`resolveScoped`) so relative agent paths cannot escape the open folder.
+  - PowerShell child-process execution with streaming output to the Terminal panel (`TerminalPanel.tsx` — command runner, not a full PTY/xterm session).
+  - Cluster status polling (`clusterStatus`) measuring ping latency, active models, and loaded VRAM models across all configured LAN endpoints.
+  - Remote model pull commands (`ollama pull <model>`) via streaming HTTP endpoints on remote nodes.
+  - Automated benchmark engine (`ollama:benchmark`) measuring generation speed (`evalTokPerSec`), prompt processing speed (`promptTokPerSec`), and model load times using a short coding generate prompt (`num_predict: 64`).
+- **Renderer Process (`src/`):**
+  - React 19 + TypeScript + Vite.
+  - Monaco Editor integration for syntax-highlighted multi-tab code editing.
+  - Resizable split pane layout (File Explorer, Monaco Editor + Terminal, Agent Conductor sidebar).
+
+### B. Settings & secrets
+- Settings (including optional Frontier API keys) persist to Electron `userData/settings.json` in **plaintext** on the local machine. Keys are not encrypted and must not be committed or logged.
+
+---
+
+## 3. Major Evolution & Milestones
+
+### Phase 1: Foundations & Cluster Connectivity
+- Configured default node cluster configuration (`main-rig`, `linux-server`, `laptop`) supporting both IP addresses (`192.168.1.74`, `192.168.1.80`) and local DNS hostnames (`ubuntu`, `ROGLaptop`).
+- Built cluster polling logic to detect node online status, ping latency, and running models in real time (merges status without wiping user model toggles / benchmarks).
+- Integrated multi-tab Monaco editor with dirty-state tracking, language detection, and file tree operations.
+
+### Phase 2: Hardware Configuration & Real-Time Benchmarking
+- Added the **Cluster & Hardware Settings** modal (`HardwareSettingsModal.tsx` + `hardware/*` panels):
+  - Hardware specification inputs (CPU, GPU, VRAM, RAM, memory bandwidth).
+  - VRAM estimation calculator computing parameter size, context window memory (`f16`/`q8`/`q4`), and max KV cache limits.
+  - Automated Token/sec benchmark runner; seeded default speeds are marked `provisional: true` until a live benchmark succeeds.
+  - Catalog of recommended models based on hardware specs.
+  - Filtering out non-generative embedding models from code generation dropdowns and benchmarks.
+  - Remote model pull trigger enabling remote endpoints to pull new models from Ollama without needing SSH.
+
+### Phase 3: File System Tooling & Autonomous Execution
+- Designed and implemented the **Autonomous Tool Protocol** (`tools.ts` + `agentLoop.ts`):
+  - `<write_file path="...">` for direct full-file creation.
+  - `<edit_file path="...">` with unified SEARCH/REPLACE diff matching and fuzzy indentation handling.
+  - `<read_file>`, `<list_dir>`, `<search>`, and `<run_command>` (PowerShell; stdout returned to the agent).
+  - **Tool Result Continuation Loop:** Fresh message history + `stripThinking`, auto-apply for writes *and* edits, bounded re-continues (max 2).
+  - **Immutable tool card state** so running/done/error updates reliably in React.
+  - **Universal Fallback Parser:** Markdown fences become writes only when create-intent is detected, an explicit path is present, or the Conductor assigned `expectedFilePath`.
+
+### Phase 4: Conductor & Multi-GPU File Distribution (Current State)
+- File-level work distribution:
+  - **Conductor Role:** Prefers coder/instruct quality models, then measured tok/s (live benchmarks beat provisional seeds).
+  - **Task Decomposition (`buildDecompositionPrompt` / `parseConductorPlan`):** JSON array (tolerates fenced ```json```), validates extensions, dedupes paths.
+  - **Cluster Job Assignment (`assignJobsToCluster`):** Online local nodes only when any are up; ordered by measured speed then bandwidth; offline assignments surfaced in the UI.
+  - **User-Controlled Node Models:** Per-node ON/OFF toggles and default model selectors; soft `roles` tags for auto-routing.
+  - **Resizable Explorer & Agent Sidebars:** Persistent layout widths in settings.
+  - Local-first: no automatic frontier escalation.
+
+---
+
+## 4. Key Source Code Map
+
+| File Path | Description |
+|---|---|
+| [`electron/main.cjs`](electron/main.cjs) | Electron main process, IPC tools, PowerShell, cluster pinging, and benchmarks. |
+| [`electron/preload.cjs`](electron/preload.cjs) | Context-bridge API for the sandboxed renderer. |
+| [`src/types.ts`](src/types.ts) | Core TypeScript types for nodes, benchmarks, tool calls, chat messages, and settings. |
+| [`src/config/defaults.ts`](src/config/defaults.ts) | Default nodes, roles, personas, and settings. |
+| [`src/lib/tools.ts`](src/lib/tools.ts) | System prompts, parsers, diff patcher, Conductor decomposition, and cluster assignment. |
+| [`src/lib/agentLoop.ts`](src/lib/agentLoop.ts) | Immutable tool execution, auto-apply, continuation helpers. |
+| [`src/lib/ollamaClient.ts`](src/lib/ollamaClient.ts) | Streaming chat client (Ollama + OpenAI-compatible Frontier). |
+| [`src/components/AgentChat.tsx`](src/components/AgentChat.tsx) | Agent Conductor chat, pipeline dispatch, tool review cards. |
+| [`src/components/agent/ToolActionCard.tsx`](src/components/agent/ToolActionCard.tsx) | Per-tool apply / preview UI. |
+| [`src/components/HardwareSettingsModal.tsx`](src/components/HardwareSettingsModal.tsx) | Node settings shell; delegates hub/installed-model panels. |
+| [`src/components/hardware/`](src/components/hardware/) | Model hub + installed models / benchmark / pull UI. |
+| [`src/components/FileTree.tsx`](src/components/FileTree.tsx) | Workspace file tree explorer with drag-resizable width support. |
+| [`src/components/EditorView.tsx`](src/components/EditorView.tsx) | Multi-tab Monaco editor with dirty indicator and file save triggers. |
+| [`src/components/TerminalPanel.tsx`](src/components/TerminalPanel.tsx) | Embedded PowerShell command runner with streaming output. |
+| [`src/App.tsx`](src/App.tsx) | Top-level state, cluster poll merge, scoped agent writes, layout. |
+
+---
+
+## 5. Development & Run Commands
+
+```powershell
+# Install dependencies
+npm install
+
+# Type-check TypeScript
+npx tsc --noEmit
+
+# Production build
+npm run build
+
+# Run Electron desktop app in development
+npm run dev
+```

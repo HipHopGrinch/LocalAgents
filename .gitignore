@@ -1,0 +1,27 @@
+# Dependencies & build
+node_modules/
+dist/
+*.local
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+**/secrets/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.log
+
+# Electron / Vite caches
+.vite/
+out/
+release/
+*.asar

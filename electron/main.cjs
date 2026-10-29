@@ -1,0 +1,1039 @@
+// LocalAgents Studio - Electron main process
+// Owns everything privileged: filesystem, PowerShell, and all network calls to Ollama nodes.
+// The renderer runs sandboxed with webSecurity on and talks to this file only via IPC (see preload.cjs).
+
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const { spawn, execFile } = require('child_process');
+
+let mainWindow = null;
+
+// ==========================================
+// WINDOW
+// ==========================================
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1500,
+    height: 920,
+    minWidth: 1100,
+    minHeight: 640,
+    backgroundColor: '#18181b',
+    title: 'LocalAgents Studio',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true
+    }
+  });
+
+  const distIndex = path.join(__dirname, '../dist/index.html');
+  if (process.env.VITE_DEV_SERVER === 'true' || !fs.existsSync(distIndex)) {
+    mainWindow.loadURL('http://localhost:5173');
+  } else {
+    mainWindow.loadFile(distIndex);
+  }
+
+  // Forward renderer errors to the terminal that launched the app (helps debugging packaged builds)
+  mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level >= 3) console.error(`[renderer] ${message} (${sourceId}:${line})`);
+  });
+
+  // Open external links in the default browser instead of inside the app
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+}
+
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => {
+  killAllProcesses();
+  app.quit();
+});
+
+const send = (channel, payload) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+};
+
+// ==========================================
+// SETTINGS PERSISTENCE (userData/settings.json)
+// ==========================================
+
+const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
+
+ipcMain.handle('settings:load', async () => {
+  try {
+    return JSON.parse(await fsp.readFile(settingsPath(), 'utf-8'));
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle('settings:save', async (_e, settings) => {
+  try {
+    const tmp = settingsPath() + '.tmp';
+    await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
+    await fsp.rename(tmp, settingsPath()); // atomic replace
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('settings:path', () => settingsPath());
+
+// ==========================================
+// USER-DRIVEN FILESYSTEM (explorer / editor)
+// ==========================================
+
+const IGNORED_DIRS = new Set([
+  '.git', 'node_modules', 'dist', 'dist-electron', 'build', 'out', '.next', '.nuxt', 'target',
+  '__pycache__', '.venv', 'venv', '.mypy_cache', '.pytest_cache', '.idea', '.vs', 'coverage', '.turbo', '.cache'
+]);
+
+async function readDirSorted(dirPath) {
+  const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+  return entries
+    .filter(e => !(e.isDirectory() && IGNORED_DIRS.has(e.name)))
+    .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1))
+    .map(e => ({ name: e.name, path: path.join(dirPath, e.name), isDirectory: e.isDirectory() }));
+}
+
+ipcMain.handle('workspace:select-folder', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory', 'createDirectory'] });
+  return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+});
+
+ipcMain.handle('workspace:default', () => process.cwd());
+
+ipcMain.handle('fs:read-dir', async (_e, dirPath) => {
+  try {
+    return await readDirSorted(dirPath);
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:read-file', async (_e, filePath) => {
+  try {
+    const stat = await fsp.stat(filePath);
+    if (stat.size > 5 * 1024 * 1024) return { error: `File too large to open (${(stat.size / 1048576).toFixed(1)} MB)` };
+    const buf = await fsp.readFile(filePath);
+    if (isBinary(buf)) return { error: 'Binary file - not opened in editor' };
+    return { content: buf.toString('utf-8') };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:write-file', async (_e, filePath, content) => {
+  try {
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    await fsp.writeFile(filePath, content, 'utf-8');
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:create-file', async (_e, filePath) => {
+  try {
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    if (!fs.existsSync(filePath)) await fsp.writeFile(filePath, '', 'utf-8');
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:create-folder', async (_e, folderPath) => {
+  try {
+    await fsp.mkdir(folderPath, { recursive: true });
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:delete', async (_e, targetPath) => {
+  try {
+    // Send to Recycle Bin rather than hard-deleting
+    await shell.trashItem(targetPath);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('fs:reveal', (_e, targetPath) => {
+  shell.showItemInFolder(targetPath);
+});
+
+function isBinary(buf) {
+  const len = Math.min(buf.length, 8000);
+  for (let i = 0; i < len; i++) if (buf[i] === 0) return true;
+  return false;
+}
+
+// ==========================================
+// AGENT TOOLS (always scoped to the workspace root)
+// ==========================================
+
+function resolveScoped(root, p) {
+  if (!root) throw new Error('No workspace folder is open');
+  const abs = path.resolve(root, (p || '.').replace(/^[\\/]+(?=[^\\/])/, ''));
+  const rel = path.relative(root, abs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Path "${p}" is outside the workspace. Agent tools are restricted to ${root}`);
+  }
+  return abs;
+}
+
+const MAX_READ_CHARS = 60000;
+
+async function toolReadFile(root, args) {
+  const abs = resolveScoped(root, args.path);
+  const buf = await fsp.readFile(abs);
+  if (isBinary(buf)) throw new Error('File is binary');
+  const text = buf.toString('utf-8');
+  if (args.raw) return { content: text, path: abs };
+
+  const lines = text.split(/\r?\n/);
+  const start = Math.max(1, parseInt(args.start, 10) || 1);
+  const end = Math.min(lines.length, parseInt(args.end, 10) || lines.length);
+  let body = lines.slice(start - 1, end).join('\n');
+  let note = '';
+  if (body.length > MAX_READ_CHARS) {
+    body = body.slice(0, MAX_READ_CHARS);
+    note = `\n[truncated at ${MAX_READ_CHARS} chars - use start/end to read further]`;
+  }
+  const range = start === 1 && end === lines.length ? `${lines.length} lines` : `lines ${start}-${end} of ${lines.length}`;
+  return { content: `${args.path} (${range})\n${body}${note}`, path: abs };
+}
+
+async function toolListDir(root, args) {
+  const base = resolveScoped(root, args.path);
+  const maxDepth = Math.min(Math.max(parseInt(args.depth, 10) || 2, 1), 5);
+  const out = [];
+  let count = 0;
+  async function walk(dir, depth, indent) {
+    if (count > 600) return;
+    let entries;
+    try {
+      entries = await readDirSorted(dir);
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (++count > 600) {
+        out.push(`${indent}... (listing truncated)`);
+        return;
+      }
+      if (e.isDirectory) {
+        out.push(`${indent}${e.name}/`);
+        if (depth < maxDepth) await walk(e.path, depth + 1, indent + '  ');
+      } else {
+        let size = '';
+        try {
+          size = ` (${formatBytes((await fsp.stat(e.path)).size)})`;
+        } catch {}
+        out.push(`${indent}${e.name}${size}`);
+      }
+    }
+  }
+  await walk(base, 1, '');
+  return { content: out.length ? out.join('\n') : '(empty directory)' };
+}
+
+async function toolSearch(root, args) {
+  const base = resolveScoped(root, args.path);
+  const query = args.query || '';
+  if (!query) throw new Error('search requires a query');
+  const useRegex = String(args.regex).toLowerCase() === 'true';
+  let re;
+  try {
+    re = useRegex ? new RegExp(query, 'i') : null;
+  } catch (err) {
+    throw new Error(`Invalid regex: ${err.message}`);
+  }
+  const needle = query.toLowerCase();
+  const results = [];
+  let filesScanned = 0;
+  const MAX_RESULTS = 150;
+
+  async function walk(dir) {
+    if (results.length >= MAX_RESULTS || filesScanned > 25000) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (results.length >= MAX_RESULTS) return;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!IGNORED_DIRS.has(e.name)) await walk(full);
+        continue;
+      }
+      filesScanned++;
+      try {
+        const stat = await fsp.stat(full);
+        if (stat.size > 1024 * 1024) continue;
+        const buf = await fsp.readFile(full);
+        if (isBinary(buf)) continue;
+        const lines = buf.toString('utf-8').split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (re ? re.test(line) : line.toLowerCase().includes(needle)) {
+            results.push(`${path.relative(root, full)}:${i + 1}: ${line.trim().slice(0, 220)}`);
+            if (results.length >= MAX_RESULTS) break;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  const stat = await fsp.stat(base);
+  if (stat.isFile()) {
+    filesScanned = 0;
+    const lines = (await fsp.readFile(base, 'utf-8')).split(/\r?\n/);
+    lines.forEach((line, i) => {
+      if (re ? re.test(line) : line.toLowerCase().includes(needle)) results.push(`${path.relative(root, base)}:${i + 1}: ${line.trim()}`);
+    });
+  } else {
+    await walk(base);
+  }
+  const suffix = results.length >= MAX_RESULTS ? `\n[stopped after ${MAX_RESULTS} matches - narrow the query or path]` : '';
+  return { content: results.length ? results.join('\n') + suffix : `No matches for "${query}"` };
+}
+
+async function toolWriteFile(root, args) {
+  const abs = resolveScoped(root, args.path);
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  await fsp.writeFile(abs, args.content ?? '', 'utf-8');
+  return { content: `Wrote ${formatBytes(Buffer.byteLength(args.content ?? ''))} to ${args.path}`, path: abs };
+}
+
+ipcMain.handle('tools:exec', async (_e, root, name, args) => {
+  try {
+    switch (name) {
+      case 'read_file': return await toolReadFile(root, args);
+      case 'list_dir': return await toolListDir(root, args);
+      case 'search': return await toolSearch(root, args);
+      case 'write_file': return await toolWriteFile(root, args);
+      case 'resolve': return { path: resolveScoped(root, args.path) };
+      case 'exists': return { exists: fs.existsSync(resolveScoped(root, args.path)) };
+      case 'run_command': {
+        const res = await runPowerShell(args.command, root, {
+          timeoutMs: (args.timeoutSec || 120) * 1000,
+          echo: true,
+          capture: true
+        });
+        const tail = res.output.length > 12000 ? '[...output truncated...]\n' + res.output.slice(-12000) : res.output;
+        return {
+          content: `Exit code: ${res.code}${res.timedOut ? ' (timed out and was killed)' : ''}\n${tail || '(no output)'}`,
+          exitCode: res.code
+        };
+      }
+      case 'read_terminal': {
+        const snap = getTerminalSnapshot(args.maxChars || 16000);
+        if (args.lines) {
+          const n = Math.min(Math.max(Number(args.lines) || 80, 1), 500);
+          const lines = snap.content.split(/\r?\n/);
+          const sliced = lines.slice(-n).join('\n');
+          return {
+            content: `Terminal (last ${Math.min(n, lines.length)} lines${snap.running ? ', process running' : ''}):\n${sliced}`
+          };
+        }
+        return {
+          content: `Terminal (${snap.chars} chars${snap.running ? ', process running' : ''}):\n${snap.content}`
+        };
+      }
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// ==========================================
+// POWERSHELL EXECUTION
+// ==========================================
+
+const activeProcs = new Set();
+const TERMINAL_BUF_MAX = 200000;
+let terminalBuffer = '';
+
+function appendTerminalBuffer(text) {
+  if (!text) return;
+  terminalBuffer += text;
+  if (terminalBuffer.length > TERMINAL_BUF_MAX) {
+    terminalBuffer = terminalBuffer.slice(-TERMINAL_BUF_MAX);
+  }
+}
+
+function echoTerminal(text) {
+  appendTerminalBuffer(text);
+  send('terminal:output', text);
+}
+
+function getTerminalSnapshot(maxChars = 12000) {
+  const limit = Math.min(Math.max(Number(maxChars) || 12000, 500), 50000);
+  const text =
+    terminalBuffer.length > limit ? terminalBuffer.slice(-limit) : terminalBuffer;
+  return {
+    content: text || '(terminal is empty)',
+    running: activeProcs.size > 0,
+    chars: text.length
+  };
+}
+
+function killTree(proc) {
+  if (!proc || proc.exitCode !== null) return;
+  // proc.kill() on Windows does not kill grandchildren (npm, node, python...). taskkill /T does.
+  execFile('taskkill', ['/PID', String(proc.pid), '/T', '/F'], () => {});
+}
+
+function killAllProcesses() {
+  for (const p of activeProcs) killTree(p);
+  activeProcs.clear();
+}
+
+function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = false } = {}) {
+  return new Promise(resolve => {
+    let output = '';
+    let timedOut = false;
+    const wrapped = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
+    let proc;
+    try {
+      proc = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', wrapped], {
+        cwd: cwd && fs.existsSync(cwd) ? cwd : process.cwd(),
+        env: process.env,
+        windowsHide: true
+      });
+    } catch (err) {
+      return resolve({ code: -1, output: err.message, timedOut });
+    }
+    activeProcs.add(proc);
+    if (echo) echoTerminal(`\n> ${command}\n`);
+
+    const onData = data => {
+      const text = data.toString();
+      if (capture) output += text;
+      if (echo) echoTerminal(text);
+    };
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+
+    const timer = timeoutMs > 0 ? setTimeout(() => { timedOut = true; killTree(proc); }, timeoutMs) : null;
+
+    proc.on('close', code => {
+      if (timer) clearTimeout(timer);
+      activeProcs.delete(proc);
+      if (echo) echoTerminal(`\n[exit ${code}]\n`);
+      send('terminal:state', { running: activeProcs.size > 0 });
+      resolve({ code, output, timedOut });
+    });
+    proc.on('error', err => {
+      if (timer) clearTimeout(timer);
+      activeProcs.delete(proc);
+      resolve({ code: -1, output: output + err.message, timedOut });
+    });
+    send('terminal:state', { running: true });
+  });
+}
+
+ipcMain.handle('terminal:execute', async (_e, command, cwd) => {
+  const res = await runPowerShell(command, cwd, { echo: true });
+  return { code: res.code };
+});
+
+ipcMain.handle('terminal:kill', () => {
+  const had = activeProcs.size > 0;
+  killAllProcesses();
+  send('terminal:state', { running: false });
+  return { success: had };
+});
+
+ipcMain.handle('terminal:getBuffer', (_e, opts) => getTerminalSnapshot(opts?.maxChars));
+
+ipcMain.handle('terminal:clearBuffer', () => {
+  terminalBuffer = '';
+  return { success: true };
+});
+
+// ==========================================
+// OLLAMA CLUSTER (all network I/O happens here, never in the renderer)
+// ==========================================
+
+async function fetchJson(url, { timeoutMs = 2500, method = 'GET', body } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method,
+      signal: controller.signal,
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text().catch(() => '')}`.trim());
+    const text = await resp.text();
+    return text ? JSON.parse(text) : {};
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function nodeStatus(node) {
+  const url = (node.url || '').replace(/\/+$/, '');
+  const started = Date.now();
+
+  // 1. OpenAI-compatible Frontier endpoint (Grok, OpenRouter, OpenAI, etc.)
+  if (node.type === 'openai' || node.apiKey) {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 4000);
+      const headers = { 'Content-Type': 'application/json' };
+      if (node.apiKey) headers['Authorization'] = `Bearer ${node.apiKey}`;
+
+      const resp = await fetch(`${url}/models`, { headers, signal: controller.signal });
+      clearTimeout(t);
+      const latency = Date.now() - started;
+
+      if (resp.ok) {
+        const data = await resp.json();
+        const modelsList = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+        return {
+          online: true,
+          latency,
+          version: 'Frontier API',
+          models: modelsList.map(m => ({
+            name: typeof m === 'string' ? m : (m.id || m.name),
+            size: 0,
+            details: { family: 'Frontier API' }
+          })),
+          loaded: []
+        };
+      }
+      return { online: false, latency: null, models: [], loaded: [], error: `HTTP ${resp.status}` };
+    } catch (err) {
+      return { online: false, latency: null, models: [], loaded: [], error: err.message };
+    }
+  }
+
+  // 2. Local Ollama Node
+  try {
+    const version = await fetchJson(`${url}/api/version`, { timeoutMs: 2000 });
+    const latency = Date.now() - started;
+    const [tags, ps] = await Promise.all([
+      fetchJson(`${url}/api/tags`, { timeoutMs: 4000 }),
+      fetchJson(`${url}/api/ps`, { timeoutMs: 4000 }).catch(() => ({ models: [] }))
+    ]);
+    return {
+      online: true,
+      latency,
+      version: version.version,
+      models: (tags.models || []).map(m => ({
+        name: m.name,
+        size: m.size,
+        details: m.details,
+        capabilities: m.capabilities
+      })),
+      loaded: (ps.models || []).map(m => ({
+        name: m.name,
+        size: m.size,
+        sizeVram: m.size_vram,
+        contextLength: m.context_length,
+        expiresAt: m.expires_at
+      }))
+    };
+  } catch (err) {
+    const msg =
+      err.name === 'AbortError'
+        ? 'Timed out reaching Ollama. On LAN nodes set OLLAMA_HOST=0.0.0.0 and allow TCP 11434 through the firewall.'
+        : /fetch failed|ECONNREFUSED|ENOTFOUND/i.test(err.message || '')
+          ? `${err.message} — confirm Ollama is running and OLLAMA_HOST=0.0.0.0 for remote access (port 11434).`
+          : err.message;
+    return { online: false, latency: null, models: [], loaded: [], error: msg };
+  }
+}
+
+ipcMain.handle('ollama:status', async (_e, nodes) => {
+  // Ping every node in parallel - total wait is the slowest node, not the sum
+  const entries = await Promise.all(nodes.map(async n => [n.id, await nodeStatus(n)]));
+  return Object.fromEntries(entries);
+});
+
+/**
+ * Ollama /api/show — used to discover thinking controls + description after a pull.
+ * thinking.values: [false] means unsupported; [true,false] or named levels means controllable.
+ */
+ipcMain.handle('ollama:show', async (_e, url, model) => {
+  const base = (url || '').replace(/\/+$/, '');
+  try {
+    const show = await fetchJson(`${base}/api/show`, {
+      method: 'POST',
+      body: { model },
+      timeoutMs: 20000
+    });
+    let thinking;
+    if (show.thinking && Array.isArray(show.thinking.values) && show.thinking.values.length > 0) {
+      thinking = { values: show.thinking.values, default: show.thinking.default };
+    } else if (Array.isArray(show.capabilities) && show.capabilities.includes('thinking')) {
+      thinking = { values: [false, true], default: true };
+    }
+    const description =
+      (typeof show.description === 'string' && show.description.trim()) ||
+      (show.details?.family ? `${show.details.family}${show.details.parameter_size ? ` · ${show.details.parameter_size}` : ''}` : undefined);
+    return {
+      capabilities: show.capabilities,
+      description,
+      thinking,
+      details: show.details
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+const streams = new Map(); // requestId -> AbortController
+
+async function streamNdjson(requestId, url, body, channel, onLine) {
+  const controller = new AbortController();
+  streams.set(requestId, controller);
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    if (!resp.ok || !resp.body) {
+      const text = await resp.text().catch(() => '');
+      let msg = text;
+      try { msg = JSON.parse(text).error || text; } catch {}
+      throw new Error(`HTTP ${resp.status}: ${msg}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        let parsed;
+        try { parsed = JSON.parse(line); } catch { continue; }
+        if (parsed.error) throw new Error(parsed.error);
+        onLine(parsed);
+      }
+    }
+    if (buffer.trim()) {
+      try { onLine(JSON.parse(buffer)); } catch {}
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') send(channel, { requestId, type: 'aborted' });
+    else send(channel, { requestId, type: 'error', error: err.message });
+    return false;
+  } finally {
+    streams.delete(requestId);
+  }
+  return true;
+}
+
+async function streamOpenAI(requestId, url, apiKey, body, channel) {
+  const controller = new AbortController();
+  streams.set(requestId, controller);
+  const started = Date.now();
+  let firstTokenTime = 0;
+  let tokenCount = 0;
+
+  try {
+    const endpoint = url.endsWith('/chat/completions') ? url : `${url.replace(/\/+$/, '')}/chat/completions`;
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      let msg = text;
+      try { msg = JSON.parse(text).error?.message || text; } catch {}
+      throw new Error(`HTTP ${resp.status}: ${msg}`);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line || !line.startsWith('data:')) continue;
+        const dataStr = line.slice(5).trim();
+        if (dataStr === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed.choices?.[0]?.delta || {};
+          const content = delta.content || '';
+          const thinking = delta.reasoning_content || delta.thinking || '';
+          if (content || thinking) {
+            if (!firstTokenTime) firstTokenTime = Date.now();
+            tokenCount += content ? Math.ceil(content.length / 4) : 0;
+            send(channel, { requestId, type: 'chunk', content, thinking });
+          }
+        } catch {}
+      }
+    }
+
+    const totalDuration = Date.now() - started;
+    send(channel, {
+      requestId,
+      type: 'done',
+      stats: {
+        evalCount: tokenCount,
+        evalDuration: (totalDuration - (firstTokenTime ? firstTokenTime - started : 0)) * 1e6,
+        totalDuration: totalDuration * 1e6,
+        promptEvalDuration: (firstTokenTime ? firstTokenTime - started : 0) * 1e6
+      }
+    });
+    return true;
+  } catch (err) {
+    if (err.name === 'AbortError') send(channel, { requestId, type: 'aborted' });
+    else send(channel, { requestId, type: 'error', error: err.message });
+    return false;
+  } finally {
+    streams.delete(requestId);
+  }
+}
+
+ipcMain.handle('ollama:chat', async (_e, requestId, url, body, nodeType, apiKey) => {
+  const base = url.replace(/\/+$/, '');
+  
+  if (nodeType === 'openai' || apiKey) {
+    // Translate Ollama-style messages (optional images[]) to OpenAI multimodal content parts
+    const messages = (body.messages || []).map(m => {
+      if (!m.images || !m.images.length) return { role: m.role, content: m.content };
+      const parts = [];
+      if (m.content) parts.push({ type: 'text', text: m.content });
+      for (const img of m.images) {
+        const url = String(img).startsWith('data:') ? img : `data:image/png;base64,${img}`;
+        parts.push({ type: 'image_url', image_url: { url } });
+      }
+      return { role: m.role, content: parts };
+    });
+    const openAiBody = {
+      model: body.model,
+      messages,
+      stream: true,
+      temperature: body.options?.temperature ?? 0.3,
+      max_tokens: body.options?.num_predict
+    };
+    return await streamOpenAI(requestId, base, apiKey, openAiBody, 'ollama:chat-event');
+  }
+
+  let doneSent = false;
+  const ok = await streamNdjson(requestId, `${base}/api/chat`, { ...body, stream: true }, 'ollama:chat-event', chunk => {
+    const content = chunk.message?.content || '';
+    const thinking = chunk.message?.thinking || '';
+    if (content || thinking) send('ollama:chat-event', { requestId, type: 'chunk', content, thinking });
+    if (chunk.done) {
+      doneSent = true;
+      send('ollama:chat-event', {
+        requestId,
+        type: 'done',
+        stats: {
+          evalCount: chunk.eval_count,
+          evalDuration: chunk.eval_duration,
+          promptEvalCount: chunk.prompt_eval_count,
+          promptEvalDuration: chunk.prompt_eval_duration,
+          loadDuration: chunk.load_duration,
+          totalDuration: chunk.total_duration,
+          doneReason: chunk.done_reason
+        }
+      });
+    }
+  });
+  if (ok && !doneSent) send('ollama:chat-event', { requestId, type: 'done', stats: {} });
+});
+
+// ==========================================
+// TOKEN/SEC BENCHMARK RUNNER
+// ==========================================
+
+ipcMain.handle('ollama:benchmark', async (_e, node, model) => {
+  const url = (node.url || '').replace(/\/+$/, '');
+  const isFrontier = node.type === 'openai' || !!node.apiKey;
+
+  if (isFrontier) {
+    const started = Date.now();
+    try {
+      const endpoint = url.endsWith('/chat/completions') ? url : `${url}/chat/completions`;
+      const headers = { 'Content-Type': 'application/json' };
+      if (node.apiKey) headers['Authorization'] = `Bearer ${node.apiKey}`;
+
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'Write a concise Python function to calculate fibonacci numbers.' }],
+          max_tokens: 100
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+
+      const totalMs = Date.now() - started;
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const tokens = data.usage?.completion_tokens || 80;
+      const promptTokens = data.usage?.prompt_tokens || 15;
+      const evalTokPerSec = Math.round(tokens / (totalMs / 1000));
+
+      return {
+        model,
+        nodeId: node.id,
+        evalTokens: tokens,
+        evalTokPerSec,
+        promptTokens,
+        promptTokPerSec: Math.round(promptTokens / (totalMs / 2000)),
+        loadMs: 0,
+        totalMs
+      };
+    } catch (err) {
+      return { error: err.message };
+    }
+  }
+
+  // Embedding-only models (bge-m3, nomic-embed-text) benchmark via /api/embed instead of /api/generate
+  const isEmbedModel = model.toLowerCase().includes('embed') || 
+                       model.toLowerCase().includes('bge-') || 
+                       model.toLowerCase().includes('bge:') || 
+                       model.toLowerCase().includes('mxbai');
+
+  if (isEmbedModel) {
+    const started = Date.now();
+    try {
+      const resp = await fetch(`${url}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          input: 'function calculateFibonacci(n) { return n <= 1 ? n : calculateFibonacci(n - 1) + calculateFibonacci(n - 2); }'
+        }),
+        signal: AbortSignal.timeout(60000)
+      });
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        let msg = errText;
+        try { msg = JSON.parse(errText).error || errText; } catch {}
+        throw new Error(`HTTP ${resp.status}: ${msg}`);
+      }
+      const data = await resp.json();
+      const totalMs = Date.now() - started;
+      const dim = Array.isArray(data.embeddings?.[0]) ? data.embeddings[0].length : 0;
+      return {
+        model,
+        nodeId: node.id,
+        isEmbedding: true,
+        embeddingDim: dim,
+        evalTokens: 0,
+        evalTokPerSec: 0,
+        promptTokens: 1,
+        promptTokPerSec: 0,
+        loadMs: Math.round((data.load_duration || 0) / 1e6),
+        totalMs
+      };
+    } catch (err) {
+      return { error: err.message };
+    }
+  }
+
+  // Local Ollama generative benchmark
+  try {
+    const resp = await fetch(`${url}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        prompt: 'Write a quick Python algorithm for calculating prime numbers up to 500 with inline comments.',
+        stream: false,
+        options: {
+          num_predict: 64,
+          num_ctx: 2048,
+          temperature: 0.1
+        }
+      }),
+      signal: AbortSignal.timeout(120000)
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      let msg = errText;
+      try { msg = JSON.parse(errText).error || errText; } catch {}
+      throw new Error(`HTTP ${resp.status}: ${msg}`);
+    }
+
+    const data = await resp.json();
+
+    const evalTokPerSec = data.eval_duration ? Math.round(data.eval_count / (data.eval_duration / 1e9)) : 0;
+    const promptTokPerSec = data.prompt_eval_duration ? Math.round(data.prompt_eval_count / (data.prompt_eval_duration / 1e9)) : 0;
+    const loadMs = Math.round((data.load_duration || 0) / 1e6);
+    const totalMs = Math.round((data.total_duration || 0) / 1e6);
+
+    return {
+      model,
+      nodeId: node.id,
+      evalTokens: data.eval_count || 0,
+      evalTokPerSec,
+      promptTokens: data.prompt_eval_count || 0,
+      promptTokPerSec,
+      loadMs,
+      totalMs
+    };
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return { error: 'Benchmark timed out after 120s. Cold weight loading or VRAM swapping took too long.' };
+    }
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('ollama:pull', async (_e, requestId, url, model) => {
+  const base = url.replace(/\/+$/, '');
+  const ok = await streamNdjson(requestId, `${base}/api/pull`, { model, stream: true }, 'ollama:pull-event', chunk => {
+    send('ollama:pull-event', {
+      requestId,
+      type: 'progress',
+      status: chunk.status,
+      completed: chunk.completed,
+      total: chunk.total
+    });
+  });
+  if (ok) send('ollama:pull-event', { requestId, type: 'done' });
+});
+
+ipcMain.handle('ollama:abort', (_e, requestId) => {
+  const c = streams.get(requestId);
+  if (c) c.abort();
+  return { success: !!c };
+});
+
+ipcMain.handle('ollama:delete', async (_e, url, model) => {
+  try {
+    const resp = await fetch(`${url.replace(/\/+$/, '')}/api/delete`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model })
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// Load (keep_alive>0) or unload (keep_alive=0) a model without generating anything
+ipcMain.handle('ollama:keepalive', async (_e, url, model, keepAlive) => {
+  try {
+    await fetchJson(`${url.replace(/\/+$/, '')}/api/generate`, {
+      method: 'POST',
+      timeoutMs: 120000,
+      body: { model, keep_alive: keepAlive, prompt: '', stream: false }
+    });
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// Look up a tag on the public Ollama registry: confirms it exists and returns the exact download size.
+ipcMain.handle('registry:lookup', async (_e, tag) => {
+  try {
+    let [name, version] = tag.trim().split(':');
+    version = version || 'latest';
+    const repo = name.includes('/') ? name : `library/${name}`;
+    const resp = await fetch(`https://registry.ollama.ai/v2/${repo}/manifests/${version}`, {
+      headers: { Accept: 'application/vnd.docker.distribution.manifest.v2+json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (resp.status === 404) return { exists: false };
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const manifest = await resp.json();
+    const size = (manifest.layers || []).reduce((s, l) => s + (l.size || 0), 0);
+    return { exists: true, sizeBytes: size };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// ==========================================
+// LOCAL HARDWARE DETECTION
+// ==========================================
+
+function run(cmd, args) {
+  return new Promise(resolve => {
+    execFile(cmd, args, { windowsHide: true, timeout: 8000 }, (err, stdout) => resolve(err ? '' : stdout.toString()));
+  });
+}
+
+ipcMain.handle('system:detect-hardware', async () => {
+  const cpu = (os.cpus()[0]?.model || 'Unknown CPU').replace(/\s+/g, ' ').trim();
+  const ramGB = Math.round(os.totalmem() / 1024 ** 3);
+  let gpu = '';
+  let vramGB = 0;
+  const smi = await run('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits']);
+  if (smi.trim()) {
+    const [name, mem] = smi.trim().split('\n')[0].split(',').map(s => s.trim());
+    gpu = name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '');
+    vramGB = Math.round(parseInt(mem, 10) / 1024);
+  }
+  // RAM speed -> approximate dual-channel bandwidth: MT/s * 8 bytes * channels
+  let ramMTs = 0;
+  let dimms = 0;
+  const memInfo = await run('powershell.exe', [
+    '-NoProfile', '-Command',
+    '(Get-CimInstance Win32_PhysicalMemory | Select-Object -ExpandProperty ConfiguredClockSpeed) -join ","'
+  ]);
+  if (memInfo.trim()) {
+    const speeds = memInfo.trim().split(',').map(Number).filter(Boolean);
+    dimms = speeds.length;
+    ramMTs = Math.max(...speeds, 0);
+  }
+  const channels = dimms >= 2 ? 2 : 1;
+  const ramBandwidthGBs = ramMTs ? Math.round((ramMTs * 8 * channels) / 1000) : 0;
+  return { cpu, ramGB, gpu, vramGB, ramMTs, ramBandwidthGBs };
+});
+
+// ==========================================
+// HELPERS
+// ==========================================
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
