@@ -4,6 +4,9 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 ---
 
+<img width="1116" height="686" alt="Screenshot 2026-10-29 182925" src="https://github.com/user-attachments/assets/d2920865-2620-4556-8a7a-79b54ec13149" />
+
+
 ## Example Cluster Templates
 
 Default nodes are **examples** — edit URLs and hardware in Hardware Settings to match your machines.
