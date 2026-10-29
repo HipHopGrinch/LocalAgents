@@ -1,6 +1,6 @@
 import { AgentPersona, AppSettings, HardwareProfile, NodeConfig } from '../types';
 
-export const SETTINGS_VERSION = 3;
+export const SETTINGS_VERSION = 5;
 
 /** Memory bandwidth presets (GB/s). Bandwidth, not TFLOPs, is what limits local token generation speed. */
 export const GPU_PRESETS: { name: string; vramGB: number; bandwidth: number }[] = [
@@ -38,146 +38,20 @@ export function guessGpuBandwidth(gpuName: string): number | undefined {
   return hit?.bandwidth;
 }
 
-const hw = (h: HardwareProfile) => h;
+/** Generic hardware used when merging incomplete node records. */
+export const DEFAULT_HARDWARE: HardwareProfile = {
+  cpu: 'Generic CPU',
+  gpu: 'Generic GPU',
+  vramGB: 8,
+  gpuBandwidthGBs: 300,
+  ramGB: 16,
+  ramBandwidthGBs: 50,
+  reserveVramGB: 1,
+  kvCacheType: 'f16'
+};
 
-export const DEFAULT_NODES: NodeConfig[] = [
-  {
-    id: 'main-rig',
-    name: 'Main Rig',
-    url: 'http://127.0.0.1:11434',
-    activeModel: 'qwen2.5-coder:7b',
-    disabledModels: [],
-    hardware: hw({
-      cpu: 'Ryzen 7 9800X3D',
-      gpu: 'RTX 5070 Ti',
-      vramGB: 16,
-      gpuBandwidthGBs: 896,
-      ramGB: 64,
-      ramBandwidthGBs: 96,
-      reserveVramGB: 1.5,
-      kvCacheType: 'f16'
-    }),
-    roles: ['coder', 'planner'],
-    benchmarks: {
-      'qwen2.5-coder:7b': {
-        model: 'qwen2.5-coder:7b',
-        nodeId: 'main-rig',
-        evalTokens: 64,
-        evalTokPerSec: 158,
-        promptTokens: 38,
-        promptTokPerSec: 517,
-        loadMs: 3400,
-        totalMs: 3800,
-        provisional: true
-      }
-    }
-  },
-  {
-    id: 'linux-server',
-    name: 'Linux Server',
-    url: 'http://192.168.1.74:11434',
-    dnsAlias: 'ubuntu',
-    activeModel: 'qwen2.5-coder:7b-instruct',
-    disabledModels: [],
-    roles: ['docs', 'planner'],
-    hardware: hw({
-      cpu: 'Ryzen 9 3900X',
-      gpu: 'GTX 1080 Ti',
-      vramGB: 11,
-      gpuBandwidthGBs: 484,
-      ramGB: 32,
-      ramBandwidthGBs: 51,
-      reserveVramGB: 0.3,
-      kvCacheType: 'f16'
-    }),
-    benchmarks: {
-      'qwen2.5-coder:7b-instruct': {
-        model: 'qwen2.5-coder:7b-instruct',
-        nodeId: 'linux-server',
-        evalTokens: 40,
-        evalTokPerSec: 59,
-        promptTokens: 30,
-        promptTokPerSec: 180,
-        loadMs: 1723,
-        totalMs: 2400,
-        provisional: true
-      }
-    }
-  },
-  {
-    id: 'laptop',
-    name: 'ROG Laptop',
-    url: 'http://192.168.1.80:11434',
-    dnsAlias: 'ROGLaptop',
-    activeModel: 'qwen2.5-coder:3b',
-    disabledModels: [],
-    roles: ['reviewer'],
-    hardware: hw({
-      cpu: 'Ryzen 9 5900HX',
-      gpu: 'RTX 3060 Laptop (6GB)',
-      vramGB: 6,
-      gpuBandwidthGBs: 336,
-      ramGB: 32,
-      ramBandwidthGBs: 51,
-      reserveVramGB: 0.6,
-      kvCacheType: 'f16'
-    }),
-    benchmarks: {
-      'qwen2.5-coder:3b': {
-        model: 'qwen2.5-coder:3b',
-        nodeId: 'laptop',
-        evalTokens: 20,
-        evalTokPerSec: 113,
-        promptTokens: 30,
-        promptTokPerSec: 168,
-        loadMs: 5970,
-        totalMs: 6300,
-        provisional: true
-      },
-      'llama3.2:3b': {
-        model: 'llama3.2:3b',
-        nodeId: 'laptop',
-        evalTokens: 20,
-        evalTokPerSec: 134,
-        promptTokens: 30,
-        promptTokPerSec: 210,
-        loadMs: 7726,
-        totalMs: 7890,
-        provisional: true
-      },
-      'qwen2.5-coder:7b': {
-        model: 'qwen2.5-coder:7b',
-        nodeId: 'laptop',
-        evalTokens: 60,
-        evalTokPerSec: 37,
-        promptTokens: 48,
-        promptTokPerSec: 143,
-        loadMs: 4937,
-        totalMs: 5300,
-        provisional: true
-      }
-    }
-  },
-  {
-    id: 'xai-grok',
-    name: 'xAI Grok (Frontier API)',
-    url: 'https://api.x.ai/v1',
-    type: 'openai',
-    apiKey: '',
-    dnsAlias: 'grok-cloud',
-    roles: ['planner'],
-    hardware: hw({
-      cpu: 'Cloud Frontier Cluster',
-      gpu: 'xAI Colossus Cluster',
-      vramGB: 80,
-      gpuBandwidthGBs: 3350,
-      ramGB: 512,
-      ramBandwidthGBs: 1000,
-      reserveVramGB: 0,
-      kvCacheType: 'f16'
-    })
-  }
-];
+/** No seeded endpoints — add nodes manually in Hardware Settings. */
+export const DEFAULT_NODES: NodeConfig[] = [];
 
 export const DEFAULT_AGENTS: AgentPersona[] = [
   {
@@ -185,7 +59,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'coder',
     name: 'Lead Coder',
     role: 'Implements features, multi-file edits, runs builds/tests',
-    endpointId: 'main-rig',
+    endpointId: '',
     model: 'qwen2.5-coder:7b',
     temperature: 0.2,
     numCtx: 16384,
@@ -199,7 +73,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'planner',
     name: 'Architect',
     role: 'Breaks down tasks, designs approaches, explains trade-offs',
-    endpointId: 'main-rig',
+    endpointId: '',
     model: 'qwen2.5-coder:7b',
     temperature: 0.4,
     numCtx: 16384,
@@ -213,7 +87,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'reviewer',
     name: 'Reviewer',
     role: 'Finds bugs, security issues and edge cases in code or diffs',
-    endpointId: 'laptop',
+    endpointId: '',
     model: 'qwen2.5-coder:7b-instruct',
     temperature: 0.1,
     numCtx: 16384,
@@ -227,7 +101,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'docs',
     name: 'Explainer',
     role: 'Explains code, writes docs, tests and commit messages',
-    endpointId: 'linux-server',
+    endpointId: '',
     model: 'qwen2.5-coder:7b-instruct',
     temperature: 0.3,
     numCtx: 16384,
@@ -258,17 +132,25 @@ export const DEFAULT_SETTINGS: AppSettings = {
 /** Merge persisted settings over defaults so new fields added in later versions get sane values. */
 export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
   if (!saved) return structuredClone(DEFAULT_SETTINGS);
+
+  // v5+: empty default cluster — drop legacy seeded nodes once when upgrading
+  const upgradingToEmptyCluster = (saved.version ?? 0) < 5;
+  const nodes = upgradingToEmptyCluster
+    ? []
+    : (Array.isArray(saved.nodes) ? saved.nodes : DEFAULT_NODES);
+
   return {
     ...DEFAULT_SETTINGS,
     ...saved,
     version: SETTINGS_VERSION,
-    nodes: (saved.nodes?.length ? saved.nodes : DEFAULT_NODES).map(n => ({
+    nodes: nodes.map(n => ({
       ...n,
-      hardware: { ...DEFAULT_NODES[0].hardware, ...n.hardware }
+      hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
     })),
     agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => ({
       ...DEFAULT_AGENTS[0],
-      ...a
+      ...a,
+      ...(upgradingToEmptyCluster ? { endpointId: '' } : {})
     })),
     conversations: Array.isArray(saved.conversations) ? saved.conversations : []
   };

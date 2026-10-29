@@ -580,7 +580,8 @@ export function selectBestEndpointForTask(
   taskText: string,
   agentHandle: string,
   nodes: EndpointNode[]
-): EndpointNode {
+): EndpointNode | undefined {
+  if (!nodes.length) return undefined;
   const onlineLocal = nodes.filter(
     n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
   );
@@ -643,14 +644,14 @@ function modelSpeed(n: EndpointNode, model: string): { speed: number; provisiona
 /**
  * Finds the best Conductor model: prefer coder/instruct quality, then measured tok/s.
  */
-export function findFastestConductor(nodes: EndpointNode[]): { node: EndpointNode; model: string; tokPerSec: number } {
+export function findFastestConductor(
+  nodes: EndpointNode[]
+): { node: EndpointNode; model: string; tokPerSec: number } | null {
   const onlineLocal = nodes.filter(
     n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
   );
   const pool = onlineLocal.length > 0 ? onlineLocal : nodes.filter(n => getEnabledModelsForNode(n).length > 0);
-  if (pool.length === 0) {
-    return { node: nodes[0], model: getPreferredModelForNode(nodes[0]), tokPerSec: 100 };
-  }
+  if (pool.length === 0) return null;
 
   let bestNode = pool[0];
   let bestModel = getPreferredModelForNode(bestNode);

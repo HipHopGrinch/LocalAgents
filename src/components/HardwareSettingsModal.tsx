@@ -41,7 +41,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   frontierTokens
 }) => {
   const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'stats'>('nodes');
-  const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || 'main-rig');
+  const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
   
   // Benchmark state
@@ -422,6 +422,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     };
 
     onUpdateNodes([...nodes, newNode]);
+    setSelectedNodeId(newNode.id);
     setShowAddNode(false);
     setNewNodeName('');
     setNewNodeUrl('http://');
@@ -430,14 +431,10 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   };
 
   const handleDeleteNode = (id: string) => {
-    if (nodes.length <= 1) {
-      alert('You must have at least one node configured.');
-      return;
-    }
     if (confirm('Delete this endpoint node from cluster?')) {
       const filtered = nodes.filter(n => n.id !== id);
       onUpdateNodes(filtered);
-      if (selectedNodeId === id) setSelectedNodeId(filtered[0].id);
+      if (selectedNodeId === id) setSelectedNodeId(filtered[0]?.id || '');
     }
   };
 
@@ -737,22 +734,54 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   />
                 </>
               )}
+              {!currentNode && (
+                <div className="h-full flex flex-col items-center justify-center text-center px-8 text-zinc-500">
+                  <Cpu className="w-10 h-10 text-indigo-400/50 mb-3" />
+                  <p className="text-sm font-semibold text-zinc-200">No endpoints configured</p>
+                  <p className="text-xs mt-2 max-w-sm leading-relaxed">
+                    Add a local Ollama node (e.g. <code className="text-indigo-300">http://127.0.0.1:11434</code>) or a Frontier API to get started.
+                  </p>
+                  <button
+                    onClick={() => setShowAddNode(true)}
+                    className="mt-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg flex items-center space-x-1.5 transition"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Node / Frontier API</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
         {activeTab === 'hub' && (
-          <ModelHubPanel
-            nodes={nodes}
-            currentNode={currentNode}
-            selectedNodeId={selectedNodeId}
-            onSelectNodeId={setSelectedNodeId}
-            selectedTask={selectedTask}
-            onSelectTask={setSelectedTask}
-            estimateContext={estimateContext}
-            onUpdateEstimateContext={onUpdateEstimateContext}
-            pullProgress={pullProgress}
-            onPullModel={handlePullModel}
-          />
+          currentNode ? (
+            <ModelHubPanel
+              nodes={nodes}
+              currentNode={currentNode}
+              selectedNodeId={selectedNodeId}
+              onSelectNodeId={setSelectedNodeId}
+              selectedTask={selectedTask}
+              onSelectTask={setSelectedTask}
+              estimateContext={estimateContext}
+              onUpdateEstimateContext={onUpdateEstimateContext}
+              pullProgress={pullProgress}
+              onPullModel={handlePullModel}
+            />
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center text-center px-8 text-zinc-500">
+              <p className="text-sm font-semibold text-zinc-200">Add a node first</p>
+              <p className="text-xs mt-2">Model Hub needs at least one endpoint to recommend pulls.</p>
+              <button
+                onClick={() => {
+                  setActiveTab('nodes');
+                  setShowAddNode(true);
+                }}
+                className="mt-4 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg transition"
+              >
+                Add Node
+              </button>
+            </div>
+          )
         )}
         {/* Tab 3: Token Usage & Local Savings */}
         {activeTab === 'stats' && (

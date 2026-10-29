@@ -348,6 +348,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
     continuationDepthRef.current += 1;
     const routeNode = opts?.node || selectedNode;
+    if (!routeNode) return;
     const routeModel = opts?.model || targetModel;
     const followUpId = `followup-${Date.now()}`;
     const followUpMsg: ChatMessage = {
@@ -491,7 +492,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       id: agentMsgId,
       role: 'assistant',
       raw: '',
-      display: `⚡ Conductor (${conductor.node.name} • ${conductor.model} @ ~${conductor.tokPerSec} tok/s) is decomposing your request into parallel file jobs...`,
+      display: conductor
+        ? `⚡ Conductor (${conductor.node.name} • ${conductor.model} @ ~${conductor.tokPerSec} tok/s) is decomposing your request into parallel file jobs...`
+        : '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node first.',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       pipelineSteps: [],
       toolCalls: []
@@ -501,11 +504,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setIsStreaming(true);
 
     try {
-      if (!conductor.node?.online && onlineLocalNodes.length === 0) {
+      if (!conductor || (!conductor.node?.online && onlineLocalNodes.length === 0)) {
         setMessages(prev =>
           prev.map(m =>
             m.id === agentMsgId
-              ? { ...m, display: '⚠️ No online cluster nodes with enabled models. Open Hardware Settings and check Ollama endpoints.' }
+              ? { ...m, display: '⚠️ No online cluster nodes with enabled models. Open Hardware Settings and add or check Ollama endpoints.' }
               : m
           )
         );
@@ -765,6 +768,28 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
     const routedNode = autoSelectEndpoint
       ? selectBestEndpointForTask(userText, currentAgent.handle, nodes)
       : selectedNode;
+    if (!routedNode) {
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `msg-${Date.now()}`,
+          role: 'user',
+          raw: userText,
+          display: userText,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          ...(attachedImages.length ? { images: attachedImages } : {})
+        },
+        {
+          id: `agent-${Date.now()}`,
+          role: 'assistant',
+          raw: '',
+          display: '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node (e.g. http://127.0.0.1:11434).',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          toolCalls: []
+        }
+      ]);
+      return;
+    }
     const routedModel = autoSelectEndpoint
       ? getPreferredModelForNode(routedNode, targetModel)
       : targetModel;
@@ -1259,13 +1284,19 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               <div className="flex items-center space-x-1.5">
                 <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span>
-                  <b>Active Target:</b> {selectedNode.name} → <code className="text-indigo-300">{targetModel}</code> {benchmarkStat ? `(~${benchmarkStat.evalTokPerSec} tok/s)` : ''}
+                  <b>Active Target:</b>{' '}
+                  {selectedNode
+                    ? <>{selectedNode.name} → <code className="text-indigo-300">{targetModel}</code> {benchmarkStat ? `(~${benchmarkStat.evalTokPerSec} tok/s)` : ''}</>
+                    : <span className="text-amber-400">none — add a node in Hardware Settings</span>}
                 </span>
               </div>
               <div className="flex items-center space-x-1.5">
                 <Share2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span>
-                  <b>Fast Conductor:</b> {conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s) splits multi-file jobs across GPUs
+                  <b>Fast Conductor:</b>{' '}
+                  {conductorInfo
+                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s) splits multi-file jobs across GPUs</>
+                    : <span className="text-zinc-500">unavailable until a node is online</span>}
                 </span>
               </div>
             </div>
