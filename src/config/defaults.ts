@@ -1,6 +1,6 @@
 import { AgentPersona, AppSettings, HardwareProfile, NodeConfig } from '../types';
 
-export const SETTINGS_VERSION = 4;
+export const SETTINGS_VERSION = 3;
 
 /** Memory bandwidth presets (GB/s). Bandwidth, not TFLOPs, is what limits local token generation speed. */
 export const GPU_PRESETS: { name: string; vramGB: number; bandwidth: number }[] = [
@@ -40,22 +40,18 @@ export function guessGpuBandwidth(gpuName: string): number | undefined {
 
 const hw = (h: HardwareProfile) => h;
 
-/**
- * Example cluster templates — replace URLs with your machines.
- * Tiers: high-end gaming (16–24GB VRAM), mid-range desktop (8–12GB), budget laptop (6GB).
- */
 export const DEFAULT_NODES: NodeConfig[] = [
   {
-    id: 'gaming-pc',
-    name: 'High-End Gaming PC',
+    id: 'main-rig',
+    name: 'Main Rig',
     url: 'http://127.0.0.1:11434',
     activeModel: 'qwen2.5-coder:7b',
     disabledModels: [],
     hardware: hw({
-      cpu: 'Ryzen 7 / Core i7 (example)',
-      gpu: 'RTX 4090',
-      vramGB: 24,
-      gpuBandwidthGBs: 1008,
+      cpu: 'Ryzen 7 9800X3D',
+      gpu: 'RTX 5070 Ti',
+      vramGB: 16,
+      gpuBandwidthGBs: 896,
       ramGB: 64,
       ramBandwidthGBs: 96,
       reserveVramGB: 1.5,
@@ -65,63 +61,63 @@ export const DEFAULT_NODES: NodeConfig[] = [
     benchmarks: {
       'qwen2.5-coder:7b': {
         model: 'qwen2.5-coder:7b',
-        nodeId: 'gaming-pc',
+        nodeId: 'main-rig',
         evalTokens: 64,
-        evalTokPerSec: 120,
+        evalTokPerSec: 158,
         promptTokens: 38,
-        promptTokPerSec: 450,
-        loadMs: 3000,
-        totalMs: 3500,
+        promptTokPerSec: 517,
+        loadMs: 3400,
+        totalMs: 3800,
         provisional: true
       }
     }
   },
   {
-    id: 'midrange-pc',
-    name: 'Mid-Range PC',
-    url: 'http://192.168.1.20:11434',
-    dnsAlias: 'midrange-pc',
+    id: 'linux-server',
+    name: 'Linux Server',
+    url: 'http://192.168.1.74:11434',
+    dnsAlias: 'ubuntu',
     activeModel: 'qwen2.5-coder:7b-instruct',
     disabledModels: [],
     roles: ['docs', 'planner'],
     hardware: hw({
-      cpu: 'Ryzen 5 / Core i5 (example)',
-      gpu: 'RTX 3060 12GB',
-      vramGB: 12,
-      gpuBandwidthGBs: 360,
+      cpu: 'Ryzen 9 3900X',
+      gpu: 'GTX 1080 Ti',
+      vramGB: 11,
+      gpuBandwidthGBs: 484,
       ramGB: 32,
       ramBandwidthGBs: 51,
-      reserveVramGB: 0.5,
+      reserveVramGB: 0.3,
       kvCacheType: 'f16'
     }),
     benchmarks: {
       'qwen2.5-coder:7b-instruct': {
         model: 'qwen2.5-coder:7b-instruct',
-        nodeId: 'midrange-pc',
+        nodeId: 'linux-server',
         evalTokens: 40,
-        evalTokPerSec: 55,
+        evalTokPerSec: 59,
         promptTokens: 30,
         promptTokPerSec: 180,
-        loadMs: 4500,
-        totalMs: 5200,
+        loadMs: 1723,
+        totalMs: 2400,
         provisional: true
       }
     }
   },
   {
-    id: 'budget-laptop',
-    name: 'Budget Laptop',
-    url: 'http://192.168.1.30:11434',
-    dnsAlias: 'budget-laptop',
+    id: 'laptop',
+    name: 'ROG Laptop',
+    url: 'http://192.168.1.80:11434',
+    dnsAlias: 'ROGLaptop',
     activeModel: 'qwen2.5-coder:3b',
     disabledModels: [],
     roles: ['reviewer'],
     hardware: hw({
-      cpu: 'Laptop Ryzen 5 / Core i5 (example)',
+      cpu: 'Ryzen 9 5900HX',
       gpu: 'RTX 3060 Laptop (6GB)',
       vramGB: 6,
       gpuBandwidthGBs: 336,
-      ramGB: 16,
+      ramGB: 32,
       ramBandwidthGBs: 51,
       reserveVramGB: 0.6,
       kvCacheType: 'f16'
@@ -129,13 +125,35 @@ export const DEFAULT_NODES: NodeConfig[] = [
     benchmarks: {
       'qwen2.5-coder:3b': {
         model: 'qwen2.5-coder:3b',
-        nodeId: 'budget-laptop',
+        nodeId: 'laptop',
         evalTokens: 20,
-        evalTokPerSec: 80,
+        evalTokPerSec: 113,
         promptTokens: 30,
-        promptTokPerSec: 150,
-        loadMs: 6000,
-        totalMs: 6500,
+        promptTokPerSec: 168,
+        loadMs: 5970,
+        totalMs: 6300,
+        provisional: true
+      },
+      'llama3.2:3b': {
+        model: 'llama3.2:3b',
+        nodeId: 'laptop',
+        evalTokens: 20,
+        evalTokPerSec: 134,
+        promptTokens: 30,
+        promptTokPerSec: 210,
+        loadMs: 7726,
+        totalMs: 7890,
+        provisional: true
+      },
+      'qwen2.5-coder:7b': {
+        model: 'qwen2.5-coder:7b',
+        nodeId: 'laptop',
+        evalTokens: 60,
+        evalTokPerSec: 37,
+        promptTokens: 48,
+        promptTokPerSec: 143,
+        loadMs: 4937,
+        totalMs: 5300,
         provisional: true
       }
     }
@@ -167,7 +185,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'coder',
     name: 'Lead Coder',
     role: 'Implements features, multi-file edits, runs builds/tests',
-    endpointId: 'gaming-pc',
+    endpointId: 'main-rig',
     model: 'qwen2.5-coder:7b',
     temperature: 0.2,
     numCtx: 16384,
@@ -181,7 +199,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'planner',
     name: 'Architect',
     role: 'Breaks down tasks, designs approaches, explains trade-offs',
-    endpointId: 'gaming-pc',
+    endpointId: 'main-rig',
     model: 'qwen2.5-coder:7b',
     temperature: 0.4,
     numCtx: 16384,
@@ -195,7 +213,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'reviewer',
     name: 'Reviewer',
     role: 'Finds bugs, security issues and edge cases in code or diffs',
-    endpointId: 'budget-laptop',
+    endpointId: 'laptop',
     model: 'qwen2.5-coder:7b-instruct',
     temperature: 0.1,
     numCtx: 16384,
@@ -209,7 +227,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     handle: 'docs',
     name: 'Explainer',
     role: 'Explains code, writes docs, tests and commit messages',
-    endpointId: 'midrange-pc',
+    endpointId: 'linux-server',
     model: 'qwen2.5-coder:7b-instruct',
     temperature: 0.3,
     numCtx: 16384,

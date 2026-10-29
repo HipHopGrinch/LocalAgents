@@ -37,7 +37,7 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
 ## 3. Major Evolution & Milestones
 
 ### Phase 1: Foundations & Cluster Connectivity
-- Configured default example node templates (`gaming-pc`, `midrange-pc`, `budget-laptop`) with placeholder LAN URLs and DNS aliases users can customize.
+- Configured multi-node cluster defaults (local Ollama + LAN peers + optional frontier API) with DNS aliases and live status polling.
 - Built cluster polling logic to detect node online status, ping latency, and running models in real time (merges status without wiping user model toggles / benchmarks).
 - Integrated multi-tab Monaco editor with dirty-state tracking, language detection, and file tree operations.
 

@@ -41,7 +41,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   frontierTokens
 }) => {
   const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'stats'>('nodes');
-  const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || 'gaming-pc');
+  const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || 'main-rig');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
   
   // Benchmark state
@@ -625,7 +625,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           <span>Compute & Memory Characteristics</span>
                         </div>
 
-                        {/127\.0\.0\.1|localhost/i.test(currentNode.url) && (
+                        {currentNode.id === 'main-rig' && (
                           <button
                             onClick={handleDetectHardware}
                             className="text-[11px] text-indigo-300 hover:text-white bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/30 px-2.5 py-1 rounded transition"
@@ -760,7 +760,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             <div>
               <h3 className="text-sm font-bold text-zinc-100">Local Agent Token Economy</h3>
               <p className="text-xs text-zinc-400 mt-1">
-                LocalAgents runs heavy agent loops on your local Ollama nodes (gaming PC, mid-range desktop, laptop, etc.) without API charges.
+                LocalAgents runs heavy agent loops directly on your local RTX 5070 Ti, 1080 Ti server, and 3060 Laptop without API charges.
               </p>
             </div>
 
@@ -770,7 +770,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 <div className="text-2xl font-bold font-mono text-emerald-400">
                   {localTokens.toLocaleString()}
                 </div>
-                <p className="text-[10px] text-zinc-500">Processed entirely on your local GPUs</p>
+                <p className="text-[10px] text-zinc-500">Processed entirely on your 3 GPUs</p>
               </div>
 
               <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-1">

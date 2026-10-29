@@ -1086,7 +1086,7 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
             <ul className="list-disc pl-3.5 space-y-1">
               <li><b className="text-zinc-300">coder</b> — build & edit files; auto-applies writes</li>
               <li><b className="text-zinc-300">planner</b> — architecture plan first; cautious on writes</li>
-              <li><b className="text-zinc-300">reviewer</b> — bugs/security review; prefers a lighter laptop node</li>
+              <li><b className="text-zinc-300">reviewer</b> — bugs/security review; prefers the laptop node</li>
               <li><b className="text-zinc-300">docs</b> — explanations, tests, docs; prefers the server</li>
             </ul>
             <p>Hover a handle for its one-line role. Switching persona changes how the model behaves, not which chat you are in.</p>
@@ -1221,7 +1221,7 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               />
               <span>Auto-Node</span>
               <HelpTip title="Auto-Node" align="right">
-                <p>When on, each send picks a hardware node from the task (e.g. review → laptop, docs → mid-range PC, coding → gaming PC).</p>
+                <p>When on, each send picks a hardware node from the task (e.g. review → laptop, docs → server, coding → main rig).</p>
                 <p>The <b className="text-zinc-300">model</b> on that node is still the one you set as its default — Auto-Node chooses the PC, not a random model.</p>
                 <p>Ignored while Conductor Swarm is on (Swarm assigns files across the cluster itself).</p>
               </HelpTip>
