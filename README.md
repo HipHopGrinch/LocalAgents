@@ -4,14 +4,16 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 ---
 
-## Cluster & Hardware Architecture
+## Example Cluster Templates
 
-| Node | Hostname / IP | Hardware Specs | Best Fit Role |
+Default nodes are **examples** — edit URLs and hardware in Hardware Settings to match your machines.
+
+| Node | Example endpoint | Example hardware | Best Fit Role |
 | :--- | :--- | :--- | :--- |
-| **Main Rig** | `127.0.0.1:11434` | 9800X3D · RTX 5070 Ti (16GB) · 64GB DDR5 | Lead Architect & Coder (`@coder`) |
-| **Linux Server** | `192.168.1.74:11434` (`ubuntu`) | 3900X · GTX 1080 Ti (11GB) · 32GB DDR4 | Vector Indexer & Docs (`@docs`) |
-| **ROG Laptop** | `192.168.1.80:11434` (`ROGLaptop`) | 5900HX · RTX 3060 (6GB) · 32GB DDR4 | Fast Reviewer & Linter (`@reviewer`) |
-| **Frontier API** | `https://api.x.ai/v1` | xAI Grok Supercluster | Deep Frontier Reasoning (Optional) |
+| **High-End Gaming PC** | `127.0.0.1:11434` | 16–24GB VRAM (e.g. RTX 4080 / 4090) · 64GB RAM | Lead Architect & Coder (`@coder`) |
+| **Mid-Range PC** | `192.168.1.20:11434` | 8–12GB VRAM (e.g. RTX 3060 12GB / 4060) · 32GB RAM | Docs & secondary planning (`@docs`) |
+| **Budget Laptop** | `192.168.1.30:11434` | ~6GB VRAM (e.g. RTX 3060 Laptop) · 16GB RAM | Fast Reviewer (`@reviewer`) |
+| **Frontier API** | `https://api.x.ai/v1` | Cloud frontier model | Deep reasoning (optional) |
 
 ---
 
@@ -45,7 +47,7 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 ## Running the App
 
 ```powershell
-cd C:\Users\rober\LocalAgents
+cd path\to\LocalAgents
 .\start.bat
 # or
 npm start

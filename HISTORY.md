@@ -3,11 +3,11 @@
 ## 1. Project Background & Motivation
 **LocalAgents Studio** was created to bridge a critical capability gap in modern AI coding environments: tools like Google Antigravity and Cursor rely heavily on cloud-hosted frontier LLMs and lack first-class native multi-agent execution targeting locally hosted Ollama/vLLM endpoints across a local hardware cluster.
 
-As a multi-GPU power user with diverse local compute available:
-- **Main Rig (Windows Desktop):** NVIDIA GeForce RTX 5070 Ti (16 GB VRAM, ~896 GB/s memory bandwidth)
-- **Linux Server (`ubuntu` / `192.168.1.74`):** NVIDIA GeForce GTX 1080 Ti (11 GB VRAM, ~484 GB/s memory bandwidth)
-- **ROG Laptop (`ROGLaptop` / `192.168.1.80`):** NVIDIA GeForce RTX 3060 Laptop (6 GB VRAM, ~336 GB/s memory bandwidth)
-- **Frontier APIs (Optional Fallback):** Grok / OpenAI API integration when frontier reasoning is explicitly required.
+Designed for mixed local hardware clusters, for example:
+- **High-end gaming PC:** 16–24 GB VRAM (RTX 4080 / 4090 class)
+- **Mid-range desktop:** 8–12 GB VRAM (RTX 3060 12GB / 4070 class)
+- **Budget / thin laptop:** ~6 GB VRAM (RTX 3060 Laptop class)
+- **Frontier APIs (optional):** Grok / OpenAI when cloud reasoning is explicitly required.
 
 The core goal of LocalAgents Studio is to eliminate costly API token consumption by maximizing local hardware utilization, parallelizing code generation tasks across multiple physical GPU nodes simultaneously, and providing a standalone desktop IDE (built on Electron, React 19, Vite, TailwindCSS, and Monaco Editor) with direct filesystem execution capabilities.
 
@@ -37,7 +37,7 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
 ## 3. Major Evolution & Milestones
 
 ### Phase 1: Foundations & Cluster Connectivity
-- Configured default node cluster configuration (`main-rig`, `linux-server`, `laptop`) supporting both IP addresses (`192.168.1.74`, `192.168.1.80`) and local DNS hostnames (`ubuntu`, `ROGLaptop`).
+- Configured default example node templates (`gaming-pc`, `midrange-pc`, `budget-laptop`) with placeholder LAN URLs and DNS aliases users can customize.
 - Built cluster polling logic to detect node online status, ping latency, and running models in real time (merges status without wiping user model toggles / benchmarks).
 - Integrated multi-tab Monaco editor with dirty-state tracking, language detection, and file tree operations.
 

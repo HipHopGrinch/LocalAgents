@@ -564,7 +564,15 @@ function nodeHasRole(n: EndpointNode, role: string): boolean {
   if (n.roles?.includes(role as any)) return true;
   const id = (n.id || '').toLowerCase();
   const name = (n.name || '').toLowerCase();
-  if (role === 'reviewer') return id.includes('laptop') || name.includes('laptop') || name.includes('review');
+  if (role === 'reviewer') {
+    return (
+      id.includes('laptop') ||
+      id.includes('budget') ||
+      name.includes('laptop') ||
+      name.includes('budget') ||
+      name.includes('review')
+    );
+  }
   if (role === 'docs') return id.includes('linux') || id.includes('server') || name.includes('docs') || name.includes('server');
   if (role === 'coder' || role === 'planner') {
     return id.includes('main') || id.includes('rig') || name.includes('main') || (n.roles?.includes('coder') ?? false);
