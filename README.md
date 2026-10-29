@@ -8,12 +8,12 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 Default nodes are **examples** — edit URLs and hardware in Hardware Settings to match your machines.
 
-| Node | Example endpoint | Example hardware | Best Fit Role |
-| :--- | :--- | :--- | :--- |
-| **High-End Gaming PC** | `127.0.0.1:11434` | 16–24GB VRAM (e.g. RTX 4080 / 4090) · 64GB RAM | Lead Architect & Coder (`@coder`) |
-| **Mid-Range PC** | `192.168.1.20:11434` | 8–12GB VRAM (e.g. RTX 3060 12GB / 4060) · 32GB RAM | Docs & secondary planning (`@docs`) |
-| **Budget Laptop** | `192.168.1.30:11434` | ~6GB VRAM (e.g. RTX 3060 Laptop) · 16GB RAM | Fast Reviewer (`@reviewer`) |
-| **Frontier API** | `https://api.x.ai/v1` | Cloud frontier model | Deep reasoning (optional) |
+| Node |  Example hardware | Best Fit Role |
+| :--- | :--- | :--- |
+| **High-End Gaming PC** | 16–24GB VRAM (e.g. RTX 4080 / 4090) · 64GB RAM | Lead Architect & Coder (`@coder`) |
+| **Mid-Range PC** | 8–12GB VRAM (e.g. RTX 3060 12GB / 4060) · 32GB RAM | Docs & secondary planning (`@docs`) |
+| **Budget Laptop** | ~6GB VRAM (e.g. RTX 3060 Laptop) · 16GB RAM | Fast Reviewer (`@reviewer`) |
+| **Frontier API** | Cloud frontier model | Deep reasoning (optional) |
 
 ---
 
