@@ -36,9 +36,30 @@ export const FileTree: React.FC<FileTreeProps> = ({
   width = 240
 }) => {
   const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
+  const [subDirFiles, setSubDirFiles] = useState<Record<string, WorkspaceFile[]>>({});
+  const [loadingDirs, setLoadingDirs] = useState<Record<string, boolean>>({});
 
-  const toggleDir = (dirPath: string) => {
-    setExpandedDirs(prev => ({ ...prev, [dirPath]: !prev[dirPath] }));
+  const toggleDir = async (dirPath: string) => {
+    const isExpanding = !expandedDirs[dirPath];
+    setExpandedDirs(prev => ({ ...prev, [dirPath]: isExpanding }));
+    if (isExpanding && window.electronAPI) {
+      setLoadingDirs(prev => ({ ...prev, [dirPath]: true }));
+      try {
+        const res = await window.electronAPI.readDir(dirPath);
+        if (Array.isArray(res)) {
+          setSubDirFiles(prev => ({ ...prev, [dirPath]: res }));
+        }
+      } catch (err) {
+        console.warn('Failed to read sub-directory:', err);
+      } finally {
+        setLoadingDirs(prev => ({ ...prev, [dirPath]: false }));
+      }
+    }
+  };
+
+  const handleRefreshAll = () => {
+    setSubDirFiles({});
+    onRefresh();
   };
 
   const getFileIcon = (fileName: string) => {
@@ -55,6 +76,108 @@ export const FileTree: React.FC<FileTreeProps> = ({
       return <FileText className="w-4 h-4 text-purple-400 shrink-0" />;
     }
     return <File className="w-4 h-4 text-zinc-400 shrink-0" />;
+  };
+
+  const renderItem = (file: WorkspaceFile, depth = 0) => {
+    const isExpanded = !!expandedDirs[file.path];
+    const children = subDirFiles[file.path] || [];
+    const isLoading = !!loadingDirs[file.path];
+
+    return (
+      <div key={file.path} className="flex flex-col">
+        <div
+          style={{ paddingLeft: `${Math.max(8, depth * 14 + 8)}px` }}
+          className={`group flex items-center justify-between pr-2 py-1.5 rounded text-xs cursor-pointer transition ${
+            activeFilePath === file.path
+              ? 'bg-indigo-600/20 text-indigo-300 font-medium'
+              : 'text-zinc-300 hover:bg-[#222226] hover:text-white'
+          }`}
+          onClick={() => {
+            if (file.isDirectory) {
+              toggleDir(file.path);
+            } else {
+              onFileSelect(file.path);
+            }
+          }}
+        >
+          <div className="flex items-center space-x-1.5 truncate">
+            {file.isDirectory ? (
+              isExpanded ? (
+                <ChevronDown className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+              )
+            ) : (
+              getFileIcon(file.name)
+            )}
+            <span className="truncate">{file.name}</span>
+          </div>
+
+          {/* Action buttons on hover */}
+          <div className="hidden group-hover:flex items-center space-x-1">
+            {file.isDirectory && (
+              <>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCreateFile(file.path);
+                  }}
+                  className="p-1 text-zinc-500 hover:text-white rounded"
+                  title="New File inside this folder"
+                >
+                  <FilePlus className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCreateFolder(file.path);
+                  }}
+                  className="p-1 text-zinc-500 hover:text-white rounded"
+                  title="New Folder inside this folder"
+                >
+                  <FolderPlus className="w-3 h-3" />
+                </button>
+              </>
+            )}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (confirm(`Delete ${file.name}?`)) {
+                  onDelete(file.path);
+                }
+              }}
+              className="p-1 text-zinc-500 hover:text-red-400 rounded"
+              title="Delete"
+            >
+              <Trash2 className="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+
+        {/* Sub-directory children */}
+        {file.isDirectory && isExpanded && (
+          <div>
+            {isLoading ? (
+              <div
+                style={{ paddingLeft: `${(depth + 1) * 14 + 12}px` }}
+                className="py-1 text-[11px] text-zinc-500 italic"
+              >
+                Loading...
+              </div>
+            ) : children.length === 0 ? (
+              <div
+                style={{ paddingLeft: `${(depth + 1) * 14 + 12}px` }}
+                className="py-1 text-[11px] text-zinc-600 italic"
+              >
+                (empty folder)
+              </div>
+            ) : (
+              children.map(child => renderItem(child, depth + 1))
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -78,7 +201,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
             <FolderPlus className="w-3.5 h-3.5" />
           </button>
           <button
-            onClick={onRefresh}
+            onClick={handleRefreshAll}
             className="p-1 hover:text-white hover:bg-[#27272a] rounded transition"
             title="Refresh Files"
           >
@@ -94,52 +217,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
             No files found in workspace
           </div>
         ) : (
-          files.map(file => (
-            <div
-              key={file.path}
-              className={`group flex items-center justify-between px-2 py-1.5 rounded text-xs cursor-pointer transition ${
-                activeFilePath === file.path
-                  ? 'bg-indigo-600/20 text-indigo-300 font-medium'
-                  : 'text-zinc-300 hover:bg-[#222226] hover:text-white'
-              }`}
-              onClick={() => {
-                if (file.isDirectory) {
-                  toggleDir(file.path);
-                } else {
-                  onFileSelect(file.path);
-                }
-              }}
-            >
-              <div className="flex items-center space-x-2 truncate">
-                {file.isDirectory ? (
-                  expandedDirs[file.path] ? (
-                    <ChevronDown className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                  ) : (
-                    <ChevronRight className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                  )
-                ) : (
-                  getFileIcon(file.name)
-                )}
-                <span className="truncate">{file.name}</span>
-              </div>
-
-              {/* Action buttons on hover */}
-              <div className="hidden group-hover:flex items-center space-x-1">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (confirm(`Delete ${file.name}?`)) {
-                      onDelete(file.path);
-                    }
-                  }}
-                  className="p-1 text-zinc-500 hover:text-red-400 rounded"
-                  title="Delete"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-          ))
+          files.map(file => renderItem(file, 0))
         )}
       </div>
     </div>

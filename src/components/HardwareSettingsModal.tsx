@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   X,
   Cpu,
@@ -6,7 +6,8 @@ import {
   Plus,
   Trash2,
   RefreshCw,
-  Sliders
+  Sliders,
+  FolderOpen
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta } from '../types';
 import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
@@ -27,6 +28,8 @@ interface HardwareSettingsModalProps {
   onUpdateEstimateContext: (ctx: number) => void;
   localTokens: number;
   frontierTokens: number;
+  uiScale: number;
+  onUpdateUiScale: (scale: number) => void;
 }
 
 export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
@@ -38,11 +41,14 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   estimateContext,
   onUpdateEstimateContext,
   localTokens,
-  frontierTokens
+  frontierTokens,
+  uiScale,
+  onUpdateUiScale
 }) => {
-  const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'stats'>('nodes');
+  const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats'>('nodes');
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
+  const [settingsFilePath, setSettingsFilePath] = useState('');
   
   // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
@@ -121,6 +127,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       setInspectingModel(null);
     }
   };
+
+  useEffect(() => {
+    if (!isOpen || !window.electronAPI) return;
+    window.electronAPI.settingsPath().then(setSettingsFilePath).catch(() => setSettingsFilePath(''));
+  }, [isOpen]);
 
   // After opening Hardware Settings, inspect installed models missing Ollama metadata
   useEffect(() => {
@@ -467,6 +478,15 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 Model Hub & Recommendations
               </button>
               <button
+                onClick={() => setActiveTab('appearance')}
+                className={`flex items-center space-x-1.5 px-3 py-1 rounded transition ${
+                  activeTab === 'appearance' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
+                }`}
+              >
+                <Sliders className="w-3.5 h-3.5" />
+                <span>Appearance & Scaling</span>
+              </button>
+              <button
                 onClick={() => setActiveTab('stats')}
                 className={`px-3 py-1 rounded transition ${
                   activeTab === 'stats' ? 'bg-indigo-600 text-white font-medium' : 'text-zinc-400 hover:text-white'
@@ -592,22 +612,26 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                       </div>
                     </div>
 
-                    {/* API Key for Frontier (Grok / OpenAI / OpenRouter) */}
+                    {/* API Key for Frontier (Gemini / Grok / OpenAI / OpenRouter) */}
                     {(currentNode.type === 'openai' || currentNode.apiKey !== undefined) && (
                       <div>
                         <label className="text-[11px] text-zinc-400 font-medium flex items-center space-x-1">
                           <Key className="w-3 h-3 text-amber-400" />
-                          <span>API Key (e.g. xAI Grok Key / OpenAI Key)</span>
+                          <span>API Key (Google Gemini / xAI Grok / OpenAI / OpenRouter)</span>
                         </label>
                         <input
                           type="password"
-                          placeholder="xai-... or sk-..."
+                          placeholder={
+                            currentNode.url?.includes('googleapis.com')
+                              ? 'AIzaSy... (Gemini API Key)'
+                              : 'xai-... or sk-...'
+                          }
                           value={currentNode.apiKey || ''}
                           onChange={(e) => handleUpdateNodeProp('apiKey', e.target.value)}
                           className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
                         />
                         <p className="text-[10px] text-zinc-500 mt-1">
-                          Stored in plaintext under Electron userData settings.json (local machine only). Not encrypted. Used for frontier API calls from this IDE.
+                          Stored only on this PC under %APPDATA%\LocalAgents Studio\settings.json — never inside the EXE. Plaintext, not encrypted.
                         </p>
                       </div>
                     )}
@@ -750,6 +774,24 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   </button>
                 </div>
               )}
+
+              {!currentNode && (
+                <div className="h-full flex flex-col items-center justify-center text-center p-8 text-zinc-500">
+                  <Cpu className="w-10 h-10 text-indigo-400/40 mb-3" />
+                  <p className="text-sm font-semibold text-zinc-200">No endpoints configured</p>
+                  <p className="text-xs text-zinc-400 mt-1 max-w-sm">
+                    Connect your local Ollama instance (default: <code className="text-indigo-300">http://127.0.0.1:11434</code>) or a remote GPU endpoint to start running agents.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddNode(true)}
+                    className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg transition shadow flex items-center space-x-1.5"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Add Node / Frontier API</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -783,13 +825,135 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             </div>
           )
         )}
-        {/* Tab 3: Token Usage & Local Savings */}
+
+        {/* Tab 3: Appearance & Scaling */}
+        {activeTab === 'appearance' && (
+          <div className="flex-1 p-6 flex flex-col space-y-6 overflow-y-auto">
+            <div>
+              <h3 className="text-sm font-bold text-zinc-100 flex items-center space-x-2">
+                <Sliders className="w-4 h-4 text-indigo-400" />
+                <span>UI & Text Scaling</span>
+              </h3>
+              <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
+                Adjust the scaling slider to make text, chat containers, and code editor comfortable on higher resolution screens (such as 1440p, 4K, or high-DPI laptops).
+              </p>
+            </div>
+
+            {/* Main Scaling Slider Box */}
+            <div className="bg-[#121215] border border-[#272730] rounded-xl p-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-zinc-200">Scale Factor</span>
+                <span className="text-sm font-bold font-mono text-indigo-400 bg-indigo-950/60 px-3 py-0.5 rounded border border-indigo-500/30">
+                  {Math.round(uiScale * 100)}%
+                </span>
+              </div>
+
+              {/* Slider */}
+              <div className="space-y-2">
+                <input
+                  type="range"
+                  min="0.75"
+                  max="1.75"
+                  step="0.05"
+                  value={uiScale}
+                  onChange={(e) => onUpdateUiScale(parseFloat(e.target.value))}
+                  className="w-full accent-indigo-500 cursor-pointer h-2 bg-[#25252e] rounded-lg"
+                />
+                <div className="flex justify-between text-[10px] text-zinc-500 font-mono">
+                  <span>75% (Compact)</span>
+                  <span>100% (Default)</span>
+                  <span>125% (1440p)</span>
+                  <span>150% (4K)</span>
+                  <span>175% (Large)</span>
+                </div>
+              </div>
+
+              {/* Preset buttons */}
+              <div className="grid grid-cols-6 gap-2 pt-1 text-xs">
+                {[
+                  { label: '80%', val: 0.8 },
+                  { label: '100% (Default)', val: 1.0 },
+                  { label: '115%', val: 1.15 },
+                  { label: '125% (HiDPI)', val: 1.25 },
+                  { label: '150% (4K)', val: 1.5 },
+                  { label: '175%', val: 1.75 }
+                ].map(item => (
+                  <button
+                    key={item.val}
+                    type="button"
+                    onClick={() => onUpdateUiScale(item.val)}
+                    className={`py-1.5 px-2 rounded font-mono text-center transition border ${
+                      Math.abs(uiScale - item.val) < 0.02
+                        ? 'bg-indigo-600 text-white border-indigo-500 font-bold shadow'
+                        : 'bg-[#18181d] text-zinc-400 hover:text-white border-[#272732] hover:bg-[#202026]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Live Interactive Preview Container */}
+            <div className="space-y-2">
+              <span className="text-xs font-semibold text-zinc-300">Live Appearance Preview</span>
+              <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-3">
+                {/* Sample Chat Message */}
+                <div className="flex items-start space-x-2.5">
+                  <div className="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                    AI
+                  </div>
+                  <div className="flex-1 bg-[#1e1e24] border border-[#2b2b36] rounded-lg p-3 space-y-2 text-xs leading-relaxed text-zinc-200">
+                    <p className="font-semibold text-indigo-300">Agent Conductor</p>
+                    <p>I inspected your project and generated the native application files. Here is the implementation:</p>
+                    <div className="bg-[#121215] border border-[#2a2a36] rounded p-2 font-mono text-[11px] text-zinc-400">
+                      <code>&lt;write_file path="src/main.py"&gt;</code>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-2 border-t border-[#272730] text-[11px] text-zinc-500">
+                  <span>Keyboard shortcuts: <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl +</kbd> to zoom in, <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl -</kbd> to zoom out, <kbd className="px-1.5 py-0.5 bg-[#1e1e24] rounded border border-[#30303c] font-mono text-zinc-300">Ctrl 0</kbd> to reset.</span>
+                  {Math.round(uiScale * 100) !== 100 && (
+                    <button
+                      type="button"
+                      onClick={() => onUpdateUiScale(1.0)}
+                      className="text-indigo-400 hover:text-indigo-300 font-medium"
+                    >
+                      Reset to 100%
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Tab 4: Token Usage & Local Savings */}
         {activeTab === 'stats' && (
           <div className="flex-1 p-6 flex flex-col space-y-6 overflow-y-auto">
+            <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
+              <h3 className="text-sm font-bold text-zinc-100">Local settings (not in the EXE)</h3>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                Endpoints, API keys, chats, and layout are saved per Windows user under AppData. Shipping or copying the portable EXE does not include your machine config.
+              </p>
+              <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
+                {settingsFilePath || '%APPDATA%\\LocalAgents Studio\\settings.json'}
+              </code>
+              <button
+                type="button"
+                onClick={() => window.electronAPI?.openSettingsFolder()}
+                className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Open settings folder</span>
+              </button>
+            </div>
+
             <div>
               <h3 className="text-sm font-bold text-zinc-100">Local Agent Token Economy</h3>
               <p className="text-xs text-zinc-400 mt-1">
-                LocalAgents runs heavy agent loops directly on your local RTX 5070 Ti, 1080 Ti server, and 3060 Laptop without API charges.
+                LocalAgents runs heavy agent loops on your local Ollama GPUs without API charges.
               </p>
             </div>
 
@@ -799,7 +963,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 <div className="text-2xl font-bold font-mono text-emerald-400">
                   {localTokens.toLocaleString()}
                 </div>
-                <p className="text-[10px] text-zinc-500">Processed entirely on your 3 GPUs</p>
+                <p className="text-[10px] text-zinc-500">Processed entirely on your local GPUs</p>
               </div>
 
               <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-1">
@@ -841,6 +1005,32 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
               <div className="space-y-3 text-xs">
                 <div>
+                  <label className="text-[11px] text-zinc-400 block mb-1.5 font-medium">Quick Presets / Templates</label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      { label: 'Google Gemini', type: 'openai' as const, name: 'Google Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/' },
+                      { label: 'xAI Grok', type: 'openai' as const, name: 'xAI Grok', url: 'https://api.x.ai/v1' },
+                      { label: 'OpenAI', type: 'openai' as const, name: 'OpenAI', url: 'https://api.openai.com/v1' },
+                      { label: 'OpenRouter', type: 'openai' as const, name: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
+                      { label: 'Local Ollama', type: 'ollama' as const, name: 'Local Ollama', url: 'http://localhost:11434' },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          setNewNodeType(preset.type);
+                          setNewNodeName(preset.name);
+                          setNewNodeUrl(preset.url);
+                        }}
+                        className="px-2 py-1 rounded bg-[#1f1f28] hover:bg-[#2c2c3b] border border-[#2e2e3e] text-[10px] text-zinc-300 hover:text-white font-medium transition-colors"
+                      >
+                        + {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
                   <label className="text-[11px] text-zinc-400">Endpoint Type</label>
                   <select
                     value={newNodeType}
@@ -848,7 +1038,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                     className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none"
                   >
                     <option value="ollama">Local / LAN Ollama Node</option>
-                    <option value="openai">Frontier API (xAI Grok, OpenAI, OpenRouter)</option>
+                    <option value="openai">Frontier API (Google Gemini, xAI Grok, OpenAI, OpenRouter)</option>
                   </select>
                 </div>
 
@@ -856,7 +1046,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   <label className="text-[11px] text-zinc-400">Node Name</label>
                   <input
                     type="text"
-                    placeholder="e.g. xAI Grok Frontier or Linux Box 2"
+                    placeholder="e.g. Google Gemini, xAI Grok, or Linux Box 2"
                     value={newNodeName}
                     onChange={(e) => setNewNodeName(e.target.value)}
                     required
@@ -868,7 +1058,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   <label className="text-[11px] text-zinc-400">URL</label>
                   <input
                     type="text"
-                    placeholder={newNodeType === 'openai' ? 'https://api.x.ai/v1' : 'http://192.168.1.xxx:11434'}
+                    placeholder={
+                      newNodeType === 'openai'
+                        ? 'https://generativelanguage.googleapis.com/v1beta/openai/ or https://api.x.ai/v1'
+                        : 'http://192.168.1.xxx:11434'
+                    }
                     value={newNodeUrl}
                     onChange={(e) => setNewNodeUrl(e.target.value)}
                     required
@@ -881,7 +1075,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                     <label className="text-[11px] text-zinc-400">API Key</label>
                     <input
                       type="password"
-                      placeholder="xai-... or sk-..."
+                      placeholder={
+                        newNodeUrl.includes('googleapis.com')
+                          ? 'AIzaSy... (Gemini API Key)'
+                          : 'xai-... or sk-...'
+                      }
                       value={newNodeApiKey}
                       onChange={(e) => setNewNodeApiKey(e.target.value)}
                       className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"

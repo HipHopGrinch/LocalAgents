@@ -32,7 +32,11 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
   try {
     if (tool.name === 'write_file') {
       const filePath = tool.args?.path || 'file';
-      const content = tool.body || '';
+      let content = tool.body || '';
+      // Ensure JSON files never have accidental markdown code fence wrappers
+      if (filePath.toLowerCase().endsWith('.json') && content.trim().startsWith('```')) {
+        content = content.replace(/^\s*```[a-zA-Z0-9_\-\+#]*[ \t]*\r?\n?/, '').replace(/\r?\n?```\s*$/, '');
+      }
       const ok = await deps.onApplyFileWrite(filePath, content);
       return {
         ...next,
@@ -49,7 +53,7 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
       }
       const absPath = filePath.includes(':')
         ? filePath
-        : `${deps.workspacePath}\\${filePath.replace(/^\//, '')}`;
+        : `${deps.workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
       const readRes = await window.electronAPI.readFile(absPath);
       if (readRes.content === undefined) {
         return { ...next, status: 'error', result: readRes.error || `Could not read ${filePath}` };

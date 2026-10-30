@@ -24,11 +24,33 @@ function parseAttrs(s: string): Record<string, string> {
   return out;
 }
 
-/** Remove a single wrapping ``` fence if the model fenced the whole body. */
-function unfence(body: string): string {
+/**
+ * Remove markdown wrapping code fences (e.g. ```json ... ```, ```python ... ```, ~~~ ... ~~~)
+ * Handles both closed fences and unclosed fences where the model opened ``` inside <write_file>
+ * but closed with </write_file> without a matching trailing ```.
+ */
+export function unfence(body: string): string {
   let b = body.replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
-  const fenced = b.match(/^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$/);
-  if (fenced) b = fenced[1];
+
+  // 1. Perfectly matched wrapping fence (``` or ~~~ with optional lang tag and trailing fence)
+  const fullFence = b.match(/^\s*(`{3,}|~{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n\1\s*$/);
+  if (fullFence) {
+    return fullFence[2];
+  }
+
+  // 2. Model opened a fence at start (e.g. ```json or ```) inside <write_file>
+  // but closed the tag without a matching closing fence (or trailing fence is missing)
+  const openFence = b.match(/^\s*(`{3,}|~{3,})[a-zA-Z0-9_\-\+#]*[ \t]*\r?\n([\s\S]*)$/);
+  if (openFence) {
+    let inner = openFence[2];
+    // Strip trailing fence if present
+    inner = inner.replace(/\r?\n(`{3,}|~{3,})\s*$/, '');
+    return inner;
+  }
+
+  // 3. Trailing unmatched fence
+  b = b.replace(/\r?\n(`{3,}|~{3,})\s*$/, '');
+
   return b;
 }
 
@@ -278,7 +300,7 @@ export function parseResponse(
           id: `${msgId}-fb-${fallbackIdx++}`,
           name: 'write_file',
           args: { path: sanitized },
-          body: content,
+          body: unfence(content),
           status: 'pending'
         });
       }
@@ -313,13 +335,14 @@ export interface EditResult {
 }
 
 export function parseEditBlocks(body: string): { search: string; replace: string }[] {
+  const normalized = body.replace(/\r\n/g, '\n');
   const blocks: { search: string; replace: string }[] = [];
-  const re = /^<{5,9}\s*SEARCH[^\n]*\n([\s\S]*?)^={5,9}[ \t]*\r?\n([\s\S]*?)^>{5,9}\s*REPLACE/gm;
+  const re = /^<{5,9}\s*SEARCH[^\n]*\n([\s\S]*?)^={5,9}[ \t]*\n([\s\S]*?)^>{5,9}\s*REPLACE/gm;
   let m;
-  while ((m = re.exec(body)) !== null) {
+  while ((m = re.exec(normalized)) !== null) {
     blocks.push({
-      search: m[1].replace(/\r?\n$/, ''),
-      replace: m[2].replace(/\r?\n$/, '')
+      search: m[1].replace(/\n$/, ''),
+      replace: m[2].replace(/\n$/, '')
     });
   }
   return blocks;
@@ -554,6 +577,11 @@ export function getPreferredModelForNode(node?: EndpointNode, fallbackModel?: st
   return node.activeModel || fallbackModel || 'qwen2.5-coder:7b';
 }
 
+export function isFrontierNode(n?: EndpointNode): boolean {
+  if (!n) return false;
+  return n.type === 'openai' || !!n.apiKey;
+}
+
 function byCapacity(a: EndpointNode, b: EndpointNode): number {
   const score = (n: EndpointNode) =>
     (n.hardware?.vramGB || 0) * 10 + (n.hardware?.gpuBandwidthGBs || 0);
@@ -582,15 +610,16 @@ export function selectBestEndpointForTask(
   nodes: EndpointNode[]
 ): EndpointNode | undefined {
   if (!nodes.length) return undefined;
-  const onlineLocal = nodes.filter(
-    n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
-  );
-  if (onlineLocal.length === 0) {
+  const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
+  const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
+  // Local-first; frontier only when no local workers are available
+  const pool = onlineLocal.length > 0 ? onlineLocal : onlineUsable;
+  if (pool.length === 0) {
     return nodes.find(n => n.online) || nodes[0];
   }
 
   const lower = taskText.toLowerCase();
-  const byRole = (role: string) => onlineLocal.filter(n => nodeHasRole(n, role)).sort(byCapacity);
+  const byRole = (role: string) => pool.filter(n => nodeHasRole(n, role)).sort(byCapacity);
 
   // Explicit agent persona routing (role tags first, legacy IDs as soft preference)
   if (agentHandle === 'reviewer') {
@@ -616,11 +645,19 @@ export function selectBestEndpointForTask(
   if (coderHits[0]) return coderHits[0];
 
   // Fallback to node with highest capacity
-  return [...onlineLocal].sort(byCapacity)[0];
+  return [...pool].sort(byCapacity)[0];
 }
 
 function isTinyModelName(name: string): boolean {
   return /:?(0\.5|1(\.5)?|1b|0\.5b)b?\b/i.test(name) || /tiny|mini:|smollm/i.test(name);
+}
+
+function modelParamBillions(model: string): number {
+  const m = model.toLowerCase();
+  const match = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
+  if (match) return parseFloat(match[1]);
+  if (/gemini|gpt-4|claude|grok/i.test(m)) return 70; // treat frontier as high-capacity
+  return 7;
 }
 
 function conductorQualityBonus(model: string): number {
@@ -630,6 +667,7 @@ function conductorQualityBonus(model: string): number {
   if (/7b|8b|9b|14b|32b|70b/.test(m)) bonus += 25;
   if (/3b|4b/.test(m)) bonus += 5;
   if (isTinyModelName(m)) bonus -= 50;
+  if (/gemini|gpt-4|claude|grok/i.test(m)) bonus += 35;
   return bonus;
 }
 
@@ -638,19 +676,62 @@ function modelSpeed(n: EndpointNode, model: string): { speed: number; provisiona
   if (bm?.evalTokPerSec) {
     return { speed: bm.evalTokPerSec, provisional: !!bm.provisional };
   }
+  if (isFrontierNode(n)) {
+    return { speed: 80, provisional: true };
+  }
   return { speed: Math.round((n.hardware?.gpuBandwidthGBs || 300) / 6), provisional: true };
 }
 
+/** Score how well a model fits a file job complexity (higher = better). */
+function scoreModelForComplexity(
+  model: string,
+  complexity: ConductorFileJob['complexity']
+): number {
+  const size = modelParamBillions(model);
+  const quality = conductorQualityBonus(model);
+  if (complexity === 'heavy') return quality * 10 + size * 6;
+  if (complexity === 'medium') return quality * 6 + size * 3 + 15;
+  // light: prefer snappy smaller/local-friendly models
+  return quality * 2 + Math.max(0, 35 - size) + (/coder|instruct/i.test(model) ? 8 : 0);
+}
+
+/** Best enabled model on a node for this job type (respects activeModel as a soft preference). */
+export function pickBestModelForComplexity(
+  node: EndpointNode,
+  complexity: ConductorFileJob['complexity']
+): string {
+  const enabled = getEnabledModelsForNode(node);
+  if (!enabled.length) return getPreferredModelForNode(node);
+
+  let best = enabled[0];
+  let bestScore = -Infinity;
+  for (const m of enabled) {
+    const { speed, provisional } = modelSpeed(node, m);
+    const activeBonus = node.activeModel === m ? 40 : 0;
+    const score =
+      scoreModelForComplexity(m, complexity) * 100 +
+      speed +
+      (provisional ? 0 : 60) +
+      activeBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      best = m;
+    }
+  }
+  return best;
+}
+
 /**
- * Finds the best Conductor model: prefer coder/instruct quality, then measured tok/s.
+ * Finds the best Conductor (planner) model.
+ * Local-first: frontier endpoints are only considered when no local workers are online.
  */
 export function findFastestConductor(
   nodes: EndpointNode[]
-): { node: EndpointNode; model: string; tokPerSec: number } | null {
-  const onlineLocal = nodes.filter(
-    n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
-  );
-  const pool = onlineLocal.length > 0 ? onlineLocal : nodes.filter(n => getEnabledModelsForNode(n).length > 0);
+): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean } | null {
+  const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
+  const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
+  const usedFrontierBackup = onlineLocal.length === 0 && onlineUsable.length > 0;
+  const pool = onlineLocal.length > 0 ? onlineLocal : onlineUsable;
   if (pool.length === 0) return null;
 
   let bestNode = pool[0];
@@ -673,7 +754,12 @@ export function findFastestConductor(
     }
   }
 
-  return { node: bestNode, model: bestModel, tokPerSec: bestSpeed || 100 };
+  return {
+    node: bestNode,
+    model: bestModel,
+    tokPerSec: bestSpeed || 100,
+    usedFrontierBackup
+  };
 }
 
 export interface ConductorFileJob {
@@ -818,59 +904,96 @@ export function parseConductorPlan(raw: string, userTask: string): ConductorFile
   return fallbackDecomposeTask(userTask);
 }
 
+export type ClusterAssignment = {
+  job: ConductorFileJob;
+  node: EndpointNode;
+  model: string;
+  skippedReason?: string;
+  usedFrontierBackup?: boolean;
+};
+
 /**
- * Assigns decomposed file jobs across online local endpoints (never offline when any node is up).
- * Nodes ordered by measured tok/s of their preferred model, then bandwidth.
+ * Assigns file jobs across enabled online workers.
+ * Local-first: uses only local Ollama nodes when any are online; frontier APIs are a backup
+ * when no local GPUs are available. Picks the best enabled model per job complexity and
+ * spreads load across nodes for parallelism.
  */
 export function assignJobsToCluster(
   jobs: ConductorFileJob[],
   nodes: EndpointNode[]
-): { job: ConductorFileJob; node: EndpointNode; model: string; skippedReason?: string }[] {
-  const onlineLocal = nodes.filter(
-    n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
-  );
-  // Never fall through to offline nodes when any online local exists
-  const effectivePool = onlineLocal.length > 0
-    ? onlineLocal
-    : nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
-
-  if (effectivePool.length === 0) {
-    // Last resort: preferred models on configured nodes, mark reason for UI
-    const any = nodes.filter(n => getEnabledModelsForNode(n).length > 0);
-    const pool = any.length > 0 ? any : nodes;
-    const weight = { heavy: 3, medium: 2, light: 1 };
-    const sortedJobs = [...jobs].sort((a, b) => weight[b.complexity] - weight[a.complexity]);
-    return sortedJobs.map((job, idx) => {
-      const targetNode = pool[idx % pool.length];
-      return {
-        job,
-        node: targetNode,
-        model: getPreferredModelForNode(targetNode),
-        skippedReason: targetNode.online ? undefined : 'Node offline — assignment may fail'
-      };
-    });
-  }
-
-  const sortedNodes = [...effectivePool].sort((a, b) => {
-    const ma = getPreferredModelForNode(a);
-    const mb = getPreferredModelForNode(b);
-    const sa = modelSpeed(a, ma);
-    const sb = modelSpeed(b, mb);
-    // Prefer live (non-provisional) speeds, then raw speed, then bandwidth
-    const scoreA = sa.speed + (sa.provisional ? 0 : 200) + (a.hardware?.gpuBandwidthGBs || 0) / 10;
-    const scoreB = sb.speed + (sb.provisional ? 0 : 200) + (b.hardware?.gpuBandwidthGBs || 0) / 10;
-    return scoreB - scoreA;
-  });
+): ClusterAssignment[] {
+  const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
+  const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
+  const onlineFrontier = onlineUsable.filter(isFrontierNode);
+  const usedFrontierBackup = onlineLocal.length === 0 && onlineFrontier.length > 0;
+  const pool = onlineLocal.length > 0 ? onlineLocal : onlineFrontier;
 
   const weight = { heavy: 3, medium: 2, light: 1 };
   const sortedJobs = [...jobs].sort((a, b) => weight[b.complexity] - weight[a.complexity]);
 
-  return sortedJobs.map((job, idx) => {
-    const targetNode = sortedNodes[idx % sortedNodes.length];
+  if (pool.length === 0) {
+    const any = nodes.filter(n => getEnabledModelsForNode(n).length > 0);
+    const fallback = any.length > 0 ? any : nodes;
+    if (fallback.length === 0) return [];
+    return sortedJobs.map((job, idx) => {
+      const targetNode = fallback[idx % fallback.length];
+      return {
+        job,
+        node: targetNode,
+        model: pickBestModelForComplexity(targetNode, job.complexity),
+        skippedReason: targetNode?.online
+          ? undefined
+          : 'Node offline — assignment may fail',
+        usedFrontierBackup: isFrontierNode(targetNode)
+      };
+    });
+  }
+
+  const loadCount = new Map<string, number>();
+  for (const n of pool) loadCount.set(n.id, 0);
+
+  return sortedJobs.map(job => {
+    let bestNode = pool[0];
+    let bestScore = -Infinity;
+
+    for (const n of pool) {
+      const model = pickBestModelForComplexity(n, job.complexity);
+      const { speed, provisional } = modelSpeed(n, model);
+      const load = loadCount.get(n.id) || 0;
+      const capacity =
+        (n.hardware?.vramGB || 8) * 12 + (n.hardware?.gpuBandwidthGBs || 300) / 8;
+      // Soft role preference for coding-heavy nodes on heavy jobs
+      const roleBonus =
+        job.complexity === 'heavy' && nodeHasRole(n, 'coder')
+          ? 120
+          : job.complexity === 'light' && (nodeHasRole(n, 'reviewer') || nodeHasRole(n, 'docs'))
+            ? 60
+            : 0;
+      const score =
+        scoreModelForComplexity(model, job.complexity) * 1000 +
+        speed * 2 +
+        (provisional ? 0 : 250) +
+        capacity +
+        roleBonus -
+        load * 900; // spread parallel work across GPUs
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestNode = n;
+      }
+    }
+
+    const model = pickBestModelForComplexity(bestNode, job.complexity);
+    loadCount.set(bestNode.id, (loadCount.get(bestNode.id) || 0) + 1);
+
     return {
       job,
-      node: targetNode,
-      model: getPreferredModelForNode(targetNode)
+      node: bestNode,
+      model,
+      skippedReason: usedFrontierBackup
+        ? 'Frontier backup — no local Ollama nodes online'
+        : undefined,
+      usedFrontierBackup
     };
   });
 }

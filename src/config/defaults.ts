@@ -125,6 +125,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   frontierTokensUsed: 0,
   explorerWidth: 240,
   chatWidth: 420,
+  uiScale: 1.0,
   conversations: [],
   activeConversationId: undefined
 };
@@ -133,24 +134,23 @@ export const DEFAULT_SETTINGS: AppSettings = {
 export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
   if (!saved) return structuredClone(DEFAULT_SETTINGS);
 
-  // v5+: empty default cluster — drop legacy seeded nodes once when upgrading
-  const upgradingToEmptyCluster = (saved.version ?? 0) < 5;
-  const nodes = upgradingToEmptyCluster
-    ? []
-    : (Array.isArray(saved.nodes) ? saved.nodes : DEFAULT_NODES);
+  const nodes = Array.isArray(saved.nodes) ? saved.nodes : DEFAULT_NODES;
+  const uiScale = typeof saved.uiScale === 'number' && saved.uiScale >= 0.7 && saved.uiScale <= 2.5
+    ? saved.uiScale
+    : 1.0;
 
   return {
     ...DEFAULT_SETTINGS,
     ...saved,
     version: SETTINGS_VERSION,
+    uiScale,
     nodes: nodes.map(n => ({
       ...n,
       hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
     })),
     agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => ({
       ...DEFAULT_AGENTS[0],
-      ...a,
-      ...(upgradingToEmptyCluster ? { endpointId: '' } : {})
+      ...a
     })),
     conversations: Array.isArray(saved.conversations) ? saved.conversations : []
   };

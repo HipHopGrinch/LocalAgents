@@ -29,7 +29,7 @@ Default nodes are **examples** — edit URLs and hardware in Hardware Settings t
 
 ### Hybrid Local + Frontier API Support
 - Route routine coding to local GPUs; optionally send work to Grok / OpenAI / OpenRouter.
-- Enter an API key in Hardware Settings. Keys are stored in **plaintext** in Electron `userData/settings.json` on this machine (not encrypted).
+- Enter an API key in Hardware Settings. Keys and cluster config are stored in **plaintext** only on that PC at `%APPDATA%\LocalAgents Studio\settings.json` (never baked into the EXE).
 
 ### Token Economy Tracker
 - Header badge tracks free local tokens vs frontier tokens and estimated API cost avoided.
@@ -62,5 +62,20 @@ Development:
 npm install
 npm run dev
 ```
+
+### Windows EXE (self-contained)
+
+```powershell
+.\build-exe.bat
+# or
+npm run dist
+```
+
+Artifacts land in `release\`:
+
+- **`LocalAgents Studio-*-portable.exe`** — single portable EXE (no installer)
+- **`LocalAgents Studio-*-setup.exe`** — NSIS installer with Start Menu / desktop shortcuts
+
+Ollama is still installed separately on each machine; the EXE only packages LocalAgents Studio. Your endpoints/API keys stay in `%APPDATA%\LocalAgents Studio\` and are not part of the build.
 
 See [HISTORY.md](HISTORY.md) for architecture and evolution notes.

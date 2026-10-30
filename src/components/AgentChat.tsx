@@ -37,6 +37,7 @@ import {
   buildDecompositionPrompt,
   parseConductorPlan,
   assignJobsToCluster,
+  isFrontierNode,
   stripThinking,
   looksLikeCreateIntent
 } from '../lib/tools';
@@ -193,14 +194,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     }
   }, [currentAgent]);
 
-  // Selected node with fallback to online node if offline
+  // Selected node with fallback to online node if offline (undefined when cluster is empty)
   const requestedNode = nodes.find(n => n.id === targetNodeId) || nodes[0];
   const onlineLocalNodes = nodes.filter(
     n => n.online && n.type !== 'openai' && getEnabledModelsForNode(n).length > 0
   );
-  const selectedNode = requestedNode.online && getEnabledModelsForNode(requestedNode).length > 0
-    ? requestedNode
-    : (onlineLocalNodes[0] || requestedNode);
+  const selectedNode =
+    requestedNode &&
+    requestedNode.online &&
+    getEnabledModelsForNode(requestedNode).length > 0
+      ? requestedNode
+      : onlineLocalNodes[0] || requestedNode;
 
   const isFrontier = selectedNode?.type === 'openai' || !!selectedNode?.apiKey;
 
@@ -493,7 +497,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       role: 'assistant',
       raw: '',
       display: conductor
-        ? `⚡ Conductor (${conductor.node.name} • ${conductor.model} @ ~${conductor.tokPerSec} tok/s) is decomposing your request into parallel file jobs...`
+        ? `⚡ Conductor (${conductor.node.name} • ${conductor.model} @ ~${conductor.tokPerSec} tok/s${
+            conductor.usedFrontierBackup ? ' · frontier backup' : ' · local'
+          }) is decomposing your request into parallel file jobs...`
         : '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node first.',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       pipelineSteps: [],
@@ -504,11 +510,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setIsStreaming(true);
 
     try {
-      if (!conductor || (!conductor.node?.online && onlineLocalNodes.length === 0)) {
+      if (!conductor || !conductor.node?.online) {
         setMessages(prev =>
           prev.map(m =>
             m.id === agentMsgId
-              ? { ...m, display: '⚠️ No online cluster nodes with enabled models. Open Hardware Settings and add or check Ollama endpoints.' }
+              ? {
+                  ...m,
+                  display:
+                    '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
+                }
               : m
           )
         );
@@ -539,15 +549,19 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         activeAbortsRef.current.push(decompHandle.abort);
         const decompRes = await decompHandle.done;
         if (decompRes.stats?.evalCount) {
-          onRecordTokens(decompRes.stats.evalCount + (decompRes.stats.promptEvalCount || 0), 0);
+          const tok = decompRes.stats.evalCount + (decompRes.stats.promptEvalCount || 0);
+          if (isFrontierNode(conductor.node)) onRecordTokens(0, tok);
+          else onRecordTokens(tok, 0);
         }
         fileJobs = parseConductorPlan(decompRes.content, userText);
       } catch (decompErr) {
         console.warn('Conductor LLM decomposition fallback triggered:', decompErr);
       }
 
-      // Phase 2: Assign each file job to a separate hardware node using THAT node's user-chosen active model
+      // Phase 2: Local-first assignment — best enabled model per job; frontier only if no local GPUs
       const assignments = assignJobsToCluster(fileJobs, nodes);
+      const localCount = assignments.filter(a => !isFrontierNode(a.node)).length;
+      const frontierCount = assignments.length - localCount;
 
       const initialSteps: PipelineStep[] = assignments.map(({ job, node, model, skippedReason }) => ({
         nodeId: node.id,
@@ -555,7 +569,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         modelName: model,
         targetFile: job.filePath,
         agentHandle: 'coder',
-        role: `${job.role} (${model})${skippedReason ? ` — ${skippedReason}` : ''}`,
+        role: `${job.role} · ${model}${isFrontierNode(node) ? ' (frontier)' : ' (local)'}${
+          skippedReason ? ` — ${skippedReason}` : ''
+        }`,
         status: skippedReason && !node.online ? 'failed' : 'running',
         content: skippedReason && !node.online
           ? `Skipped: ${skippedReason}`
@@ -568,7 +584,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           m.id === agentMsgId
             ? {
                 ...m,
-                display: `⚡ Conductor dispatched ${assignments.length} files in parallel across your enabled cluster nodes:`,
+                display:
+                  frontierCount > 0 && localCount === 0
+                    ? `⚡ Conductor dispatched ${assignments.length} files via frontier backup (no local Ollama workers online):`
+                    : `⚡ Conductor dispatched ${assignments.length} files across ${localCount} local worker${
+                        localCount === 1 ? '' : 's'
+                      }${frontierCount ? ` + ${frontierCount} frontier backup` : ''} (enabled models only):`,
                 pipelineSteps: initialSteps
               }
             : m
@@ -669,7 +690,9 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
           }
 
           if (res.stats?.evalCount) {
-            onRecordTokens(res.stats.evalCount + (res.stats.promptEvalCount || 0), 0);
+            const tok = res.stats.evalCount + (res.stats.promptEvalCount || 0);
+            if (isFrontierNode(node)) onRecordTokens(0, tok);
+            else onRecordTokens(tok, 0);
           }
 
           const parsedDisplay = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
@@ -1134,7 +1157,7 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               </span>
             </span>
             <select
-              value={targetNodeId}
+              value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
               onChange={(e) => {
                 const newNodeId = e.target.value;
                 setTargetNodeId(newNodeId);
@@ -1144,13 +1167,18 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
                   setTargetModel(getPreferredModelForNode(nextNode));
                 }
               }}
-              className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate"
+              disabled={nodes.length === 0}
+              className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
             >
-              {nodes.map(n => (
-                <option key={n.id} value={n.id} disabled={!n.online}>
-                  {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
-                </option>
-              ))}
+              {nodes.length === 0 ? (
+                <option value="">No endpoints — open Hardware Settings</option>
+              ) : (
+                nodes.map(n => (
+                  <option key={n.id} value={n.id} disabled={!n.online}>
+                    {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
+                  </option>
+                ))
+              )}
             </select>
           </div>
 
@@ -1186,7 +1214,11 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
             >
               {effectiveModels.length === 0 ? (
                 <option value="">
-                  {selectedNode?.online ? 'No models installed — pull in Hardware Settings' : 'Node offline / no models'}
+                  {!selectedNode
+                    ? 'Add an endpoint in Hardware Settings'
+                    : selectedNode.online
+                      ? 'No models installed — pull in Hardware Settings'
+                      : 'Node offline / no models'}
                 </option>
               ) : (
                 effectiveModels.map(m => (
@@ -1227,12 +1259,19 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               title={isPipelineMode ? 'Conductor Swarm is ON — click to use single-node chat' : 'Click to enable multi-GPU file distribution'}
             >
               <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
-              <span className="truncate">Conductor Swarm ({onlineLocalNodes.length} GPUs)</span>
+              <span className="truncate">
+                Conductor Swarm ({onlineLocalNodes.length} local
+                {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
+                  ? ` + frontier`
+                  : ''}
+                )
+              </span>
             </button>
             <HelpTip title="Conductor Swarm mode">
               <p><b className="text-zinc-300">Off (default):</b> one message → one node/model. Best for questions, edits, and single-file work.</p>
-              <p><b className="text-zinc-300">On:</b> the Conductor splits your request into 2–4 files (e.g. index.html + styles.css + app.js) and generates each file in parallel on different GPUs.</p>
-              <p>Use Swarm for greenfield multi-file apps. Leave it off for chat, reviews, and surgical changes.</p>
+              <p><b className="text-zinc-300">On:</b> splits the request into files and runs workers in parallel.</p>
+              <p><b className="text-zinc-300">Local-first:</b> uses enabled models on online Ollama GPUs. Frontier/cloud APIs are used only when no local workers are available.</p>
+              <p>Heavy files prefer stronger coder models; light files prefer faster smaller ones. Load is spread across nodes.</p>
             </HelpTip>
           </div>
 
@@ -1247,8 +1286,8 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               <span>Auto-Node</span>
               <HelpTip title="Auto-Node" align="right">
                 <p>When on, each send picks a hardware node from the task (e.g. review → laptop, docs → server, coding → main rig).</p>
-                <p>The <b className="text-zinc-300">model</b> on that node is still the one you set as its default — Auto-Node chooses the PC, not a random model.</p>
-                <p>Ignored while Conductor Swarm is on (Swarm assigns files across the cluster itself).</p>
+                <p><b className="text-zinc-300">Local-first:</b> prefers online Ollama nodes; frontier APIs only if no local workers are up.</p>
+                <p>Ignored while Conductor Swarm is on (Swarm assigns files + models itself).</p>
               </HelpTip>
             </label>
 
@@ -1295,7 +1334,7 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
                 <span>
                   <b>Fast Conductor:</b>{' '}
                   {conductorInfo
-                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s) splits multi-file jobs across GPUs</>
+                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ' · local-first'}) splits multi-file jobs across enabled workers</>
                     : <span className="text-zinc-500">unavailable until a node is online</span>}
                 </span>
               </div>

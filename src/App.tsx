@@ -53,6 +53,9 @@ export const App: React.FC = () => {
   const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth || 420);
   const [resizingSide, setResizingSide] = useState<'explorer' | 'chat' | null>(null);
 
+  // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
+  const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
+
   // 1. Initial Load: Settings & Workspace
   useEffect(() => {
     async function init() {
@@ -64,6 +67,13 @@ export const App: React.FC = () => {
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
       if (merged.activeConversationId) setActiveConversationId(merged.activeConversationId);
+      
+      const initialScale = merged.uiScale || 1.0;
+      setUiScale(initialScale);
+      if (window.electronAPI.setZoomFactor) {
+        window.electronAPI.setZoomFactor(initialScale);
+      }
+      document.documentElement.style.setProperty('--app-scale', String(initialScale));
 
       // Initialize live nodes
       setNodes(
@@ -93,6 +103,36 @@ export const App: React.FC = () => {
       return next;
     });
   }, []);
+
+  const handleUpdateUiScale = useCallback((scale: number) => {
+    const clamped = Math.max(0.75, Math.min(2.0, Math.round(scale * 100) / 100));
+    setUiScale(clamped);
+    if (window.electronAPI?.setZoomFactor) {
+      window.electronAPI.setZoomFactor(clamped);
+    }
+    document.documentElement.style.setProperty('--app-scale', String(clamped));
+    updateSettings({ uiScale: clamped });
+  }, [updateSettings]);
+
+  // Global Keyboard Zoom Shortcuts: Ctrl + / Ctrl - / Ctrl 0
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === '=' || e.key === '+') {
+          e.preventDefault();
+          handleUpdateUiScale(uiScale + 0.05);
+        } else if (e.key === '-' || e.key === '_') {
+          e.preventDefault();
+          handleUpdateUiScale(uiScale - 0.05);
+        } else if (e.key === '0') {
+          e.preventDefault();
+          handleUpdateUiScale(1.0);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [uiScale, handleUpdateUiScale]);
 
   const workspaceConversations = useMemo(
     () => conversationsForWorkspace(settings.conversations, workspacePath),
@@ -551,6 +591,8 @@ export const App: React.FC = () => {
         onOpenHardwareModal={() => setIsHardwareModalOpen(true)}
         localTokens={settings.localTokensGenerated || 0}
         frontierTokens={settings.frontierTokensUsed || 0}
+        uiScale={uiScale}
+        onUpdateUiScale={handleUpdateUiScale}
       />
 
       {/* Main Studio Body */}
@@ -640,6 +682,8 @@ export const App: React.FC = () => {
         onUpdateEstimateContext={(ctx) => updateSettings({ estimateContext: ctx })}
         localTokens={settings.localTokensGenerated || 0}
         frontierTokens={settings.frontierTokensUsed || 0}
+        uiScale={uiScale}
+        onUpdateUiScale={handleUpdateUiScale}
       />
     </div>
   );

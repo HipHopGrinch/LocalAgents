@@ -1,6 +1,17 @@
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { EndpointNode } from '../types';
-import { Folder, FolderPlus, Cpu, RefreshCw, Terminal, Layers, Zap, Cloud } from 'lucide-react';
+import {
+  Folder,
+  FolderPlus,
+  Cpu,
+  RefreshCw,
+  Terminal,
+  Layers,
+  Zap,
+  Cloud,
+  Sliders,
+  RotateCcw
+} from 'lucide-react';
 
 interface HeaderProps {
   workspacePath: string;
@@ -13,6 +24,8 @@ interface HeaderProps {
   onOpenHardwareModal: () => void;
   localTokens: number;
   frontierTokens: number;
+  uiScale: number;
+  onUpdateUiScale: (scale: number) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -25,10 +38,29 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleTerminal,
   onOpenHardwareModal,
   localTokens,
-  frontierTokens
+  frontierTokens,
+  uiScale,
+  onUpdateUiScale
 }) => {
+  const [showScalePopover, setShowScalePopover] = useState(false);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  // Close popover when clicking outside
+  useEffect(() => {
+    if (!showScalePopover) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setShowScalePopover(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => window.removeEventListener('mousedown', handleClickOutside);
+  }, [showScalePopover]);
+
+  const scalePercent = Math.round(uiScale * 100);
+
   return (
-    <header className="h-12 bg-[#121214] border-b border-[#27272a] px-4 flex items-center justify-between select-none shrink-0">
+    <header className="h-12 bg-[#121214] border-b border-[#27272a] px-4 flex items-center justify-between select-none shrink-0 relative z-30">
       {/* Brand & Workspace */}
       <div className="flex items-center space-x-3">
         <div className="flex items-center space-x-2 text-indigo-400 font-bold tracking-tight text-sm">
@@ -57,7 +89,7 @@ export const Header: React.FC<HeaderProps> = ({
         </button>
       </div>
 
-      {/* Cluster Nodes & Token Economy */}
+      {/* Cluster Nodes, Scaling & Token Economy */}
       <div className="flex items-center space-x-3">
         {/* Token Savings Pill */}
         <div 
@@ -86,19 +118,26 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="text-[11px] text-zinc-400 font-medium">Cluster:</span>
           
           <div className="flex items-center space-x-2">
-            {nodes.map(node => (
-              <div key={node.id} className="flex items-center space-x-1 text-[11px]">
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    node.online ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]' : 'bg-red-500/70'
-                  }`}
-                />
-                <span className="text-zinc-300 font-mono text-[10px]">{node.name.split(' ')[0]}</span>
-                {node.online && node.latency !== null && (
-                  <span className="text-[9px] text-emerald-400 font-mono">{node.latency}ms</span>
-                )}
-              </div>
-            ))}
+            {nodes.length === 0 ? (
+              <span className="text-[10px] text-amber-400 font-medium flex items-center space-x-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                <span>No endpoints (Click to configure)</span>
+              </span>
+            ) : (
+              nodes.map(node => (
+                <div key={node.id} className="flex items-center space-x-1 text-[11px]">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      node.online ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]' : 'bg-red-500/70'
+                    }`}
+                  />
+                  <span className="text-zinc-300 font-mono text-[10px]">{node.name.split(' ')[0]}</span>
+                  {node.online && node.latency !== null && (
+                    <span className="text-[9px] text-emerald-400 font-mono">{node.latency}ms</span>
+                  )}
+                </div>
+              ))
+            )}
           </div>
         </div>
 
@@ -109,6 +148,92 @@ export const Header: React.FC<HeaderProps> = ({
         >
           <RefreshCw className="w-3.5 h-3.5" />
         </button>
+
+        {/* Discord-style UI & Text Scaling Control */}
+        <div className="relative" ref={popoverRef}>
+          <button
+            onClick={() => setShowScalePopover(prev => !prev)}
+            className={`flex items-center space-x-1.5 px-2 py-1 text-xs rounded border transition ${
+              scalePercent !== 100 || showScalePopover
+                ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300 font-medium'
+                : 'bg-[#18181b] border-[#27272a] text-zinc-400 hover:text-white'
+            }`}
+            title="UI & Text Scaling slider (Discord-style) • Ctrl +/- to zoom"
+          >
+            <Sliders className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="font-mono text-[11px]">{scalePercent}%</span>
+          </button>
+
+          {showScalePopover && (
+            <div className="absolute right-0 top-full mt-2 w-72 bg-[#161619] border border-[#2e2e38] rounded-xl shadow-2xl p-3.5 flex flex-col space-y-3 z-50 text-zinc-200">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-zinc-100 flex items-center space-x-1.5">
+                  <Sliders className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>UI & Text Scaling</span>
+                </span>
+                <span className="text-xs font-mono font-bold text-indigo-400 bg-indigo-950/60 px-2 py-0.5 rounded border border-indigo-500/30">
+                  {scalePercent}%
+                </span>
+              </div>
+
+              <p className="text-[11px] text-zinc-400 leading-tight">
+                Scales text, chat containers, and editor for high-res (1440p / 4K) displays.
+              </p>
+
+              {/* Smooth slider */}
+              <div className="flex flex-col space-y-1">
+                <input
+                  type="range"
+                  min="0.75"
+                  max="1.75"
+                  step="0.05"
+                  value={uiScale}
+                  onChange={(e) => onUpdateUiScale(parseFloat(e.target.value))}
+                  className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-[#25252e] rounded-lg"
+                />
+                <div className="flex justify-between text-[9px] text-zinc-500 font-mono">
+                  <span>75%</span>
+                  <span>100%</span>
+                  <span>125%</span>
+                  <span>150%</span>
+                  <span>175%</span>
+                </div>
+              </div>
+
+              {/* Quick Presets */}
+              <div className="grid grid-cols-4 gap-1 pt-1 text-[10px]">
+                {[0.8, 1.0, 1.25, 1.5].map(val => (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => onUpdateUiScale(val)}
+                    className={`py-1 rounded font-mono transition border ${
+                      Math.abs(uiScale - val) < 0.02
+                        ? 'bg-indigo-600 text-white border-indigo-500 font-bold'
+                        : 'bg-[#1e1e24] text-zinc-400 hover:text-white border-[#2c2c36] hover:bg-[#25252e]'
+                    }`}
+                  >
+                    {Math.round(val * 100)}%
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-[#272730] text-[10px] text-zinc-500">
+                <span>Shortcuts: <kbd className="px-1 py-0.5 bg-[#22222a] rounded font-mono text-zinc-400">Ctrl +/-</kbd></span>
+                {scalePercent !== 100 && (
+                  <button
+                    type="button"
+                    onClick={() => onUpdateUiScale(1.0)}
+                    className="flex items-center space-x-1 text-indigo-400 hover:text-indigo-300 transition"
+                  >
+                    <RotateCcw className="w-2.5 h-2.5" />
+                    <span>Reset (100%)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         <button
           onClick={onToggleTerminal}

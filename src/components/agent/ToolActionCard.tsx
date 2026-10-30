@@ -35,9 +35,17 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
 
     const handleApply = async () => {
       setLoading(true);
-      const success = await onApplyFileWrite(filePath, content);
+      if (onRunSingleTool) {
+        const res = await onRunSingleTool(tool);
+        setApplied(res.status === 'done');
+      } else {
+        const success = await onApplyFileWrite(filePath, content);
+        if (success) {
+          tool.status = 'done';
+          setApplied(true);
+        }
+      }
       setLoading(false);
-      if (success) setApplied(true);
     };
 
     return (
@@ -94,17 +102,26 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
 
     const handleApplyEdit = async () => {
       setLoading(true);
-      if (!window.electronAPI) return;
-      const absPath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^\//, '')}`;
-      const readRes = await window.electronAPI.readFile(absPath);
-      if (readRes.content !== undefined) {
-        const editRes = applyEdits(readRes.content, body);
-        if (editRes.content !== undefined) {
-          await onApplyFileWrite(filePath, editRes.content);
+      if (onRunSingleTool) {
+        const res = await onRunSingleTool(tool);
+        if (res.status === 'done') {
           setApplied(true);
         } else {
-          alert(`Could not apply diff: ${editRes.error}`);
           onDiffFailed?.();
+        }
+      } else if (window.electronAPI) {
+        const absPath = filePath.includes(':') ? filePath : `${workspacePath}\\${filePath.replace(/^[\\/]+/, '')}`;
+        const readRes = await window.electronAPI.readFile(absPath);
+        if (readRes.content !== undefined) {
+          const editRes = applyEdits(readRes.content, body);
+          if (editRes.content !== undefined) {
+            await onApplyFileWrite(filePath, editRes.content);
+            tool.status = 'done';
+            setApplied(true);
+          } else {
+            alert(`Could not apply diff: ${editRes.error}`);
+            onDiffFailed?.();
+          }
         }
       }
       setLoading(false);

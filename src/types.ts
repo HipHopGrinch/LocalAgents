@@ -152,6 +152,8 @@ export interface AppSettings {
   frontierTokensUsed: number;
   explorerWidth?: number;
   chatWidth?: number;
+  /** UI & Text scaling factor (0.75 to 2.0, default 1.0) */
+  uiScale?: number;
   /** Persisted chat threads (scoped by workspacePath at runtime) */
   conversations?: ChatConversation[];
   activeConversationId?: string;
@@ -292,9 +294,14 @@ export interface DetectedHardware {
 }
 
 export interface ElectronAPI {
+  // Zoom & UI Scaling
+  setZoomFactor?: (factor: number) => void;
+  getZoomFactor?: () => number;
+
   loadSettings: () => Promise<AppSettings | null>;
   saveSettings: (s: AppSettings) => Promise<{ success?: boolean; error?: string }>;
   settingsPath: () => Promise<string>;
+  openSettingsFolder: () => Promise<{ success?: boolean; path?: string; error?: string }>;
 
   getDefaultWorkspace: () => Promise<string>;
   selectFolder: () => Promise<string | null>;

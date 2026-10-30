@@ -9,6 +9,25 @@ const fsp = require('fs/promises');
 const os = require('os');
 const { spawn, execFile } = require('child_process');
 
+// Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
+// Must be set before app.ready().
+(() => {
+  const appData = app.getPath('appData');
+  const userDataDir = path.join(appData, 'LocalAgents Studio');
+  const legacyDir = path.join(appData, 'local-agents-ide');
+  app.setPath('userData', userDataDir);
+  try {
+    if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
+    const nextSettings = path.join(userDataDir, 'settings.json');
+    const legacySettings = path.join(legacyDir, 'settings.json');
+    if (!fs.existsSync(nextSettings) && fs.existsSync(legacySettings)) {
+      fs.copyFileSync(legacySettings, nextSettings);
+    }
+  } catch (err) {
+    console.warn('userData setup:', err.message);
+  }
+})();
+
 let mainWindow = null;
 
 // ==========================================
@@ -16,6 +35,10 @@ let mainWindow = null;
 // ==========================================
 
 function createWindow() {
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.localagents.studio');
+  }
+
   mainWindow = new BrowserWindow({
     width: 1500,
     height: 920,
@@ -34,7 +57,8 @@ function createWindow() {
   });
 
   const distIndex = path.join(__dirname, '../dist/index.html');
-  if (process.env.VITE_DEV_SERVER === 'true' || !fs.existsSync(distIndex)) {
+  const useDevServer = process.env.VITE_DEV_SERVER === 'true' && !app.isPackaged;
+  if (useDevServer || (!app.isPackaged && !fs.existsSync(distIndex))) {
     mainWindow.loadURL('http://localhost:5173');
   } else {
     mainWindow.loadFile(distIndex);
@@ -64,6 +88,7 @@ const send = (channel, payload) => {
 
 // ==========================================
 // SETTINGS PERSISTENCE (userData/settings.json)
+// Outside the app package — e.g. %APPDATA%\LocalAgents Studio\settings.json
 // ==========================================
 
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
@@ -78,6 +103,7 @@ ipcMain.handle('settings:load', async () => {
 
 ipcMain.handle('settings:save', async (_e, settings) => {
   try {
+    await fsp.mkdir(app.getPath('userData'), { recursive: true });
     const tmp = settingsPath() + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(settings, null, 2), 'utf-8');
     await fsp.rename(tmp, settingsPath()); // atomic replace
@@ -88,6 +114,13 @@ ipcMain.handle('settings:save', async (_e, settings) => {
 });
 
 ipcMain.handle('settings:path', () => settingsPath());
+
+ipcMain.handle('settings:openFolder', async () => {
+  const dir = app.getPath('userData');
+  await fsp.mkdir(dir, { recursive: true });
+  const err = await shell.openPath(dir);
+  return err ? { error: err } : { success: true, path: dir };
+});
 
 // ==========================================
 // USER-DRIVEN FILESYSTEM (explorer / editor)
@@ -493,33 +526,65 @@ async function fetchJson(url, { timeoutMs = 2500, method = 'GET', body } = {}) {
   }
 }
 
+function normalizeFrontierEndpoint(rawUrl) {
+  let endpoint = (rawUrl || '').trim().replace(/\/+$/, '');
+  if (endpoint.includes('googleapis.com')) {
+    if (!endpoint.includes('/v1beta')) {
+      endpoint = `${endpoint}/v1beta`;
+    }
+    if (!endpoint.includes('/openai')) {
+      endpoint = `${endpoint}/openai`;
+    }
+  }
+  return endpoint;
+}
+
 async function nodeStatus(node) {
   const url = (node.url || '').replace(/\/+$/, '');
   const started = Date.now();
 
-  // 1. OpenAI-compatible Frontier endpoint (Grok, OpenRouter, OpenAI, etc.)
+  // 1. OpenAI-compatible Frontier endpoint (Grok, OpenRouter, OpenAI, Gemini, etc.)
   if (node.type === 'openai' || node.apiKey) {
     try {
+      const endpointUrl = normalizeFrontierEndpoint(node.url);
       const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 4000);
+      const t = setTimeout(() => controller.abort(), 6000);
       const headers = { 'Content-Type': 'application/json' };
-      if (node.apiKey) headers['Authorization'] = `Bearer ${node.apiKey}`;
+      if (node.apiKey) {
+        headers['Authorization'] = `Bearer ${node.apiKey}`;
+        if (endpointUrl.includes('googleapis.com')) {
+          headers['x-goog-api-key'] = node.apiKey;
+        }
+      }
 
-      const resp = await fetch(`${url}/models`, { headers, signal: controller.signal });
+      const resp = await fetch(`${endpointUrl}/models`, { headers, signal: controller.signal });
       clearTimeout(t);
       const latency = Date.now() - started;
 
       if (resp.ok) {
         const data = await resp.json();
         const modelsList = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+        const filtered = modelsList
+          .map(m => typeof m === 'string' ? m : (m.id || m.name))
+          .filter(name => {
+            if (!name) return false;
+            const lower = name.toLowerCase();
+            return !lower.includes('embedding') && !lower.includes('aqa');
+          });
+
+        const isGemini = endpointUrl.includes('googleapis.com');
+        const fallbackList = isGemini
+          ? ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash']
+          : ['gpt-4o', 'grok-2-1212', 'claude-3-5-sonnet'];
+
         return {
           online: true,
           latency,
-          version: 'Frontier API',
-          models: modelsList.map(m => ({
-            name: typeof m === 'string' ? m : (m.id || m.name),
+          version: isGemini ? 'Google Gemini API' : 'Frontier API',
+          models: (filtered.length > 0 ? filtered : fallbackList).map(name => ({
+            name,
             size: 0,
-            details: { family: 'Frontier API' }
+            details: { family: isGemini ? 'Gemini' : 'Frontier API' }
           })),
           loaded: []
         };
@@ -662,9 +727,15 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
   let tokenCount = 0;
 
   try {
-    const endpoint = url.endsWith('/chat/completions') ? url : `${url.replace(/\/+$/, '')}/chat/completions`;
+    const baseUrl = normalizeFrontierEndpoint(url);
+    const endpoint = baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`;
     const headers = { 'Content-Type': 'application/json' };
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+      if (baseUrl.includes('googleapis.com')) {
+        headers['x-goog-api-key'] = apiKey;
+      }
+    }
 
     const resp = await fetch(endpoint, {
       method: 'POST',

@@ -1,5 +1,5 @@
 // Bridge between the sandboxed renderer and the privileged main process.
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webFrame } = require('electron');
 
 const subscribe = channel => callback => {
   const handler = (_event, value) => callback(value);
@@ -8,10 +8,29 @@ const subscribe = channel => callback => {
 };
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // Zoom & UI Scaling
+  setZoomFactor: factor => {
+    try {
+      if (typeof factor === 'number' && factor >= 0.5 && factor <= 3.0) {
+        webFrame.setZoomFactor(factor);
+      }
+    } catch (err) {
+      console.warn('setZoomFactor failed:', err);
+    }
+  },
+  getZoomFactor: () => {
+    try {
+      return webFrame.getZoomFactor();
+    } catch {
+      return 1;
+    }
+  },
+
   // Settings
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: settings => ipcRenderer.invoke('settings:save', settings),
   settingsPath: () => ipcRenderer.invoke('settings:path'),
+  openSettingsFolder: () => ipcRenderer.invoke('settings:openFolder'),
 
   // Workspace & user-driven filesystem
   getDefaultWorkspace: () => ipcRenderer.invoke('workspace:default'),
