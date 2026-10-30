@@ -1,5 +1,20 @@
 @import "tailwindcss";
 
+@theme {
+  --animate-activity-square: activity-square 1.05s ease-in-out infinite;
+
+  @keyframes activity-square {
+    0%, 100% {
+      opacity: 0.28;
+      transform: scale(0.82);
+    }
+    35% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+}
+
 @layer base {
   * {
     box-sizing: border-box;

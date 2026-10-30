@@ -70,6 +70,7 @@ import {
 import { streamChat } from '../lib/ollamaClient';
 import { ToolActionCard } from './agent/ToolActionCard';
 import { HelpTip } from './agent/HelpTip';
+import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
 import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
 import { fileToChatImage, modelSupportsVision, toOllamaBase64 } from '../lib/images';
 
@@ -1319,6 +1320,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   const conductorInfo = findLeadArchitect(nodes) || findFastestConductor(nodes);
+  const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+  const activityLabel = streamingActivityLabel(latestAssistant);
 
   const handleNewChatClick = () => {
     if (isStreaming) {
@@ -1792,6 +1795,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       {/* Input Composer */}
       <div className="p-3 border-t border-[#27272a] bg-[#121215]">
+        {isStreaming && <ActivityIndicator label={activityLabel} />}
         {activeTab && (
           <div className="flex items-center justify-between mb-2 px-1 text-[11px] text-zinc-400">
             <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
