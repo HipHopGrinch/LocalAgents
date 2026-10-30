@@ -346,6 +346,10 @@ export interface ElectronAPI {
   saveSettings: (s: AppSettings) => Promise<{ success?: boolean; error?: string }>;
   settingsPath: () => Promise<string>;
   openSettingsFolder: () => Promise<{ success?: boolean; path?: string; error?: string }>;
+  writeLog: (level: string, message: string) => Promise<{ success?: boolean; error?: string }>;
+  readLogTail: () => Promise<{ success?: boolean; text?: string; path?: string; error?: string }>;
+  logsPath: () => Promise<string>;
+  openLogsFolder: () => Promise<{ success?: boolean; path?: string; error?: string }>;
   /** Encrypt node configs to a passphrase-protected .enc file (AES-256-GCM + scrypt). */
   exportNodes: (
     nodes: NodeConfig[],

@@ -56,6 +56,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
   const [selectedTask, setSelectedTask] = useState<TaskId>('agent');
   const [settingsFilePath, setSettingsFilePath] = useState('');
+  const [logsFilePath, setLogsFilePath] = useState('');
+  const [logCopyNote, setLogCopyNote] = useState('');
   
   // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
@@ -147,6 +149,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen || !window.electronAPI) return;
     window.electronAPI.settingsPath().then(setSettingsFilePath).catch(() => setSettingsFilePath(''));
+    window.electronAPI.logsPath?.().then(setLogsFilePath).catch(() => setLogsFilePath(''));
   }, [isOpen]);
 
   // After opening Hardware Settings, inspect installed models missing Ollama metadata
@@ -1132,14 +1135,49 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
               <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
                 {settingsFilePath || '%APPDATA%\\LocalAgents Studio\\settings.json'}
               </code>
-              <button
-                type="button"
-                onClick={() => window.electronAPI?.openSettingsFolder()}
-                className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
-              >
-                <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Open settings folder</span>
-              </button>
+              <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
+                {logsFilePath || '%APPDATA%\\LocalAgents Studio\\logs\\studio.log'}
+              </code>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => window.electronAPI?.openSettingsFolder()}
+                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
+                >
+                  <FolderOpen className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Open settings folder</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const res = await window.electronAPI?.readLogTail?.();
+                    const text = res?.text?.trim();
+                    if (!text) {
+                      setLogCopyNote(res?.error || 'No log yet');
+                      return;
+                    }
+                    try {
+                      await navigator.clipboard.writeText(text);
+                      setLogCopyNote('Copied recent logs');
+                    } catch {
+                      setLogCopyNote('Could not copy');
+                    }
+                    setTimeout(() => setLogCopyNote(''), 2500);
+                  }}
+                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
+                >
+                  <span>Copy recent logs</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.electronAPI?.openLogsFolder?.()}
+                  className="inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] text-zinc-200 bg-[#1e1e24] hover:bg-[#282830] border border-[#2c2c36] rounded transition"
+                >
+                  <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Open logs folder</span>
+                </button>
+                {logCopyNote && <span className="text-[10px] text-emerald-300">{logCopyNote}</span>}
+              </div>
             </div>
 
             <div>

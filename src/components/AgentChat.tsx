@@ -607,6 +607,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         await continueWithToolResults(followUpMsgFinal, opts);
       }
     } catch (err: any) {
+      window.electronAPI?.writeLog?.('error', `code generation: ${err?.message || err}`);
       setMessages(prev => prev.map(m => {
         if (m.id === followUpId) {
           return {
@@ -1242,6 +1243,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
     } catch (err: any) {
       console.error('Pipeline error:', err);
+      window.electronAPI?.writeLog?.('error', `swarm: ${err?.message || err}`);
       patchPipelineMsg({
         display: `⚠️ Conductor Swarm error: ${err?.message || err}`
       });
@@ -1491,6 +1493,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         await continueWithToolResults(origin, { createIntent: false, node: routedNode, model: routedModel });
       }
     } catch (err: any) {
+      window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${err?.message || err}`);
       setMessages(prev =>
         prev.map(m => {
           if (m.id === agentMsgId) {
@@ -1704,6 +1707,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         setExecutingPlanNotice(null);
       }
     } catch (err: any) {
+      window.electronAPI?.writeLog?.('error', `continuation check: ${err?.message || err}`);
       setMessages(prev =>
         prev.map(m =>
           m.id === agentMsgId

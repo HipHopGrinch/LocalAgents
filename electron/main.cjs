@@ -65,9 +65,14 @@ function createWindow() {
     mainWindow.loadFile(distIndex);
   }
 
-  // Forward renderer errors to the terminal that launched the app (helps debugging packaged builds)
+  // Warnings and errors go to the feedback log and, when present, the launching terminal.
   mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
-    if (level >= 3) console.error(`[renderer] ${message} (${sourceId}:${line})`);
+    if (level < 2) return;
+    const label = level >= 3 ? 'error' : 'warn';
+    const text = `[renderer] ${message} (${sourceId}:${line})`;
+    if (level >= 3) console.error(text);
+    else console.warn(text);
+    appendLog(label, text);
   });
 
   // Open external links in the default browser instead of inside the app
@@ -76,6 +81,14 @@ function createWindow() {
     return { action: 'deny' };
   });
 }
+
+process.on('uncaughtException', err => {
+  appendLog('error', `uncaughtException: ${err && err.stack ? err.stack : err}`);
+});
+process.on('unhandledRejection', reason => {
+  const text = reason && reason.stack ? reason.stack : String(reason);
+  appendLog('error', `unhandledRejection: ${text}`);
+});
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => {
@@ -122,6 +135,101 @@ ipcMain.handle('settings:openFolder', async () => {
   const err = await shell.openPath(dir);
   return err ? { error: err } : { success: true, path: dir };
 });
+
+// ==========================================
+// FEEDBACK LOG (userData/logs/studio.log)
+// Rotates once at ~2 MB so a session can be pasted without a huge file.
+// ==========================================
+
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+const LOG_TAIL_BYTES = 200 * 1024;
+
+function logFilePath() {
+  return path.join(app.getPath('userData'), 'logs', 'studio.log');
+}
+
+function redactLog(text) {
+  return String(text || '')
+    .replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-[redacted]')
+    .replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, 'Bearer [redacted]')
+    .replace(/(api[_-]?key|token|password|passphrase|authorization)\s*[=:]\s*\S+/gi, '$1=[redacted]');
+}
+
+let logChain = Promise.resolve();
+
+function appendLog(level, message) {
+  const line = `${new Date().toISOString()} ${(level || 'info').toUpperCase()} ${redactLog(message).replace(/\s*\r?\n\s*/g, ' | ').slice(0, 4000)}\n`;
+  logChain = logChain.then(async () => {
+    const file = logFilePath();
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    try {
+      const stat = await fsp.stat(file);
+      if (stat.size >= LOG_MAX_BYTES) {
+        const backup = `${file}.1`;
+        await fsp.rm(backup, { force: true }).catch(() => {});
+        await fsp.rename(file, backup);
+      }
+    } catch {
+      /* file not created yet */
+    }
+    await fsp.appendFile(file, line, 'utf-8');
+  }).catch(err => {
+    console.error('log write failed:', err.message);
+  });
+  return logChain;
+}
+
+async function readLogTail() {
+  const file = logFilePath();
+  const chunks = [];
+  for (const candidate of [`${file}.1`, file]) {
+    try {
+      const stat = await fsp.stat(candidate);
+      const start = Math.max(0, stat.size - LOG_TAIL_BYTES);
+      const fh = await fsp.open(candidate, 'r');
+      try {
+        const buf = Buffer.alloc(stat.size - start);
+        await fh.read(buf, 0, buf.length, start);
+        chunks.push(buf.toString('utf-8'));
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      /* missing */
+    }
+  }
+  const text = chunks.join('');
+  return text.length > LOG_TAIL_BYTES ? text.slice(-LOG_TAIL_BYTES) : text;
+}
+
+ipcMain.handle('logs:write', async (_e, level, message) => {
+  try {
+    await appendLog(level || 'info', message);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('logs:readTail', async () => {
+  try {
+    const text = await readLogTail();
+    return { success: true, text, path: logFilePath() };
+  } catch (err) {
+    return { error: err.message, text: '', path: logFilePath() };
+  }
+});
+
+ipcMain.handle('logs:path', () => logFilePath());
+
+ipcMain.handle('logs:openFolder', async () => {
+  const dir = path.dirname(logFilePath());
+  await fsp.mkdir(dir, { recursive: true });
+  const err = await shell.openPath(dir);
+  return err ? { error: err } : { success: true, path: dir };
+});
+
+appendLog('info', `studio start ${app.getVersion()}`);
 
 // ==========================================
 // ENCRYPTED NODE SETUP EXPORT / IMPORT

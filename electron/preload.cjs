@@ -31,6 +31,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveSettings: settings => ipcRenderer.invoke('settings:save', settings),
   settingsPath: () => ipcRenderer.invoke('settings:path'),
   openSettingsFolder: () => ipcRenderer.invoke('settings:openFolder'),
+  writeLog: (level, message) => ipcRenderer.invoke('logs:write', level, message),
+  readLogTail: () => ipcRenderer.invoke('logs:readTail'),
+  logsPath: () => ipcRenderer.invoke('logs:path'),
+  openLogsFolder: () => ipcRenderer.invoke('logs:openFolder'),
   exportNodes: (nodes, passphrase) => ipcRenderer.invoke('settings:exportNodes', { nodes, passphrase }),
   importNodes: passphrase => ipcRenderer.invoke('settings:importNodes', { passphrase }),
 
