@@ -48,7 +48,9 @@ import {
   findLeadArchitect,
   groupTscErrorsByFile,
   isTypeScriptContractPath,
+  endpointQueueKey,
   parseSwarmManifest,
+  queueAssignmentsByGpu,
   type SwarmAssignment,
   type SwarmManifest
 } from '../lib/swarmContract';
@@ -855,6 +857,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
+      const gpuQueues = queueAssignmentsByGpu(assignments);
+      const queueHeadSteps = new Set(gpuQueues.map(queue => queue[0].stepIdx));
       const localCount = assignments.filter(a => !isFrontierNode(a.node)).length;
       const frontierCount = assignments.length - localCount;
       const siblingSummary = assignments
@@ -876,52 +880,76 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           content: `Locked shared contract (${manifest.tasks.length} tasks)`,
           toolCalls: []
         },
-        ...assignments.map(({ task, node, model, skippedReason }) => ({
-          nodeId: node.id,
-          nodeName: `${node.name} → ${task.filePath}`,
-          modelName: model,
-          targetFile: task.filePath,
-          agentHandle: 'coder' as const,
-          role: `${task.role || task.preferredRole} · ${model}${
-            isFrontierNode(node) ? ' (frontier)' : ' (local)'
-          }${skippedReason ? ` — ${skippedReason}` : ''}`,
-          status: (skippedReason && !node.online ? 'failed' : 'running') as PipelineStep['status'],
-          content:
-            skippedReason && !node.online
+        ...assignments.map(({ task, node, model, skippedReason }, i) => {
+          const stepIdx = i + 1;
+          const offline = !!(skippedReason && !node.online);
+          const isHead = queueHeadSteps.has(stepIdx);
+          const status: PipelineStep['status'] = offline ? 'failed' : isHead ? 'running' : 'pending';
+          return {
+            nodeId: node.id,
+            nodeName: `${node.name} → ${task.filePath}`,
+            modelName: model,
+            targetFile: task.filePath,
+            agentHandle: 'coder' as const,
+            role: `${task.role || task.preferredRole} · ${model}${
+              isFrontierNode(node) ? ' (frontier)' : ' (local)'
+            }${skippedReason ? ` — ${skippedReason}` : ''}`,
+            status,
+            content: offline
               ? `Skipped: ${skippedReason}`
-              : `Generating ${task.filePath} on ${node.name} using ${model}…`,
-          toolCalls: [] as PipelineStep['toolCalls']
-        }))
+              : isHead
+                ? `Generating ${task.filePath} on ${node.name} using ${model}…`
+                : `Queued on ${node.name} — one model at a time (${model})`,
+            toolCalls: [] as PipelineStep['toolCalls']
+          };
+        })
       ];
 
       patchPipelineMsg({
         display:
           frontierCount > 0 && localCount === 0
             ? `⚡ Pass 2 — dispatched ${assignments.length} files via frontier backup (contract locked):`
-            : `⚡ Pass 2 — dispatched ${assignments.length} files across ${localCount} local worker${
-                localCount === 1 ? '' : 's'
-              }${frontierCount ? ` + ${frontierCount} frontier` : ''} (contract injected read-only):`,
+            : `⚡ Pass 2 — ${assignments.length} files across ${gpuQueues.length} GPU${
+                gpuQueues.length === 1 ? '' : 's'
+              } (${localCount} local worker${localCount === 1 ? '' : 's'}${
+                frontierCount ? ` + ${frontierCount} frontier` : ''
+              }). Each machine runs one file at a time:`,
         pipelineSteps: initialSteps
       });
 
       await Promise.allSettled(
-        assignments.map(async (assignment, i) => {
-          const idx = i + 1; // offset 0 = contract step
-          const current = await readWorkspaceRel(assignment.task.filePath);
-          const workerPrompt = buildSwarmWorkerPrompt({
-            task: assignment.task,
-            contractFile: manifest.contractFile,
-            contractCode: manifest.contractCode,
-            siblingSummary,
-            currentFileContent: current,
-            userPrompt: fullPrompt
-          });
-          await runWorkerTurn({
-            idx,
-            assignment,
-            userPrompt: workerPrompt,
-            expectedFilePath: assignment.task.filePath
-          });
+        gpuQueues.map(async queue => {
+          for (let n = 0; n < queue.length; n++) {
+            const { assignment, stepIdx } = queue[n];
+            if (n > 0) {
+              patchPipelineMsg(m => {
+                if (!m.pipelineSteps?.[stepIdx]) return m;
+                const updatedSteps = [...m.pipelineSteps];
+                updatedSteps[stepIdx] = {
+                  ...updatedSteps[stepIdx],
+                  status: 'running',
+                  modelName: assignment.model,
+                  content: `Generating ${assignment.task.filePath} on ${assignment.node.name} using ${assignment.model}…`
+                };
+                return { ...m, pipelineSteps: updatedSteps };
+              });
+            }
+            const current = await readWorkspaceRel(assignment.task.filePath);
+            const workerPrompt = buildSwarmWorkerPrompt({
+              task: assignment.task,
+              contractFile: manifest.contractFile,
+              contractCode: manifest.contractCode,
+              siblingSummary,
+              currentFileContent: current,
+              userPrompt: fullPrompt
+            });
+            await runWorkerTurn({
+              idx: stepIdx,
+              assignment,
+              userPrompt: workerPrompt,
+              expectedFilePath: assignment.task.filePath
+            });
+          }
         })
       );
 
@@ -978,36 +1006,46 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               display: `🔧 Targeted repair — re-prompting ${repairJobs.length} GPU owner(s) with tsc stderr…`
             }));
 
-            await Promise.allSettled(
-              repairJobs.map(async ({ idx, assignment, errors }) => {
-                patchPipelineMsg(m => {
-                  if (!m.pipelineSteps?.[idx]) return m;
-                  const updatedSteps = [...m.pipelineSteps];
-                  updatedSteps[idx] = {
-                    ...updatedSteps[idx],
-                    status: 'running',
-                    content: `Repairing ${assignment.task.filePath} from tsc errors…`
-                  };
-                  return { ...m, pipelineSteps: updatedSteps };
-                });
+            const repairQueues = new Map<string, typeof repairJobs>();
+            for (const job of repairJobs) {
+              const key = endpointQueueKey(job.assignment.node);
+              const queue = repairQueues.get(key) ?? [];
+              queue.push(job);
+              repairQueues.set(key, queue);
+            }
 
-                const current =
-                  (await readWorkspaceRel(assignment.task.filePath)) ||
-                  '(file missing after Pass 2)';
-                const repairPrompt = buildRepairWorkerPrompt({
-                  task: assignment.task,
-                  contractFile: manifest.contractFile,
-                  contractCode: manifest.contractCode,
-                  currentFileContent: current,
-                  tscErrors: errors
-                });
-                await runWorkerTurn({
-                  idx,
-                  assignment,
-                  userPrompt: repairPrompt,
-                  expectedFilePath: assignment.task.filePath,
-                  stepLabel: `Repaired ${assignment.task.filePath}`
-                });
+            await Promise.allSettled(
+              [...repairQueues.values()].map(async queue => {
+                for (const { idx, assignment, errors } of queue) {
+                  patchPipelineMsg(m => {
+                    if (!m.pipelineSteps?.[idx]) return m;
+                    const updatedSteps = [...m.pipelineSteps];
+                    updatedSteps[idx] = {
+                      ...updatedSteps[idx],
+                      status: 'running',
+                      content: `Repairing ${assignment.task.filePath} from tsc errors…`
+                    };
+                    return { ...m, pipelineSteps: updatedSteps };
+                  });
+
+                  const current =
+                    (await readWorkspaceRel(assignment.task.filePath)) ||
+                    '(file missing after Pass 2)';
+                  const repairPrompt = buildRepairWorkerPrompt({
+                    task: assignment.task,
+                    contractFile: manifest.contractFile,
+                    contractCode: manifest.contractCode,
+                    currentFileContent: current,
+                    tscErrors: errors
+                  });
+                  await runWorkerTurn({
+                    idx,
+                    assignment,
+                    userPrompt: repairPrompt,
+                    expectedFilePath: assignment.task.filePath,
+                    stepLabel: `Repaired ${assignment.task.filePath}`
+                  });
+                }
               })
             );
 
@@ -1557,7 +1595,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               <p><b className="text-zinc-300">Off (default):</b> one message → one node/model. Best for questions, edits, and single-file work.</p>
               <p><b className="text-zinc-300">On (contract-first):</b> Pass 1 locks a shared TypeScript contract on the Lead Architect GPU, verifies it with <code className="text-indigo-300">tsc</code>, then Pass 2 fans file workers across online GPUs with that contract injected read-only.</p>
               <p><b className="text-zinc-300">Local-first:</b> uses enabled models on online Ollama GPUs (high-VRAM @coder preferred for Pass 1). Frontier APIs only when no local workers are available.</p>
-              <p>After workers finish, workspace <code className="text-indigo-300">tsc</code> routes errors back to the GPU that owns the broken file.</p>
+              <p>Each GPU runs one file at a time on one model, so a 16GB card is not asked to hold two models. Different PCs still run together. After workers finish, workspace <code className="text-indigo-300">tsc</code> routes errors back to the GPU that owns the broken file.</p>
             </HelpTip>
           </div>
 
@@ -1673,7 +1711,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                         >
                           <div className="flex items-center justify-between font-mono text-[10px] mb-1">
                             <span className="text-indigo-300 font-bold truncate">{step.nodeName}</span>
-                            <span className={step.status === 'completed' ? 'text-emerald-400 shrink-0 ml-2' : 'text-amber-400 animate-pulse shrink-0 ml-2'}>
+                            <span className={`shrink-0 ml-2 ${
+                              step.status === 'completed'
+                                ? 'text-emerald-400'
+                                : step.status === 'failed'
+                                  ? 'text-red-400'
+                                  : step.status === 'pending'
+                                    ? 'text-zinc-500'
+                                    : 'text-amber-400 animate-pulse'
+                            }`}>
                               {step.status} {step.stats ? `(${step.stats.tokensPerSec} t/s)` : ''}
                             </span>
                           </div>

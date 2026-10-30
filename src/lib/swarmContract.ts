@@ -35,6 +35,45 @@ export interface SwarmAssignment {
   skippedReason?: string;
 }
 
+/** One assigned file plus its pipeline-step index (step 0 is the contract). */
+export interface SwarmWorkItem {
+  assignment: SwarmAssignment;
+  stepIdx: number;
+}
+
+/** Same Ollama URL shares one GPU, even if two node entries point at it. */
+export function endpointQueueKey(node: EndpointNode): string {
+  return (node.url || node.id || '').replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * One in-flight chat per GPU URL. Different URLs stay parallel.
+ * The heaviest file's model is pinned for the whole queue so a 16GB card
+ * does not load a 14B and a 7B at the same time.
+ */
+export function queueAssignmentsByGpu(assignments: SwarmAssignment[]): SwarmWorkItem[][] {
+  const queues = new Map<string, SwarmWorkItem[]>();
+  assignments.forEach((assignment, i) => {
+    const key = endpointQueueKey(assignment.node);
+    const queue = queues.get(key) ?? [];
+    queue.push({ assignment, stepIdx: i + 1 });
+    queues.set(key, queue);
+  });
+
+  for (const queue of queues.values()) {
+    let heaviest = queue[0];
+    for (const item of queue) {
+      const itemWeight = COMPLEXITY_WEIGHT[item.assignment.task.complexity];
+      const bestWeight = COMPLEXITY_WEIGHT[heaviest.assignment.task.complexity];
+      if (itemWeight > bestWeight) heaviest = item;
+    }
+    const pinned = heaviest.assignment.model;
+    for (const item of queue) item.assignment.model = pinned;
+  }
+
+  return [...queues.values()];
+}
+
 const COMPLEXITY_WEIGHT: Record<SwarmComplexity, number> = {
   high: 3,
   medium: 2,
