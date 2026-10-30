@@ -314,6 +314,18 @@ export interface ElectronAPI {
   revealInExplorer: (targetPath: string) => Promise<void>;
 
   execTool: (root: string, name: string, args: Record<string, unknown>) => Promise<ToolExecResult>;
+  typecheckWorkspace: (
+    root: string,
+    opts?: { mode?: 'contract' | 'workspace'; file?: string; timeoutMs?: number }
+  ) => Promise<{
+    ok: boolean;
+    skipped?: boolean;
+    code?: number;
+    output?: string;
+    error?: string;
+    timedOut?: boolean;
+    mode?: string;
+  }>;
 
   executeCommand: (command: string, cwd?: string) => Promise<{ code?: number }>;
   killCommand: () => Promise<{ success: boolean }>;

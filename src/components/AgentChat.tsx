@@ -34,13 +34,24 @@ import {
   getPreferredModelForNode,
   selectBestEndpointForTask,
   findFastestConductor,
-  buildDecompositionPrompt,
-  parseConductorPlan,
-  assignJobsToCluster,
   isFrontierNode,
   stripThinking,
   looksLikeCreateIntent
 } from '../lib/tools';
+import {
+  assignSwarmTasksToCluster,
+  buildContractRepairPrompt,
+  buildLeadArchitectPrompt,
+  buildRepairWorkerPrompt,
+  buildSwarmWorkerPrompt,
+  fallbackSwarmManifest,
+  findLeadArchitect,
+  groupTscErrorsByFile,
+  isTypeScriptContractPath,
+  parseSwarmManifest,
+  type SwarmAssignment,
+  type SwarmManifest
+} from '../lib/swarmContract';
 import {
   MAX_TOOL_CONTINUATIONS,
   MAX_COMMAND_FIX_ATTEMPTS,
@@ -477,7 +488,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   // ==========================================
-  // CONDUCTOR MULTI-NODE FILE DISTRIBUTION
+  // CONDUCTOR SWARM — CONTRACT-FIRST TWO-PASS
   // ==========================================
   const handleSendPipelineMessage = async (userText: string, fullPrompt: string) => {
     resetAgentLoopBudget();
@@ -490,16 +501,202 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     };
 
     const agentMsgId = `pipeline-${Date.now()}`;
-    const conductor = findFastestConductor(nodes);
+    const architect = findLeadArchitect(nodes);
+
+    const patchPipelineMsg = (
+      patch: Partial<ChatMessage> | ((m: ChatMessage) => ChatMessage)
+    ) => {
+      setMessages(prev =>
+        prev.map(m => {
+          if (m.id !== agentMsgId) return m;
+          return typeof patch === 'function' ? patch(m) : { ...m, ...patch };
+        })
+      );
+    };
+
+    const readWorkspaceRel = async (rel: string): Promise<string | undefined> => {
+      if (!window.electronAPI || !workspacePath) return undefined;
+      const abs = `${workspacePath}\\${rel.replace(/^[\\/]+/, '').replace(/\//g, '\\')}`;
+      try {
+        const res = await window.electronAPI.readFile(abs);
+        return res.content;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const loadExistingSnippets = async (): Promise<string> => {
+      if (!workspaceFiles?.length || !window.electronAPI) return '';
+      const files = workspaceFiles
+        .filter(f => !f.isDirectory && /\.(ts|tsx|js|jsx|json)$/i.test(f.name))
+        .slice(0, 5);
+      const chunks: string[] = [];
+      for (const f of files) {
+        try {
+          const res = await window.electronAPI.readFile(f.path);
+          if (res.content != null) {
+            chunks.push(`### ${f.name}\n\`\`\`\n${res.content.slice(0, 2500)}\n\`\`\``);
+          }
+        } catch {
+          /* skip */
+        }
+      }
+      return chunks.join('\n\n');
+    };
+
+    const recordTok = (node: EndpointNode, stats?: { evalCount?: number; promptEvalCount?: number }) => {
+      if (!stats?.evalCount) return;
+      const tok = stats.evalCount + (stats.promptEvalCount || 0);
+      if (isFrontierNode(node)) onRecordTokens(0, tok);
+      else onRecordTokens(tok, 0);
+    };
+
+    const runWorkerTurn = async (opts: {
+      idx: number;
+      assignment: SwarmAssignment;
+      userPrompt: string;
+      expectedFilePath: string;
+      stepLabel?: string;
+    }) => {
+      const { idx, assignment, userPrompt, expectedFilePath } = opts;
+      const { node, model, skippedReason } = assignment;
+      if (skippedReason && !node.online) {
+        patchPipelineMsg(m => {
+          if (!m.pipelineSteps) return m;
+          const updatedSteps = [...m.pipelineSteps];
+          if (updatedSteps[idx]) {
+            updatedSteps[idx] = {
+              ...updatedSteps[idx],
+              status: 'failed',
+              content: `Skipped: ${skippedReason}`
+            };
+          }
+          return { ...m, pipelineSteps: updatedSteps };
+        });
+        return;
+      }
+
+      const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview);
+      const body = withThink(
+        {
+          model,
+          messages: [
+            { role: 'system', content: workerSystemPrompt },
+            { role: 'user', content: userPrompt }
+          ],
+          options: { temperature: currentAgent.temperature, num_ctx: currentAgent.numCtx }
+        },
+        node,
+        model
+      );
+
+      try {
+        const handle = streamChat(
+          node.url,
+          body,
+          content => {
+            patchPipelineMsg(m => {
+              if (!m.pipelineSteps) return m;
+              const updatedSteps = [...m.pipelineSteps];
+              if (updatedSteps[idx]) {
+                updatedSteps[idx] = { ...updatedSteps[idx], content };
+              }
+              return { ...m, pipelineSteps: updatedSteps };
+            });
+          },
+          node.type,
+          node.apiKey
+        );
+        activeAbortsRef.current.push(handle.abort);
+        const res = await handle.done;
+        recordTok(node, res.stats);
+
+        let tools = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
+          expectedFilePath,
+          createIntent: true
+        }).toolCalls;
+
+        const readPass = await runReadOnlyTools(tools, toolDeps);
+        tools = readPass.tools;
+
+        if (autoApplyWrites) {
+          tools = await autoApplyWritableTools(tools, toolDeps);
+          const cmdPass = await runCommandTools(tools, toolDeps);
+          tools = cmdPass.tools;
+        }
+
+        if (shouldContinueFromTools(tools, continueDecisionOpts())) {
+          const origin: ChatMessage = {
+            id: `${agentMsgId}-worker-${idx}`,
+            role: 'assistant',
+            raw: res.content,
+            display: '',
+            toolCalls: tools,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          };
+          await continueWithToolResults(origin, {
+            expectedFilePath,
+            createIntent: true,
+            node,
+            model
+          });
+        }
+
+        const parsedDisplay = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
+          expectedFilePath,
+          createIntent: true
+        }).display;
+
+        patchPipelineMsg(m => {
+          if (!m.pipelineSteps) return m;
+          const updatedSteps = [...m.pipelineSteps];
+          if (updatedSteps[idx]) {
+            updatedSteps[idx] = {
+              ...updatedSteps[idx],
+              status: 'completed',
+              content:
+                opts.stepLabel ||
+                parsedDisplay ||
+                `Completed ${expectedFilePath}`,
+              toolCalls: tools,
+              stats:
+                res.stats?.evalCount && res.stats?.evalDuration
+                  ? {
+                      evalCount: res.stats.evalCount,
+                      tokensPerSec: Math.round(
+                        res.stats.evalCount / (res.stats.evalDuration / 1e9)
+                      )
+                    }
+                  : undefined
+            };
+          }
+          const allTools = updatedSteps.flatMap(s => s.toolCalls || []);
+          return { ...m, pipelineSteps: updatedSteps, toolCalls: allTools };
+        });
+      } catch (workerErr: any) {
+        patchPipelineMsg(m => {
+          if (!m.pipelineSteps) return m;
+          const updatedSteps = [...m.pipelineSteps];
+          if (updatedSteps[idx]) {
+            updatedSteps[idx] = {
+              ...updatedSteps[idx],
+              status: 'failed',
+              content: `Failed on ${node.name}: ${workerErr?.message || workerErr}`
+            };
+          }
+          return { ...m, pipelineSteps: updatedSteps };
+        });
+      }
+    };
 
     const initialAgentMsg: ChatMessage = {
       id: agentMsgId,
       role: 'assistant',
       raw: '',
-      display: conductor
-        ? `⚡ Conductor (${conductor.node.name} • ${conductor.model} @ ~${conductor.tokPerSec} tok/s${
-            conductor.usedFrontierBackup ? ' · frontier backup' : ' · local'
-          }) is decomposing your request into parallel file jobs...`
+      display: architect
+        ? `⚡ Pass 1 — Lead Architect (${architect.node.name} • ${architect.model} @ ~${architect.tokPerSec} tok/s${
+            architect.usedFrontierBackup ? ' · frontier backup' : ' · local'
+          }) is locking the shared TypeScript contract...`
         : '⚠️ No endpoints configured. Open Hardware Settings and add an Ollama node first.',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       pipelineSteps: [],
@@ -510,246 +707,335 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setIsStreaming(true);
 
     try {
-      if (!conductor || !conductor.node?.online) {
-        setMessages(prev =>
-          prev.map(m =>
-            m.id === agentMsgId
-              ? {
-                  ...m,
-                  display:
-                    '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
-                }
-              : m
-          )
-        );
+      if (!architect || !architect.node?.online) {
+        patchPipelineMsg({
+          display:
+            '⚠️ No online cluster nodes with enabled models. Open Hardware Settings, enable models on a local Ollama node (frontier APIs are backup only).'
+        });
         return;
       }
 
-      // Phase 1: Fast Conductor Task Decomposition into distinct files
-      let fileJobs = parseConductorPlan('', userText);
+      // ── Pass 1: Generate Shared Contract & Manifest ──
+      let manifest: SwarmManifest = fallbackSwarmManifest(userText);
       try {
-        const decompPrompt = buildDecompositionPrompt(userText, workspaceOverview);
+        const snippets = await loadExistingSnippets();
+        const architectPrompt = buildLeadArchitectPrompt(userText, workspaceOverview, snippets);
+        const architectBody: Record<string, unknown> = {
+          model: architect.model,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON.'
+            },
+            { role: 'user', content: architectPrompt }
+          ],
+          options: { temperature: 0.1, num_ctx: 8192 }
+        };
+        if (!isFrontierNode(architect.node)) architectBody.format = 'json';
         const decompHandle = streamChat(
-          conductor.node.url,
-          withThink({
-            model: conductor.model,
-            messages: [
-              {
-                role: 'system',
-                content: 'You are a fast task-decomposition Conductor. Respond ONLY with a valid JSON array of file objects.'
-              },
-              { role: 'user', content: decompPrompt }
-            ],
-            options: { temperature: 0.1, num_ctx: 4096 }
-          }, conductor.node, conductor.model),
+          architect.node.url,
+          withThink(architectBody, architect.node, architect.model),
           () => {},
-          conductor.node.type,
-          conductor.node.apiKey
+          architect.node.type,
+          architect.node.apiKey
         );
         activeAbortsRef.current.push(decompHandle.abort);
         const decompRes = await decompHandle.done;
-        if (decompRes.stats?.evalCount) {
-          const tok = decompRes.stats.evalCount + (decompRes.stats.promptEvalCount || 0);
-          if (isFrontierNode(conductor.node)) onRecordTokens(0, tok);
-          else onRecordTokens(tok, 0);
-        }
-        fileJobs = parseConductorPlan(decompRes.content, userText);
+        recordTok(architect.node, decompRes.stats);
+        const parsed = parseSwarmManifest(decompRes.content, userText);
+        if (parsed) manifest = parsed;
+        else console.warn('Pass 1 JSON parse failed — using fallback manifest');
       } catch (decompErr) {
-        console.warn('Conductor LLM decomposition fallback triggered:', decompErr);
+        console.warn('Pass 1 Lead Architect failed — using fallback:', decompErr);
       }
 
-      // Phase 2: Local-first assignment — best enabled model per job; frontier only if no local GPUs
-      const assignments = assignJobsToCluster(fileJobs, nodes);
-      const localCount = assignments.filter(a => !isFrontierNode(a.node)).length;
-      const frontierCount = assignments.length - localCount;
-
-      const initialSteps: PipelineStep[] = assignments.map(({ job, node, model, skippedReason }) => ({
-        nodeId: node.id,
-        nodeName: `${node.name} → ${job.filePath}`,
-        modelName: model,
-        targetFile: job.filePath,
-        agentHandle: 'coder',
-        role: `${job.role} · ${model}${isFrontierNode(node) ? ' (frontier)' : ' (local)'}${
-          skippedReason ? ` — ${skippedReason}` : ''
-        }`,
-        status: skippedReason && !node.online ? 'failed' : 'running',
-        content: skippedReason && !node.online
-          ? `Skipped: ${skippedReason}`
-          : `Generating ${job.filePath} on ${node.name} using ${model}...`,
-        toolCalls: []
-      }));
-
-      setMessages(prev =>
-        prev.map(m =>
-          m.id === agentMsgId
-            ? {
-                ...m,
-                display:
-                  frontierCount > 0 && localCount === 0
-                    ? `⚡ Conductor dispatched ${assignments.length} files via frontier backup (no local Ollama workers online):`
-                    : `⚡ Conductor dispatched ${assignments.length} files across ${localCount} local worker${
-                        localCount === 1 ? '' : 's'
-                      }${frontierCount ? ` + ${frontierCount} frontier backup` : ''} (enabled models only):`,
-                pipelineSteps: initialSteps
-              }
-            : m
-        )
-      );
-
-      // Phase 3: Parallel Multi-Node File Generation
-      const allSiblingFiles = assignments.map(a => `- ${a.job.filePath}: ${a.job.description}`).join('\n');
-
-      const tasks = assignments.map(async ({ job, node, model, skippedReason }, idx) => {
-        if (skippedReason && !node.online) {
-          return;
-        }
-
-        const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview);
-        const workerUserPrompt = `[DISTRIBUTED FILE ASSIGNMENT]
-You are assigned to write EXACTLY ONE FILE for this project: "${job.filePath}"
-Role: ${job.role}
-File Specification: ${job.description}
-
-Project Architecture (files being written simultaneously by other GPUs):
-${allSiblingFiles}
-
-Overall User Request:
-${fullPrompt}
-
-CRITICAL REQUIREMENT:
-You MUST output the complete, working code for "${job.filePath}" wrapped inside:
-<write_file path="${job.filePath}">
-...complete code here...
-</write_file>
-Do NOT omit code with placeholders. Ensure imports/links match the sibling files listed above.`;
-
-        const body = withThink({
-          model,
-          messages: [
-            { role: 'system', content: workerSystemPrompt },
-            { role: 'user', content: workerUserPrompt }
-          ],
-          options: { temperature: currentAgent.temperature, num_ctx: currentAgent.numCtx }
-        }, node, model);
-
-        try {
-          const handle = streamChat(
-            node.url,
-            body,
-            (content) => {
-              setMessages(prev =>
-                prev.map(m => {
-                  if (m.id === agentMsgId && m.pipelineSteps) {
-                    const updatedSteps = [...m.pipelineSteps];
-                    updatedSteps[idx] = {
-                      ...updatedSteps[idx],
-                      content
-                    };
-                    return { ...m, pipelineSteps: updatedSteps };
-                  }
-                  return m;
-                })
-              );
-            },
-            node.type,
-            node.apiKey
-          );
-
-          activeAbortsRef.current.push(handle.abort);
-          const res = await handle.done;
-
-          let tools = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
-            expectedFilePath: job.filePath,
-            createIntent: true
-          }).toolCalls;
-
-          const readPass = await runReadOnlyTools(tools, toolDeps);
-          tools = readPass.tools;
-
-          if (autoApplyWrites) {
-            tools = await autoApplyWritableTools(tools, toolDeps);
-            const cmdPass = await runCommandTools(tools, toolDeps);
-            tools = cmdPass.tools;
-          }
-
-          if (shouldContinueFromTools(tools, continueDecisionOpts())) {
-            const origin: ChatMessage = {
-              id: `${agentMsgId}-worker-${idx}`,
-              role: 'assistant',
-              raw: res.content,
-              display: '',
-              toolCalls: tools,
-              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-            };
-            await continueWithToolResults(origin, {
-              expectedFilePath: job.filePath,
-              createIntent: true,
-              node,
-              model
-            });
-          }
-
-          if (res.stats?.evalCount) {
-            const tok = res.stats.evalCount + (res.stats.promptEvalCount || 0);
-            if (isFrontierNode(node)) onRecordTokens(0, tok);
-            else onRecordTokens(tok, 0);
-          }
-
-          const parsedDisplay = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
-            expectedFilePath: job.filePath,
-            createIntent: true
-          }).display;
-
-          setMessages(prev =>
-            prev.map(m => {
-              if (m.id === agentMsgId && m.pipelineSteps) {
-                const updatedSteps = [...m.pipelineSteps];
-                updatedSteps[idx] = {
-                  ...updatedSteps[idx],
-                  status: 'completed',
-                  content: parsedDisplay || `Completed ${job.filePath}`,
-                  toolCalls: tools,
-                  stats:
-                    res.stats?.evalCount && res.stats?.evalDuration
-                      ? {
-                          evalCount: res.stats.evalCount,
-                          tokensPerSec: Math.round(res.stats.evalCount / (res.stats.evalDuration / 1e9))
-                        }
-                      : undefined
-                };
-
-                const allTools = updatedSteps.flatMap(s => s.toolCalls || []);
-                return {
-                  ...m,
-                  display: `✅ Conductor completed parallel generation of ${updatedSteps.length} files across your cluster.`,
-                  pipelineSteps: updatedSteps,
-                  toolCalls: allTools
-                };
-              }
-              return m;
-            })
-          );
-        } catch (workerErr: any) {
-          setMessages(prev =>
-            prev.map(m => {
-              if (m.id === agentMsgId && m.pipelineSteps) {
-                const updatedSteps = [...m.pipelineSteps];
-                updatedSteps[idx] = {
-                  ...updatedSteps[idx],
-                  status: 'failed',
-                  content: `Failed on ${node.name}: ${workerErr?.message || workerErr}`
-                };
-                return { ...m, pipelineSteps: updatedSteps };
-              }
-              return m;
-            })
-          );
-        }
+      // ── Stage 2: Write Contract & Verify Syntax ──
+      patchPipelineMsg({
+        display: `📝 Writing shared contract \`${manifest.contractFile}\` (${manifest.tasks.length} worker file${
+          manifest.tasks.length === 1 ? '' : 's'
+        })…`
       });
 
-      await Promise.all(tasks);
+      const writeOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+      if (!writeOk) {
+        patchPipelineMsg({
+          display: `⚠️ Failed to write contract file \`${manifest.contractFile}\`. Aborting swarm.`
+        });
+        return;
+      }
+
+      if (
+        isTypeScriptContractPath(manifest.contractFile) &&
+        window.electronAPI?.typecheckWorkspace &&
+        workspacePath
+      ) {
+        let check = await window.electronAPI.typecheckWorkspace(workspacePath, {
+          mode: 'contract',
+          file: manifest.contractFile,
+          timeoutMs: 45000
+        });
+
+        if (!check.ok) {
+          patchPipelineMsg({
+            display: `🔧 Contract failed tsc — Lead Architect self-correcting before waking workers…\n\`\`\`\n${(
+              check.output ||
+              check.error ||
+              ''
+            ).slice(0, 1200)}\n\`\`\``
+          });
+          try {
+            const repairPrompt = buildContractRepairPrompt(
+              userText,
+              manifest,
+              check.output || check.error || 'unknown tsc error'
+            );
+            const repairBody: Record<string, unknown> = {
+              model: architect.model,
+              messages: [
+                {
+                  role: 'system',
+                  content: 'Fix the Swarm JSON manifest so contractCode typechecks. JSON only.'
+                },
+                { role: 'user', content: repairPrompt }
+              ],
+              options: { temperature: 0.1, num_ctx: 8192 }
+            };
+            if (!isFrontierNode(architect.node)) repairBody.format = 'json';
+            const repairHandle = streamChat(
+              architect.node.url,
+              withThink(repairBody, architect.node, architect.model),
+              () => {},
+              architect.node.type,
+              architect.node.apiKey
+            );
+            activeAbortsRef.current.push(repairHandle.abort);
+            const repairRes = await repairHandle.done;
+            recordTok(architect.node, repairRes.stats);
+            const repaired = parseSwarmManifest(repairRes.content, userText);
+            if (repaired) {
+              manifest = repaired;
+              await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+              check = await window.electronAPI.typecheckWorkspace(workspacePath, {
+                mode: 'contract',
+                file: manifest.contractFile,
+                timeoutMs: 45000
+              });
+            }
+          } catch (repairErr) {
+            console.warn('Contract repair failed:', repairErr);
+          }
+
+          if (!check.ok) {
+            patchPipelineMsg({
+              display: `⚠️ Contract still fails tsc after repair — continuing with best-effort workers.\n\`\`\`\n${(
+                check.output ||
+                check.error ||
+                ''
+              ).slice(0, 1500)}\n\`\`\``
+            });
+          } else {
+            patchPipelineMsg({
+              display: `✅ Contract \`${manifest.contractFile}\` typechecks. Fan-out Pass 2…`
+            });
+          }
+        } else {
+          patchPipelineMsg({
+            display: `✅ Contract \`${manifest.contractFile}\` locked & typechecked. Fan-out Pass 2…`
+          });
+        }
+      }
+
+      // ── Pass 2: Fan Out Parallel File Workers ──
+      const assignments = assignSwarmTasksToCluster(manifest.tasks, nodes);
+      if (!assignments.length) {
+        patchPipelineMsg({
+          display: '⚠️ No worker assignments produced. Check Hardware Settings for online nodes.'
+        });
+        return;
+      }
+
+      const localCount = assignments.filter(a => !isFrontierNode(a.node)).length;
+      const frontierCount = assignments.length - localCount;
+      const siblingSummary = assignments
+        .map(
+          a =>
+            `- ${a.task.filePath} (${a.task.complexity}${a.task.role ? `, ${a.task.role}` : ''}): ${a.task.instructions.slice(0, 120)}`
+        )
+        .join('\n');
+
+      const initialSteps: PipelineStep[] = [
+        {
+          nodeId: architect.node.id,
+          nodeName: `${architect.node.name} → ${manifest.contractFile}`,
+          modelName: architect.model,
+          targetFile: manifest.contractFile,
+          agentHandle: 'coder',
+          role: `Lead Architect · contract${architect.usedFrontierBackup ? ' (frontier)' : ' (local)'}`,
+          status: 'completed',
+          content: `Locked shared contract (${manifest.tasks.length} tasks)`,
+          toolCalls: []
+        },
+        ...assignments.map(({ task, node, model, skippedReason }) => ({
+          nodeId: node.id,
+          nodeName: `${node.name} → ${task.filePath}`,
+          modelName: model,
+          targetFile: task.filePath,
+          agentHandle: 'coder' as const,
+          role: `${task.role || task.preferredRole} · ${model}${
+            isFrontierNode(node) ? ' (frontier)' : ' (local)'
+          }${skippedReason ? ` — ${skippedReason}` : ''}`,
+          status: (skippedReason && !node.online ? 'failed' : 'running') as PipelineStep['status'],
+          content:
+            skippedReason && !node.online
+              ? `Skipped: ${skippedReason}`
+              : `Generating ${task.filePath} on ${node.name} using ${model}…`,
+          toolCalls: [] as PipelineStep['toolCalls']
+        }))
+      ];
+
+      patchPipelineMsg({
+        display:
+          frontierCount > 0 && localCount === 0
+            ? `⚡ Pass 2 — dispatched ${assignments.length} files via frontier backup (contract locked):`
+            : `⚡ Pass 2 — dispatched ${assignments.length} files across ${localCount} local worker${
+                localCount === 1 ? '' : 's'
+              }${frontierCount ? ` + ${frontierCount} frontier` : ''} (contract injected read-only):`,
+        pipelineSteps: initialSteps
+      });
+
+      await Promise.allSettled(
+        assignments.map(async (assignment, i) => {
+          const idx = i + 1; // offset 0 = contract step
+          const current = await readWorkspaceRel(assignment.task.filePath);
+          const workerPrompt = buildSwarmWorkerPrompt({
+            task: assignment.task,
+            contractFile: manifest.contractFile,
+            contractCode: manifest.contractCode,
+            siblingSummary,
+            currentFileContent: current,
+            userPrompt: fullPrompt
+          });
+          await runWorkerTurn({
+            idx,
+            assignment,
+            userPrompt: workerPrompt,
+            expectedFilePath: assignment.task.filePath
+          });
+        })
+      );
+
+      // ── Stage 4: Workspace Typecheck & Targeted Repair ──
+      if (window.electronAPI?.typecheckWorkspace && workspacePath) {
+        patchPipelineMsg(m => ({
+          ...m,
+          display: `${m.display || ''}\n\n🔍 Running workspace \`tsc --noEmit\`…`
+        }));
+
+        const wsCheck = await window.electronAPI.typecheckWorkspace(workspacePath, {
+          mode: 'workspace',
+          timeoutMs: 90000
+        });
+
+        if (wsCheck.skipped) {
+          patchPipelineMsg(m => ({
+            ...m,
+            display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). ${wsCheck.output || 'No tsconfig — skipped project typecheck.'}`
+          }));
+        } else if (wsCheck.ok) {
+          patchPipelineMsg(m => ({
+            ...m,
+            display: `✅ Conductor Swarm finished ${assignments.length} worker file(s). Workspace typecheck passed.`
+          }));
+        } else {
+          const byFile = groupTscErrorsByFile(wsCheck.output || '', workspacePath);
+          const repairJobs: { idx: number; assignment: SwarmAssignment; errors: string }[] = [];
+
+          assignments.forEach((assignment, i) => {
+            const key = assignment.task.filePath.replace(/\\/g, '/').toLowerCase();
+            let errors = '';
+            for (const [file, err] of byFile.entries()) {
+              if (file.toLowerCase().replace(/\\/g, '/').endsWith(key) || file.toLowerCase() === key) {
+                errors = err;
+                break;
+              }
+            }
+            if (errors) {
+              repairJobs.push({ idx: i + 1, assignment, errors });
+            }
+          });
+
+          if (!repairJobs.length) {
+            patchPipelineMsg(m => ({
+              ...m,
+              display: `⚠️ Workspace tsc reported errors, but none mapped to swarm-owned files.\n\`\`\`\n${(
+                wsCheck.output || ''
+              ).slice(0, 2000)}\n\`\`\``
+            }));
+          } else {
+            patchPipelineMsg(m => ({
+              ...m,
+              display: `🔧 Targeted repair — re-prompting ${repairJobs.length} GPU owner(s) with tsc stderr…`
+            }));
+
+            await Promise.allSettled(
+              repairJobs.map(async ({ idx, assignment, errors }) => {
+                patchPipelineMsg(m => {
+                  if (!m.pipelineSteps?.[idx]) return m;
+                  const updatedSteps = [...m.pipelineSteps];
+                  updatedSteps[idx] = {
+                    ...updatedSteps[idx],
+                    status: 'running',
+                    content: `Repairing ${assignment.task.filePath} from tsc errors…`
+                  };
+                  return { ...m, pipelineSteps: updatedSteps };
+                });
+
+                const current =
+                  (await readWorkspaceRel(assignment.task.filePath)) ||
+                  '(file missing after Pass 2)';
+                const repairPrompt = buildRepairWorkerPrompt({
+                  task: assignment.task,
+                  contractFile: manifest.contractFile,
+                  contractCode: manifest.contractCode,
+                  currentFileContent: current,
+                  tscErrors: errors
+                });
+                await runWorkerTurn({
+                  idx,
+                  assignment,
+                  userPrompt: repairPrompt,
+                  expectedFilePath: assignment.task.filePath,
+                  stepLabel: `Repaired ${assignment.task.filePath}`
+                });
+              })
+            );
+
+            const recheck = await window.electronAPI.typecheckWorkspace(workspacePath, {
+              mode: 'workspace',
+              timeoutMs: 90000
+            });
+            patchPipelineMsg(m => ({
+              ...m,
+              display: recheck.ok
+                ? `✅ Conductor Swarm finished — workspace typecheck passed after targeted repair.`
+                : `⚠️ Conductor Swarm finished with remaining type errors after repair.\n\`\`\`\n${(
+                    recheck.output || ''
+                  ).slice(0, 2000)}\n\`\`\``
+            }));
+          }
+        }
+      } else {
+        patchPipelineMsg(m => ({
+          ...m,
+          display: `✅ Conductor Swarm completed parallel generation of ${assignments.length} files (contract: \`${manifest.contractFile}\`).`
+        }));
+      }
     } catch (err: any) {
       console.error('Pipeline error:', err);
+      patchPipelineMsg({
+        display: `⚠️ Conductor Swarm error: ${err?.message || err}`
+      });
     } finally {
       setIsStreaming(false);
       activeAbortsRef.current = [];
@@ -994,7 +1280,7 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
     }
   };
 
-  const conductorInfo = findFastestConductor(nodes);
+  const conductorInfo = findLeadArchitect(nodes) || findFastestConductor(nodes);
 
   const handleNewChatClick = () => {
     if (isStreaming) {
@@ -1269,9 +1555,9 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
             </button>
             <HelpTip title="Conductor Swarm mode">
               <p><b className="text-zinc-300">Off (default):</b> one message → one node/model. Best for questions, edits, and single-file work.</p>
-              <p><b className="text-zinc-300">On:</b> splits the request into files and runs workers in parallel.</p>
-              <p><b className="text-zinc-300">Local-first:</b> uses enabled models on online Ollama GPUs. Frontier/cloud APIs are used only when no local workers are available.</p>
-              <p>Heavy files prefer stronger coder models; light files prefer faster smaller ones. Load is spread across nodes.</p>
+              <p><b className="text-zinc-300">On (contract-first):</b> Pass 1 locks a shared TypeScript contract on the Lead Architect GPU, verifies it with <code className="text-indigo-300">tsc</code>, then Pass 2 fans file workers across online GPUs with that contract injected read-only.</p>
+              <p><b className="text-zinc-300">Local-first:</b> uses enabled models on online Ollama GPUs (high-VRAM @coder preferred for Pass 1). Frontier APIs only when no local workers are available.</p>
+              <p>After workers finish, workspace <code className="text-indigo-300">tsc</code> routes errors back to the GPU that owns the broken file.</p>
             </HelpTip>
           </div>
 
@@ -1332,9 +1618,9 @@ Do NOT omit code with placeholders. Ensure imports/links match the sibling files
               <div className="flex items-center space-x-1.5">
                 <Share2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span>
-                  <b>Fast Conductor:</b>{' '}
+                  <b>Lead Architect:</b>{' '}
                   {conductorInfo
-                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ' · local-first'}) splits multi-file jobs across enabled workers</>
+                    ? <>{conductorInfo.node.name} (<code className="text-emerald-300">{conductorInfo.model}</code> @ ~{conductorInfo.tokPerSec} tok/s{conductorInfo.usedFrontierBackup ? ' · frontier backup' : ' · local-first'}) locks the shared contract, then workers fan out by live tok/s</>
                     : <span className="text-zinc-500">unavailable until a node is online</span>}
                 </span>
               </div>

@@ -399,6 +399,128 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
 });
 
 // ==========================================
+// WORKSPACE TYPECHECK (Conductor Swarm contract / repair)
+// ==========================================
+
+function findTscBinary(workspaceRoot) {
+  const candidates = [
+    path.join(workspaceRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc'),
+    path.join(__dirname, '..', 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc')
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+function runTsc(cwd, args, timeoutMs = 90000) {
+  return new Promise(resolve => {
+    const bin = findTscBinary(cwd);
+    let output = '';
+    let timedOut = false;
+    let proc;
+    try {
+      if (bin) {
+        proc = spawn(bin, args, { cwd, env: process.env, windowsHide: true, shell: process.platform === 'win32' });
+      } else {
+        // Fallback: npx tsc (may download; prefer local install)
+        proc = spawn(
+          process.platform === 'win32' ? 'npx.cmd' : 'npx',
+          ['--no-install', 'tsc', ...args],
+          { cwd, env: process.env, windowsHide: true, shell: true }
+        );
+      }
+    } catch (err) {
+      return resolve({ code: -1, output: err.message, timedOut: false, skipped: false });
+    }
+
+    const onData = d => { output += d.toString(); };
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill(); } catch {}
+    }, timeoutMs);
+    proc.on('close', code => {
+      clearTimeout(timer);
+      resolve({ code: code ?? 1, output, timedOut, skipped: false });
+    });
+    proc.on('error', err => {
+      clearTimeout(timer);
+      resolve({ code: -1, output: output + err.message, timedOut, skipped: false });
+    });
+  });
+}
+
+/**
+ * opts.mode: 'contract' | 'workspace'
+ * opts.file: relative path for isolated contract check
+ */
+ipcMain.handle('workspace:typecheck', async (_e, root, opts = {}) => {
+  try {
+    if (!root || !fs.existsSync(root)) {
+      return { ok: false, error: 'Workspace root missing', output: '' };
+    }
+    const mode = opts.mode || 'workspace';
+    const timeoutMs = opts.timeoutMs || 90000;
+
+    if (mode === 'contract') {
+      const rel = opts.file;
+      if (!rel) return { ok: false, error: 'contract file required', output: '' };
+      const abs = resolveScoped(root, rel);
+      if (!fs.existsSync(abs)) {
+        return { ok: false, error: `Contract file not found: ${rel}`, output: '' };
+      }
+      // Isolated check so worker projects without a full tsconfig still validate the contract
+      const args = [
+        '--noEmit',
+        '--pretty', 'false',
+        '--strict',
+        '--skipLibCheck',
+        '--target', 'ES2020',
+        '--module', 'ESNext',
+        '--moduleResolution', 'node',
+        '--esModuleInterop',
+        '--jsx', 'react-jsx',
+        '--lib', 'DOM,ES2020,DOM.Iterable',
+        abs
+      ];
+      const res = await runTsc(root, args, timeoutMs);
+      const tail = (res.output || '').slice(-14000);
+      return {
+        ok: res.code === 0 && !res.timedOut,
+        code: res.code,
+        output: tail || (res.code === 0 ? '' : 'tsc failed with no output'),
+        timedOut: res.timedOut,
+        mode: 'contract'
+      };
+    }
+
+    const tsconfig = path.join(root, 'tsconfig.json');
+    if (!fs.existsSync(tsconfig)) {
+      return {
+        ok: true,
+        skipped: true,
+        output: 'No tsconfig.json in workspace — skipped full project typecheck',
+        mode: 'workspace'
+      };
+    }
+    const res = await runTsc(root, ['--noEmit', '--pretty', 'false'], timeoutMs);
+    const tail = (res.output || '').slice(-16000);
+    return {
+      ok: res.code === 0 && !res.timedOut,
+      code: res.code,
+      output: tail,
+      timedOut: res.timedOut,
+      skipped: false,
+      mode: 'workspace'
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, output: err.message };
+  }
+});
+
+// ==========================================
 // POWERSHELL EXECUTION
 // ==========================================
 

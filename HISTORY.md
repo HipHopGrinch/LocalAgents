@@ -59,14 +59,13 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
   - **Immutable tool card state** so running/done/error updates reliably in React.
   - **Universal Fallback Parser:** Markdown fences become writes only when create-intent is detected, an explicit path is present, or the Conductor assigned `expectedFilePath`.
 
-### Phase 4: Conductor & Multi-GPU File Distribution (Current State)
-- File-level work distribution:
-  - **Conductor Role:** Prefers coder/instruct quality models, then measured tok/s (live benchmarks beat provisional seeds).
-  - **Task Decomposition (`buildDecompositionPrompt` / `parseConductorPlan`):** JSON array (tolerates fenced ```json```), validates extensions, dedupes paths.
-  - **Cluster Job Assignment (`assignJobsToCluster`):** Online local nodes only when any are up; ordered by measured speed then bandwidth; offline assignments surfaced in the UI.
-  - **User-Controlled Node Models:** Per-node ON/OFF toggles and default model selectors; soft `roles` tags for auto-routing.
-  - **Resizable Explorer & Agent Sidebars:** Persistent layout widths in settings.
-  - Local-first: no automatic frontier escalation.
+### Phase 4: Conductor Swarm — Contract-First Two-Pass (Current State)
+- **Pass 1 (Lead Architect):** High-VRAM `@coder` (or frontier backup) emits a JSON manifest — shared `contractCode` + per-file tasks with locked imports/exports. Thinking blocks stripped before `JSON.parse`.
+- **Contract verify:** Electron writes the contract file and runs isolated `tsc --noEmit`; architect self-corrects once on failure before workers wake.
+- **Pass 2 (GPU workers):** Tasks assigned by live tok/s × complexity × role bonus (`assignSwarmTasksToCluster`); each worker gets the contract injected read-only.
+- **Workspace repair:** After `Promise.allSettled`, project `tsc --noEmit` routes errors back to the owning GPU for a targeted re-prompt.
+- Local-first routing; frontier only when no local Ollama workers are online.
+- Per-node model toggles, soft `roles`, and resizable sidebars unchanged.
 
 ---
 
@@ -78,7 +77,8 @@ The core goal of LocalAgents Studio is to eliminate costly API token consumption
 | [`electron/preload.cjs`](electron/preload.cjs) | Context-bridge API for the sandboxed renderer. |
 | [`src/types.ts`](src/types.ts) | Core TypeScript types for nodes, benchmarks, tool calls, chat messages, and settings. |
 | [`src/config/defaults.ts`](src/config/defaults.ts) | Default nodes, roles, personas, and settings. |
-| [`src/lib/tools.ts`](src/lib/tools.ts) | System prompts, parsers, diff patcher, Conductor decomposition, and cluster assignment. |
+| [`src/lib/tools.ts`](src/lib/tools.ts) | System prompts, parsers, diff patcher, and routing helpers. |
+| [`src/lib/swarmContract.ts`](src/lib/swarmContract.ts) | Contract-first Swarm manifest parse/prompts, Lead Architect selection, tok/s assignment, tsc error grouping. |
 | [`src/lib/agentLoop.ts`](src/lib/agentLoop.ts) | Immutable tool execution, auto-apply, continuation helpers. |
 | [`src/lib/ollamaClient.ts`](src/lib/ollamaClient.ts) | Streaming chat client (Ollama + OpenAI-compatible Frontier). |
 | [`src/components/AgentChat.tsx`](src/components/AgentChat.tsx) | Agent Conductor chat, pipeline dispatch, tool review cards. |

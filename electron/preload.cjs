@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Agent tools (scoped to workspace root in the main process)
   execTool: (root, name, args) => ipcRenderer.invoke('tools:exec', root, name, args),
+  typecheckWorkspace: (root, opts) => ipcRenderer.invoke('workspace:typecheck', root, opts),
 
   // Terminal
   executeCommand: (command, cwd) => ipcRenderer.invoke('terminal:execute', command, cwd),
