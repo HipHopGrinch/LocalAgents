@@ -19,6 +19,16 @@
   * {
     box-sizing: border-box;
   }
+
+  /* App shell and body use select-none. Without this, Electron drops
+     keyboard input in text fields that inherit user-select: none. */
+  input,
+  textarea,
+  select,
+  [contenteditable="true"] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
   
   /* Custom scrollbar for dark theme */
   ::-webkit-scrollbar {

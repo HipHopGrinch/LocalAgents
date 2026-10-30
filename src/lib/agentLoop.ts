@@ -1,10 +1,18 @@
 import { ChatMessage, ToolCall } from '../types';
 import { applyEdits, formatToolResult, READ_ONLY_TOOLS } from './tools';
+import { pickImageTarget, placeholderSvg } from './imageRouting';
 
 /** Inspect → write re-prompts (not counting command self-correct). */
 export const MAX_TOOL_CONTINUATIONS = 2;
 /** Auto self-correct rounds after a failed terminal command (then stop). */
-export const MAX_COMMAND_FIX_ATTEMPTS = 1;
+export const MAX_COMMAND_FIX_ATTEMPTS = 2;
+
+const DESTRUCTIVE_CMD =
+  /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdel\s+\/s\b|\bremove-item\b[^\n]*-recurse[^\n]*-force|\bmkfs\b|\bshutdown\s+\/s\b/i;
+
+export function isDestructiveCommand(cmd: string): boolean {
+  return DESTRUCTIVE_CMD.test(cmd);
+}
 
 export function commandSignature(tool: ToolCall): string {
   return (tool.body || tool.args?.command || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -21,6 +29,8 @@ export interface ToolExecutorDeps {
   workspacePath: string;
   onApplyFileWrite: (filePath: string, content: string) => Promise<boolean>;
   onExecuteToolCommand: (command: string) => Promise<string>;
+  nodes?: import('../types').EndpointNode[];
+  searxngUrl?: string;
 }
 
 /** Execute one tool without mutating the input; returns a new ToolCall. */
@@ -72,6 +82,13 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
 
     if (tool.name === 'run_command') {
       const cmd = tool.body || tool.args?.command || '';
+      if (isDestructiveCommand(cmd)) {
+        return {
+          ...next,
+          status: 'error',
+          result: `Blocked destructive command. Run it yourself if you really want it: ${cmd}`
+        };
+      }
       const output = await deps.onExecuteToolCommand(cmd);
       const failed = /Exit code:\s*(?!0\b)\d+/i.test(output) || /timed out/i.test(output);
       return {
@@ -95,6 +112,58 @@ export async function executeTool(tool: ToolCall, deps: ToolExecutorDeps): Promi
         return { ...next, status: 'error', result: res.error };
       }
       return { ...next, status: 'done', result: res.content || '(empty)' };
+    }
+
+    if (tool.name === 'web_search') {
+      const query = tool.args?.query || tool.body || '';
+      if (!window.electronAPI?.webSearch) {
+        return { ...next, status: 'error', result: 'Web search API unavailable' };
+      }
+      const res = await window.electronAPI.webSearch(deps.searxngUrl || '', query);
+      if (res.error) return { ...next, status: 'error', result: res.error };
+      return { ...next, status: 'done', result: res.content || '(no results)' };
+    }
+
+    if (tool.name === 'generate_image') {
+      const prompt = tool.args?.prompt || tool.body || 'placeholder';
+      let rel = tool.args?.path || 'assets/generated.svg';
+      const target = pickImageTarget(deps.nodes || []);
+      if (!target || !window.electronAPI?.generateImage) {
+        if (!rel.toLowerCase().endsWith('.svg')) rel = rel.replace(/\.[a-z0-9]+$/i, '') + '.svg';
+        const ok = await deps.onApplyFileWrite(rel, placeholderSvg(prompt));
+        return {
+          ...next,
+          status: ok ? 'done' : 'error',
+          result: ok
+            ? `No image-generation model is online. Wrote SVG placeholder to ${rel}`
+            : `Failed to write placeholder ${rel}`
+        };
+      }
+      const gen = await window.electronAPI.generateImage(target.node.url, target.model, prompt);
+      if (!gen.ok || !gen.imageBase64) {
+        if (!rel.toLowerCase().endsWith('.svg')) rel = rel.replace(/\.[a-z0-9]+$/i, '') + '.svg';
+        const ok = await deps.onApplyFileWrite(rel, placeholderSvg(prompt));
+        return {
+          ...next,
+          status: ok ? 'done' : 'error',
+          result: ok
+            ? `Image model ${target.model} on ${target.node.name} did not return a picture (${gen.error || 'empty'}). Wrote SVG placeholder to ${rel}`
+            : `Image generation failed: ${gen.error || 'empty'}`
+        };
+      }
+      if (!/\.(png|jpe?g|webp)$/i.test(rel)) rel = rel.replace(/\.[a-z0-9]+$/i, '') + '.png';
+      const written = await window.electronAPI.execTool(deps.workspacePath, 'write_base64', {
+        path: rel,
+        content: gen.imageBase64
+      });
+      if (written.error) {
+        return { ...next, status: 'error', result: written.error };
+      }
+      return {
+        ...next,
+        status: 'done',
+        result: `Wrote ${rel} using ${target.model} on ${target.node.name}`
+      };
     }
 
     return { ...next, status: 'error', result: `Unknown tool: ${tool.name}` };
@@ -141,7 +210,21 @@ export async function runReadOnlyTools(
   return { tools: out, hadReads };
 }
 
-/** Auto-run pending PowerShell commands (for verify / self-correct loops). */
+export async function runAuxTools(tools: ToolCall[], deps: ToolExecutorDeps): Promise<ToolCall[]> {
+  const out: ToolCall[] = [];
+  for (const tool of tools) {
+    if (
+      (tool.name === 'web_search' || tool.name === 'generate_image') &&
+      tool.status !== 'done' &&
+      tool.status !== 'error'
+    ) {
+      out.push(await executeTool(tool, deps));
+    } else {
+      out.push(tool);
+    }
+  }
+  return out;
+}
 export async function runCommandTools(
   tools: ToolCall[],
   deps: ToolExecutorDeps
@@ -176,7 +259,10 @@ export function replaceToolsInMessage(
 export function collectFeedbackTools(tools: ToolCall[]): ToolCall[] {
   return tools.filter(t => {
     if (t.status !== 'done' && t.status !== 'error') return false;
-    return READ_ONLY_TOOLS.includes(t.name as any) || t.name === 'run_command';
+    if (READ_ONLY_TOOLS.includes(t.name as any) || t.name === 'run_command') return true;
+    if (t.name === 'web_search' || t.name === 'generate_image') return true;
+    if ((t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error') return true;
+    return false;
   });
 }
 
@@ -185,6 +271,8 @@ export interface ContinueDecisionOpts {
   commandFixAttempts?: number;
   /** Signatures of commands that already failed earlier in this turn. */
   prevFailedCmdSigs?: string[];
+  /** Failed write/edit re-prompts already used. */
+  writeFixAttempts?: number;
 }
 
 /**
@@ -207,6 +295,11 @@ export function shouldContinueFromTools(
     return true;
   }
 
+  const writeFailed = tools.some(
+    t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
+  );
+  if (writeFailed && (opts.writeFixAttempts ?? 0) < 1) return true;
+
   const wrote = tools.some(t => isWritableTool(t.name) && t.status === 'done');
   // read_terminal alone must not keep the loop alive
   const inspectedCode = tools.some(
@@ -223,6 +316,9 @@ export function buildContinuationUserPrompt(
 ): string {
   const resultsXml = feedbackTools.map(t => formatToolResult(t)).join('\n\n');
   const cmdFailed = feedbackTools.some(t => t.name === 'run_command' && t.status === 'error');
+  const writeFailed = feedbackTools.some(
+    t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
+  );
   const hadCmd = feedbackTools.some(t => t.name === 'run_command');
   const hadTerminal = feedbackTools.some(t => t.name === 'read_terminal');
 
@@ -231,6 +327,10 @@ export function buildContinuationUserPrompt(
       return `Terminal / command results:\n${resultsXml}\n\nPrevious fix attempt did not clear the error. Briefly explain what is still wrong and stop. Do NOT re-run the same failing command. Only emit a tool if you have a clearly different fix; otherwise reply with a short diagnosis only.`;
     }
     return `Terminal / command results:\n${resultsXml}\n\nA command failed. Make ONE concrete fix with <edit_file> or <write_file>, then optionally re-run once with <run_command> to verify. If you cannot fix it confidently, explain the error and stop — do not retry the same command repeatedly.`;
+  }
+
+  if (writeFailed) {
+    return `File write failed:\n${resultsXml}\n\nFix the file with a corrected <write_file> or <edit_file> for the same path. Do not repeat a destructive command.`;
   }
 
   if (hadCmd) {
@@ -266,3 +366,4 @@ export function historyForModel(
     })
     .filter(m => m.content.trim().length > 0 || (m.images && m.images.length > 0));
 }
+

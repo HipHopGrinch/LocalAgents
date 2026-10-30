@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 
 // Per-user settings live under AppData — NEVER inside the install dir or portable EXE.
@@ -123,12 +124,180 @@ ipcMain.handle('settings:openFolder', async () => {
 });
 
 // ==========================================
+// ENCRYPTED NODE SETUP EXPORT / IMPORT
+// AES-256-GCM + scrypt; passphrase never stored or logged.
+// ==========================================
+
+const NODES_EXPORT_FORMAT = 'localagents-nodes-v1';
+const NODES_SCRYPT = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
+const NODES_KEY_LEN = 32;
+const NODES_SALT_LEN = 16;
+const NODES_IV_LEN = 12;
+const NODES_TAG_LEN = 16;
+
+function stripNodeForExport(n) {
+  if (!n || typeof n !== 'object') return null;
+  const cfg = {
+    id: String(n.id || ''),
+    name: String(n.name || ''),
+    url: String(n.url || ''),
+    hardware: n.hardware && typeof n.hardware === 'object' ? n.hardware : {
+      gpuModel: 'Unknown', vramGB: 0, ramGB: 0, ramBandwidthGBs: 0, reserveVramGB: 1
+    }
+  };
+  if (n.type === 'ollama' || n.type === 'openai') cfg.type = n.type;
+  if (typeof n.apiKey === 'string') cfg.apiKey = n.apiKey;
+  if (typeof n.dnsAlias === 'string') cfg.dnsAlias = n.dnsAlias;
+  if (Array.isArray(n.roles)) cfg.roles = n.roles;
+  if (n.benchmarks && typeof n.benchmarks === 'object') cfg.benchmarks = n.benchmarks;
+  if (Array.isArray(n.disabledModels)) cfg.disabledModels = n.disabledModels;
+  if (typeof n.activeModel === 'string') cfg.activeModel = n.activeModel;
+  if (n.modelMeta && typeof n.modelMeta === 'object') cfg.modelMeta = n.modelMeta;
+  if (n.modelPrefs && typeof n.modelPrefs === 'object') cfg.modelPrefs = n.modelPrefs;
+  return cfg;
+}
+
+function deriveNodesKey(passphrase, salt) {
+  return crypto.scryptSync(String(passphrase), salt, NODES_KEY_LEN, NODES_SCRYPT);
+}
+
+function encryptNodesPayload(payload, passphrase) {
+  const salt = crypto.randomBytes(NODES_SALT_LEN);
+  const iv = crypto.randomBytes(NODES_IV_LEN);
+  const key = deriveNodesKey(passphrase, salt);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plain = Buffer.from(JSON.stringify(payload), 'utf8');
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    format: NODES_EXPORT_FORMAT,
+    kdf: 'scrypt',
+    kdfParams: { N: NODES_SCRYPT.N, r: NODES_SCRYPT.r, p: NODES_SCRYPT.p, dkLen: NODES_KEY_LEN },
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    ciphertext: Buffer.concat([enc, tag]).toString('base64')
+  };
+}
+
+function decryptNodesFile(fileObj, passphrase) {
+  if (!fileObj || fileObj.format !== NODES_EXPORT_FORMAT) {
+    throw new Error('Unrecognized or unsupported export format');
+  }
+  if (fileObj.kdf !== 'scrypt') {
+    throw new Error('Unsupported key derivation');
+  }
+  const salt = Buffer.from(fileObj.salt, 'base64');
+  const iv = Buffer.from(fileObj.iv, 'base64');
+  const packed = Buffer.from(fileObj.ciphertext, 'base64');
+  if (salt.length < 8 || iv.length !== NODES_IV_LEN || packed.length <= NODES_TAG_LEN) {
+    throw new Error('Corrupt export file');
+  }
+  const data = packed.subarray(0, packed.length - NODES_TAG_LEN);
+  const tag = packed.subarray(packed.length - NODES_TAG_LEN);
+  const key = deriveNodesKey(passphrase, salt);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
+  return JSON.parse(plain.toString('utf8'));
+}
+
+function validateImportedNodesPayload(payload) {
+  if (!payload || payload.format !== NODES_EXPORT_FORMAT) {
+    throw new Error('Invalid decrypted payload format');
+  }
+  if (!Array.isArray(payload.nodes)) {
+    throw new Error('Export does not contain a nodes array');
+  }
+  const nodes = [];
+  for (const raw of payload.nodes) {
+    const cfg = stripNodeForExport(raw);
+    if (!cfg || !cfg.id || !cfg.url) continue;
+    nodes.push(cfg);
+  }
+  if (nodes.length === 0) {
+    throw new Error('No valid nodes found in export');
+  }
+  return nodes;
+}
+
+ipcMain.handle('settings:exportNodes', async (_e, { nodes, passphrase } = {}) => {
+  try {
+    if (!passphrase || typeof passphrase !== 'string' || passphrase.length < 4) {
+      return { error: 'Passphrase must be at least 4 characters' };
+    }
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      return { error: 'No nodes to export' };
+    }
+    const sanitized = nodes.map(stripNodeForExport).filter(Boolean);
+    if (sanitized.length === 0) return { error: 'No valid nodes to export' };
+
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export encrypted node setup',
+      defaultPath: 'localagents-nodes.enc',
+      filters: [
+        { name: 'Encrypted LocalAgents nodes', extensions: ['enc'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+
+    const inner = {
+      format: NODES_EXPORT_FORMAT,
+      exportedAt: new Date().toISOString(),
+      nodes: sanitized
+    };
+    const envelope = encryptNodesPayload(inner, passphrase);
+    await fsp.writeFile(result.filePath, JSON.stringify(envelope, null, 2), 'utf-8');
+    return { success: true, path: result.filePath, nodeCount: sanitized.length };
+  } catch (err) {
+    return { error: err.message || 'Export failed' };
+  }
+});
+
+ipcMain.handle('settings:importNodes', async (_e, { passphrase } = {}) => {
+  try {
+    if (!passphrase || typeof passphrase !== 'string') {
+      return { error: 'Passphrase required' };
+    }
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Import encrypted node setup',
+      properties: ['openFile'],
+      filters: [
+        { name: 'Encrypted LocalAgents nodes', extensions: ['enc'] },
+        { name: 'JSON / encrypted', extensions: ['enc', 'json'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    });
+    if (result.canceled || !result.filePaths?.length) return { canceled: true };
+
+    const raw = await fsp.readFile(result.filePaths[0], 'utf-8');
+    let fileObj;
+    try {
+      fileObj = JSON.parse(raw);
+    } catch {
+      return { error: 'File is not valid JSON' };
+    }
+    let payload;
+    try {
+      payload = decryptNodesFile(fileObj, passphrase);
+    } catch {
+      // Wrong passphrase or tampered ciphertext — do not leak details
+      return { error: 'Decryption failed (wrong passphrase or corrupt file)' };
+    }
+    const nodes = validateImportedNodesPayload(payload);
+    return { success: true, path: result.filePaths[0], nodes, nodeCount: nodes.length };
+  } catch (err) {
+    return { error: err.message || 'Import failed' };
+  }
+});
+
+// ==========================================
 // USER-DRIVEN FILESYSTEM (explorer / editor)
 // ==========================================
 
 const IGNORED_DIRS = new Set([
   '.git', 'node_modules', 'dist', 'dist-electron', 'build', 'out', '.next', '.nuxt', 'target',
-  '__pycache__', '.venv', 'venv', '.mypy_cache', '.pytest_cache', '.idea', '.vs', 'coverage', '.turbo', '.cache'
+  '__pycache__', '.venv', 'venv', '.mypy_cache', '.pytest_cache', '.idea', '.vs', 'coverage', '.turbo', '.cache', '.localagents'
 ]);
 
 async function readDirSorted(dirPath) {
@@ -145,6 +314,49 @@ ipcMain.handle('workspace:select-folder', async () => {
 });
 
 ipcMain.handle('workspace:default', () => process.cwd());
+
+function projectChatsPath(root) {
+  return path.join(root, '.localagents', 'chats.json');
+}
+
+ipcMain.handle('project:loadChats', async (_e, root) => {
+  try {
+    if (!root) return { conversations: [], activeConversationId: null };
+    const raw = await fsp.readFile(projectChatsPath(root), 'utf-8');
+    const data = JSON.parse(raw);
+    return {
+      conversations: Array.isArray(data.conversations) ? data.conversations : [],
+      activeConversationId: data.activeConversationId || null
+    };
+  } catch {
+    return { conversations: [], activeConversationId: null };
+  }
+});
+
+ipcMain.handle('project:saveChats', async (_e, root, payload) => {
+  try {
+    if (!root) return { error: 'No workspace' };
+    const dir = path.join(root, '.localagents');
+    await fsp.mkdir(dir, { recursive: true });
+    const body = JSON.stringify({
+      version: 1,
+      activeConversationId: payload?.activeConversationId || null,
+      conversations: Array.isArray(payload?.conversations) ? payload.conversations : []
+    });
+    const file = projectChatsPath(root);
+    const tmp = file + '.tmp';
+    await fsp.writeFile(tmp, body, 'utf-8');
+    try {
+      await fsp.rename(tmp, file);
+    } catch {
+      await fsp.copyFile(tmp, file);
+      await fsp.unlink(tmp).catch(() => {});
+    }
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
 
 ipcMain.handle('fs:read-dir', async (_e, dirPath) => {
   try {
@@ -362,6 +574,12 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
       case 'list_dir': return await toolListDir(root, args);
       case 'search': return await toolSearch(root, args);
       case 'write_file': return await toolWriteFile(root, args);
+      case 'write_base64': {
+        const abs = resolveScoped(root, args.path);
+        await fsp.mkdir(path.dirname(abs), { recursive: true });
+        await fsp.writeFile(abs, Buffer.from(String(args.content || ''), 'base64'));
+        return { content: `Wrote binary ${args.path}`, path: abs };
+      }
       case 'resolve': return { path: resolveScoped(root, args.path) };
       case 'exists': return { exists: fs.existsSync(resolveScoped(root, args.path)) };
       case 'run_command': {
@@ -395,6 +613,58 @@ ipcMain.handle('tools:exec', async (_e, root, name, args) => {
     }
   } catch (err) {
     return { error: err.message };
+  }
+});
+
+ipcMain.handle('web:search', async (_e, baseUrl, query) => {
+  try {
+    const base = String(baseUrl || '').trim();
+    const q = String(query || '').trim();
+    if (!base) {
+      return { error: 'SearXNG is not configured. Set the URL in Hardware Settings and continue from local knowledge if needed.' };
+    }
+    if (!q) return { error: 'Empty search query' };
+    const root = base.replace(/\/+$/, '');
+    const url = `${root}/search?q=${encodeURIComponent(q)}&format=json`;
+    const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!resp.ok) return { error: `SearXNG HTTP ${resp.status}` };
+    const data = await resp.json();
+    const results = Array.isArray(data.results) ? data.results.slice(0, 6) : [];
+    if (!results.length) return { content: `No results for: ${q}` };
+    const lines = results.map((r, i) => {
+      const title = String(r.title || 'Untitled').slice(0, 160);
+      const link = String(r.url || '');
+      const snippet = String(r.content || '').replace(/\s+/g, ' ').slice(0, 280);
+      return `${i + 1}. ${title}\n${link}\n${snippet}`;
+    });
+    return { content: lines.join('\n\n') };
+  } catch (err) {
+    return { error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle('image:generate', async (_e, nodeUrl, model, prompt) => {
+  try {
+    const base = String(nodeUrl || '').replace(/\/+$/, '');
+    const resp = await fetch(`${base}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, prompt, stream: false })
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `Image HTTP ${resp.status}: ${text.slice(0, 300)}` };
+    }
+    const data = await resp.json();
+    let image = data.image || (Array.isArray(data.images) ? data.images[0] : '');
+    if (image && typeof image === 'object' && image.b64_json) image = image.b64_json;
+    if (typeof image === 'string' && image.includes('base64,')) image = image.split('base64,').pop();
+    if (!image || typeof image !== 'string') {
+      return { ok: false, error: 'Model response had no image bytes' };
+    }
+    return { ok: true, imageBase64: image, mime: 'image/png' };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
   }
 });
 

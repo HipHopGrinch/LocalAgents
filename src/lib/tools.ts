@@ -1,4 +1,6 @@
-import { AgentPersona, EndpointNode, ToolCall, ToolName } from '../types';
+import { AgentPersona, ApprovedPlan, EndpointNode, ToolCall, ToolName } from '../types';
+import { PLANNER_PROTOCOL, formatApprovedPlanContext } from './planOptions';
+import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
 
 export const READ_ONLY_TOOLS: ToolName[] = ['read_file', 'list_dir', 'search', 'read_terminal'];
 const ALL_TOOLS: ToolName[] = [
@@ -8,7 +10,9 @@ const ALL_TOOLS: ToolName[] = [
   'write_file',
   'edit_file',
   'run_command',
-  'read_terminal'
+  'read_terminal',
+  'web_search',
+  'generate_image'
 ];
 const TOOL_ALT = ALL_TOOLS.join('|');
 
@@ -131,6 +135,12 @@ export function parseResponse(
     else if (f.name === 'run_command') {
       body = unfence(f.body ?? '').trim();
       if (!body && args.command) body = args.command;
+    } else if (f.name === 'web_search') {
+      body = unfence(f.body ?? '').trim();
+      if (!args.query && body) args.query = body;
+    } else if (f.name === 'generate_image') {
+      body = unfence(f.body ?? '').trim();
+      if (!args.prompt && body) args.prompt = body;
     } else if (f.name === 'read_terminal') {
       const raw = (f.body ?? '').trim();
       if (!args.lines && /^\d+$/.test(raw)) args.lines = raw;
@@ -477,13 +487,32 @@ Read recent PowerShell output from the LocalAgents terminal panel (includes comm
 
 When a command fails (non-zero exit), diagnose from the output, fix with <edit_file> or <write_file>, then re-run with <run_command>. Prefer <read_terminal/> if the user already ran something in the terminal and you need that output.
 
+### 6. Web search (SearXNG):
+<web_search query="rust cargo add tokio"/>
+
+### 7. Generate an image into the workspace (the app picks an image-capable GPU automatically):
+<generate_image path="assets/product.png" prompt="studio photo of a red sneaker on white"/>
+
 ### Mandatory Rules:
 - MANDATORY: When the user asks you to build, create, or write code (e.g. "build a webpage", "create a python script"), you MUST invoke <write_file path="...">. DO NOT respond only with conversational text and raw markdown code blocks. The user expects the file to be created on their computer.
 - After writing code that should be verified, run a relevant command (<run_command>) and fix failures from the terminal output before stopping.
 - Paths are relative to the workspace root. Do not prefix with leading slash.
 - State a brief 1-2 sentence description before or after the tool tags.`;
 
-export function buildSystemPrompt(agent: AgentPersona, workspace: string, overview: string): string {
+export interface BuildSystemPromptOptions {
+  /** Planner turn: force plan+options protocol; skip write-heavy pressure */
+  planMode?: boolean;
+  /** Locked plan after user picked an option */
+  approvedPlan?: ApprovedPlan | null;
+}
+
+export function buildSystemPrompt(
+  agent: AgentPersona,
+  workspace: string,
+  overview: string,
+  opts?: BuildSystemPromptOptions
+): string {
+  const planMode = opts?.planMode ?? (agent.handle === 'planner' || agent.id === 'planner');
   const parts = [
     agent.systemPrompt.trim(),
     `## Environment
@@ -491,7 +520,23 @@ export function buildSystemPrompt(agent: AgentPersona, workspace: string, overvi
 - Workspace root: ${workspace || '(no folder open)'}
 - Date: ${new Date().toISOString().slice(0, 10)}`
   ];
-  if (agent.toolsEnabled) parts.push(TOOL_PROTOCOL);
+  if (planMode) {
+    parts.push(PLANNER_PROTOCOL);
+    // Read tools only in plan mode — still document protocol but remind not to write deliverables
+    if (agent.toolsEnabled) {
+      parts.push(
+        TOOL_PROTOCOL +
+          '\n\n### Planner restriction\nDo NOT use <write_file> or <edit_file> for the deliverable. Exploration tools only until the user picks an option.'
+      );
+    }
+  } else {
+    if (agent.toolsEnabled) {
+      parts.push(TOOL_PROTOCOL);
+      parts.push(DELIVERY_POLICY);
+      parts.push(TOOLCHAIN_PLAYBOOK);
+    }
+    if (opts?.approvedPlan) parts.push(formatApprovedPlanContext(opts.approvedPlan));
+  }
   if (overview) parts.push(`## Workspace overview\n${overview}`);
   return parts.join('\n\n');
 }
@@ -523,6 +568,10 @@ export function describeTool(call: ToolCall): string {
       return `Run: ${call.body}`;
     case 'read_terminal':
       return call.args.lines ? `Read terminal (last ${call.args.lines} lines)` : 'Read terminal';
+    case 'web_search':
+      return `Search web: ${call.args.query || call.body || ''}`;
+    case 'generate_image':
+      return `Image ${call.args.path || 'asset'}: ${call.args.prompt || call.body || ''}`;
   }
 }
 
@@ -566,15 +615,12 @@ export function getEnabledModelsForNode(node?: EndpointNode): string[] {
  * Online nodes with an empty catalog return '' (no ghost model names).
  */
 export function getPreferredModelForNode(node?: EndpointNode, fallbackModel?: string): string {
-  if (!node) return fallbackModel || 'qwen2.5-coder:7b';
+  if (!node) return '';
   const enabled = getEnabledModelsForNode(node);
-  if (enabled.length > 0) {
-    if (node.activeModel && enabled.includes(node.activeModel)) return node.activeModel;
-    if (fallbackModel && enabled.includes(fallbackModel)) return fallbackModel;
-    return enabled[0];
-  }
-  if (node.online) return '';
-  return node.activeModel || fallbackModel || 'qwen2.5-coder:7b';
+  if (enabled.length === 0) return '';
+  if (node.activeModel && enabled.includes(node.activeModel)) return node.activeModel;
+  if (fallbackModel && enabled.includes(fallbackModel)) return fallbackModel;
+  return enabled[0];
 }
 
 export function isFrontierNode(n?: EndpointNode): boolean {

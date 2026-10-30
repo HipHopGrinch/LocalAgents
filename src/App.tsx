@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Header } from './components/Header';
 import { FileTree } from './components/FileTree';
 import { EditorView } from './components/EditorView';
@@ -20,6 +20,9 @@ import { getLanguageFromPath } from './utils/language';
 import {
   conversationsForWorkspace,
   createConversation,
+  normalizeWorkspacePath,
+  rememberWorkspace,
+  replaceWorkspaceConversations,
   titleFromMessages,
   upsertConversation
 } from './lib/conversations';
@@ -43,6 +46,9 @@ export const App: React.FC = () => {
   );
   const [selectedAgentId, setSelectedAgentId] = useState<string>(DEFAULT_SETTINGS.agents[0].id);
   const [activeConversationId, setActiveConversationId] = useState<string | undefined>(undefined);
+  const loadedWorkspaceRef = useRef('');
+  const forceNewChatRef = useRef(false);
+  const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
 
   // Modals & Drawers
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
@@ -63,6 +69,12 @@ export const App: React.FC = () => {
 
       const saved = await window.electronAPI.loadSettings();
       const merged = mergeSettings(saved);
+      const sortedChats = [...(merged.conversations || [])].sort((a, b) => a.updatedAt - b.updatedAt);
+      let recent = merged.recentWorkspaces || [];
+      for (const chat of sortedChats) {
+        if (chat.workspacePath) recent = rememberWorkspace(recent, chat.workspacePath);
+      }
+      merged.recentWorkspaces = recent;
       setSettings(merged);
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
@@ -144,33 +156,58 @@ export const App: React.FC = () => {
     return (settings.conversations || []).find(c => c.id === activeConversationId) || null;
   }, [settings.conversations, activeConversationId]);
 
-  // Ensure an active chat exists for the current workspace
+  // Load this project's chats from the folder (migrate older global history once).
   useEffect(() => {
-    if (!workspacePath) return;
-    setSettings(prev => {
-      const forWs = conversationsForWorkspace(prev.conversations, workspacePath);
-      const activeStillValid =
-        activeConversationId && forWs.some(c => c.id === activeConversationId);
-      if (activeStillValid) return prev;
+    if (!workspacePath || !window.electronAPI?.loadProjectChats) return;
+    const key = normalizeWorkspacePath(workspacePath);
+    if (loadedWorkspaceRef.current === key) return;
+    loadedWorkspaceRef.current = key;
+    const wantNewChat = forceNewChatRef.current;
+    forceNewChatRef.current = false;
 
-      if (forWs[0]) {
-        setActiveConversationId(forWs[0].id);
-        const next = { ...prev, activeConversationId: forWs[0].id };
-        if (window.electronAPI) window.electronAPI.saveSettings(next);
+    let cancelled = false;
+    (async () => {
+      const loaded = await window.electronAPI.loadProjectChats(workspacePath);
+      if (cancelled) return;
+      setSettings(prev => {
+        const fromDisk = (loaded.conversations || []).map(c => ({
+          ...c,
+          workspacePath
+        }));
+        const fromSettings = conversationsForWorkspace(prev.conversations, workspacePath);
+        let forWs = fromDisk.length ? fromDisk : fromSettings;
+        let active = loaded.activeConversationId || undefined;
+        if (wantNewChat || !forWs.some(c => c.id === active)) {
+          if (wantNewChat || !forWs.length) {
+            const fresh = createConversation(workspacePath, selectedAgentId);
+            forWs = [fresh, ...forWs.filter(c => c.id !== fresh.id)];
+            active = fresh.id;
+          } else if (!forWs.some(c => c.id === active)) {
+            active = forWs[0].id;
+          }
+        }
+        setActiveConversationId(active);
+        const conversations = replaceWorkspaceConversations(prev.conversations, workspacePath, forWs);
+        const next = {
+          ...prev,
+          lastWorkspace: workspacePath,
+          recentWorkspaces: rememberWorkspace(prev.recentWorkspaces, workspacePath),
+          conversations,
+          activeConversationId: active
+        };
+        window.electronAPI.saveSettings(next);
+        window.electronAPI.saveProjectChats(workspacePath, {
+          conversations: conversationsForWorkspace(conversations, workspacePath),
+          activeConversationId: active
+        });
         return next;
-      }
-
-      const fresh = createConversation(workspacePath, selectedAgentId);
-      setActiveConversationId(fresh.id);
-      const next = {
-        ...prev,
-        conversations: upsertConversation(prev.conversations, fresh),
-        activeConversationId: fresh.id
-      };
-      if (window.electronAPI) window.electronAPI.saveSettings(next);
-      return next;
-    });
-  }, [workspacePath]);
+      });
+    })();
+    return () => {
+      cancelled = true;
+      if (loadedWorkspaceRef.current === key) loadedWorkspaceRef.current = '';
+    };
+  }, [workspacePath, workspaceEpoch]);
 
   // Sidebar Drag-Resize Listeners
   useEffect(() => {
@@ -256,45 +293,44 @@ export const App: React.FC = () => {
   const loadDirectory = async (dirPath: string) => {
     if (!window.electronAPI) return;
     const result = await window.electronAPI.readDir(dirPath);
-    if (Array.isArray(result)) {
-      setFiles(result);
-    }
+    setFiles(Array.isArray(result) ? result : []);
   };
 
   const handleSelectFolder = async () => {
     if (!window.electronAPI) return;
     const chosen = await window.electronAPI.selectFolder();
-    if (chosen) {
-      setWorkspacePath(chosen);
-      setOpenTabs([]);
-      setActiveTabPath(undefined);
-      setActiveConversationId(undefined); // workspace effect will attach/create chat
-      updateSettings({ lastWorkspace: chosen, activeConversationId: undefined });
-      loadDirectory(chosen);
-    }
+    if (!chosen) return;
+    forceNewChatRef.current = false;
+    loadedWorkspaceRef.current = '';
+    setWorkspaceEpoch(n => n + 1);
+    setOpenTabs([]);
+    setActiveTabPath(undefined);
+    setWorkspacePath(chosen);
+    loadDirectory(chosen);
   };
 
-  /** New project: pick folder, clear tabs, start a brand-new chat for that workspace. */
+  /** Open a folder and start a new chat, keeping older chats for that project. */
   const handleNewProject = async () => {
     if (!window.electronAPI) return;
     const chosen = await window.electronAPI.selectFolder();
     if (!chosen) return;
-
-    const fresh = createConversation(chosen, selectedAgentId);
-    setWorkspacePath(chosen);
+    forceNewChatRef.current = true;
+    loadedWorkspaceRef.current = '';
+    setWorkspaceEpoch(n => n + 1);
     setOpenTabs([]);
     setActiveTabPath(undefined);
-    setActiveConversationId(fresh.id);
-    setSettings(prev => {
-      const next = {
-        ...prev,
-        lastWorkspace: chosen,
-        conversations: upsertConversation(prev.conversations, fresh),
-        activeConversationId: fresh.id
-      };
-      window.electronAPI.saveSettings(next);
-      return next;
-    });
+    setWorkspacePath(chosen);
+    loadDirectory(chosen);
+  };
+
+  const handleOpenRecent = (chosen: string) => {
+    if (!chosen) return;
+    forceNewChatRef.current = false;
+    loadedWorkspaceRef.current = '';
+    setWorkspaceEpoch(n => n + 1);
+    setOpenTabs([]);
+    setActiveTabPath(undefined);
+    setWorkspacePath(chosen);
     loadDirectory(chosen);
   };
 
@@ -307,14 +343,34 @@ export const App: React.FC = () => {
         conversations: upsertConversation(prev.conversations, fresh),
         activeConversationId: fresh.id
       };
-      if (window.electronAPI) window.electronAPI.saveSettings(next);
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(next.conversations, workspacePath),
+            activeConversationId: fresh.id
+          });
+        }
+      }
       return next;
     });
   };
 
   const handleSelectConversation = (id: string) => {
     setActiveConversationId(id);
-    updateSettings({ activeConversationId: id });
+    setSettings(prev => {
+      const next = { ...prev, activeConversationId: id };
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(next.conversations, workspacePath),
+            activeConversationId: id
+          });
+        }
+      }
+      return next;
+    });
     const conv = (settings.conversations || []).find(c => c.id === id);
     if (conv?.agentId) setSelectedAgentId(conv.agentId);
   };
@@ -336,10 +392,18 @@ export const App: React.FC = () => {
       }
       const next = {
         ...prev,
-        conversations: remaining.slice(0, 40),
+        conversations: remaining,
         activeConversationId: nextActive
       };
-      if (window.electronAPI) window.electronAPI.saveSettings(next);
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(remaining, workspacePath),
+            activeConversationId: nextActive
+          });
+        }
+      }
       return next;
     });
   };
@@ -354,7 +418,13 @@ export const App: React.FC = () => {
         existing.messages.length === messages.length &&
         existing.messages[existing.messages.length - 1]?.id === messages[messages.length - 1]?.id &&
         existing.messages[existing.messages.length - 1]?.raw === messages[messages.length - 1]?.raw &&
-        existing.messages.every((m, i) => m.id === messages[i]?.id && m.display === messages[i]?.display)
+        existing.messages.every(
+          (m, i) =>
+            m.id === messages[i]?.id &&
+            m.display === messages[i]?.display &&
+            m.selectedPlanOptionId === messages[i]?.selectedPlanOptionId &&
+            m.chosenPlanOptionId === messages[i]?.chosenPlanOptionId
+        )
       ) {
         return prev;
       }
@@ -370,7 +440,46 @@ export const App: React.FC = () => {
         ...prev,
         conversations: upsertConversation(prev.conversations, updated)
       };
-      if (window.electronAPI) window.electronAPI.saveSettings(next);
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(next.conversations, workspacePath),
+            activeConversationId
+          });
+        }
+      }
+      return next;
+    });
+  };
+
+  /** Persist approved plan / agent switch without rewriting the full message list. */
+  const handleConversationPatch = (
+    patch: Partial<Pick<ChatConversation, 'approvedPlan' | 'agentId'>>
+  ) => {
+    if (!activeConversationId) return;
+    if (patch.agentId) setSelectedAgentId(patch.agentId);
+    setSettings(prev => {
+      const existing = (prev.conversations || []).find(c => c.id === activeConversationId);
+      if (!existing) return prev;
+      const updated: ChatConversation = {
+        ...existing,
+        ...patch,
+        updatedAt: Date.now()
+      };
+      const next = {
+        ...prev,
+        conversations: upsertConversation(prev.conversations, updated)
+      };
+      if (window.electronAPI) {
+        window.electronAPI.saveSettings(next);
+        if (workspacePath) {
+          window.electronAPI.saveProjectChats(workspacePath, {
+            conversations: conversationsForWorkspace(next.conversations, workspacePath),
+            activeConversationId
+          });
+        }
+      }
       return next;
     });
   };
@@ -580,9 +689,11 @@ export const App: React.FC = () => {
   return (
     <div className="flex flex-col h-screen w-screen bg-[#18181b] text-zinc-100 overflow-hidden font-sans select-none">
       {/* Top Header */}
-      <Header
+        <Header
         workspacePath={workspacePath}
+        recentWorkspaces={settings.recentWorkspaces || []}
         onSelectFolder={handleSelectFolder}
+        onOpenRecent={handleOpenRecent}
         onNewProject={handleNewProject}
         nodes={nodes}
         onRefreshNodes={refreshNodes}
@@ -664,10 +775,12 @@ export const App: React.FC = () => {
           conversation={activeConversation}
           workspaceConversations={workspaceConversations}
           onMessagesChange={handleMessagesChange}
+          onConversationPatch={handleConversationPatch}
           onNewChat={handleNewChat}
           onSelectConversation={handleSelectConversation}
           onDeleteConversation={handleDeleteConversation}
           onToggleModelThinking={handleToggleModelThinking}
+          searxngUrl={settings.searxngUrl || ''}
         />
       </div>
 
@@ -684,6 +797,8 @@ export const App: React.FC = () => {
         frontierTokens={settings.frontierTokensUsed || 0}
         uiScale={uiScale}
         onUpdateUiScale={handleUpdateUiScale}
+        searxngUrl={settings.searxngUrl || ''}
+        onUpdateSearxngUrl={url => updateSettings({ searxngUrl: url })}
       />
     </div>
   );

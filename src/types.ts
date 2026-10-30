@@ -12,6 +12,8 @@ export interface ModelThinkingInfo {
 export interface ModelPref {
   /** Top-level Ollama `think` value; null = use model default */
   think?: boolean | string | null;
+  /** Ollama `options.num_ctx` for this model on this node; omit = agent/default */
+  numCtx?: number;
 }
 
 /** Cached `/api/show` metadata so we don't re-query on every status poll. */
@@ -94,6 +96,8 @@ export interface NodeConfig {
   modelMeta?: Record<string, ModelMeta>;
   /** User prefs per model name (e.g. think on/off) */
   modelPrefs?: Record<string, ModelPref>;
+  /** Optional forced image-generation model. Empty = auto-detect. */
+  imageModel?: string;
 }
 
 /** Live node status (merged into NodeConfig at runtime) */
@@ -127,6 +131,28 @@ export interface AgentPersona {
   autoApproveCommands: boolean;
 }
 
+/** A single architecture choice offered by the Planner. */
+export interface PlanOption {
+  id: string;
+  title: string;
+  description: string;
+  /** stop = record the choice and do not start the coder */
+  action?: 'run' | 'stop';
+}
+
+/** Locked plan after the user picks an option — drives Coder / Swarm execution. */
+export interface ApprovedPlan {
+  summary: string;
+  chosenOptionId: string;
+  chosenOptionTitle: string;
+  chosenOptionDescription: string;
+  allOptions: PlanOption[];
+  originalUserRequest: string;
+  approvedAt: number;
+  /** Full planner markdown (options block stripped) for agent context */
+  planMarkdown?: string;
+}
+
 /** One agent chat thread (Cursor/VS Code-style conversation). */
 export interface ChatConversation {
   id: string;
@@ -134,6 +160,8 @@ export interface ChatConversation {
   workspacePath: string;
   agentId: string;
   messages: ChatMessage[];
+  /** Set when user confirms a Planner option; cleared on new chat / new plan request */
+  approvedPlan?: ApprovedPlan | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -154,6 +182,10 @@ export interface AppSettings {
   chatWidth?: number;
   /** UI & Text scaling factor (0.75 to 2.0, default 1.0) */
   uiScale?: number;
+  /** SearXNG base URL for the web_search tool. Empty = search unavailable. */
+  searxngUrl?: string;
+  /** Recently opened project folders, newest first */
+  recentWorkspaces?: string[];
   /** Persisted chat threads (scoped by workspacePath at runtime) */
   conversations?: ChatConversation[];
   activeConversationId?: string;
@@ -189,7 +221,9 @@ export type ToolName =
   | 'write_file'
   | 'edit_file'
   | 'run_command'
-  | 'read_terminal';
+  | 'read_terminal'
+  | 'web_search'
+  | 'generate_image';
 
 export type ToolStatus = 'pending' | 'awaiting_approval' | 'running' | 'done' | 'rejected' | 'error';
 
@@ -244,6 +278,16 @@ export interface ChatMessage {
   pipelineSteps?: PipelineStep[];
   /** Screenshot / image attachments as data URLs (for UI + vision models) */
   images?: string[];
+  /** Planner proposal: clickable architecture options parsed from the reply */
+  planOptions?: PlanOption[];
+  /** Short plan text kept alongside options for Coder context */
+  planSummary?: string;
+  /** Set on the proposal message once the user picks an option */
+  selectedPlanOptionId?: string;
+  /** Set on the user confirmation message when they choose an option */
+  chosenPlanOptionId?: string;
+  /** Which persona drove this turn (survives agent auto-switch Planner → Coder) */
+  personaHandle?: string;
 }
 
 // ==========================================
@@ -302,8 +346,31 @@ export interface ElectronAPI {
   saveSettings: (s: AppSettings) => Promise<{ success?: boolean; error?: string }>;
   settingsPath: () => Promise<string>;
   openSettingsFolder: () => Promise<{ success?: boolean; path?: string; error?: string }>;
+  /** Encrypt node configs to a passphrase-protected .enc file (AES-256-GCM + scrypt). */
+  exportNodes: (
+    nodes: NodeConfig[],
+    passphrase: string
+  ) => Promise<{ success?: boolean; canceled?: boolean; path?: string; nodeCount?: number; error?: string }>;
+  /** Decrypt a node export file; returns NodeConfig[] for the renderer to merge/replace. */
+  importNodes: (
+    passphrase: string
+  ) => Promise<{
+    success?: boolean;
+    canceled?: boolean;
+    path?: string;
+    nodes?: NodeConfig[];
+    nodeCount?: number;
+    error?: string;
+  }>;
 
   getDefaultWorkspace: () => Promise<string>;
+  loadProjectChats: (
+    root: string
+  ) => Promise<{ conversations: ChatConversation[]; activeConversationId?: string | null }>;
+  saveProjectChats: (
+    root: string,
+    payload: { conversations: ChatConversation[]; activeConversationId?: string | null }
+  ) => Promise<{ success?: boolean; error?: string }>;
   selectFolder: () => Promise<string | null>;
   readDir: (dirPath: string) => Promise<WorkspaceFile[] | { error: string }>;
   readFile: (filePath: string) => Promise<{ content?: string; error?: string }>;
@@ -350,6 +417,12 @@ export interface ElectronAPI {
     thinking?: ModelThinkingInfo;
     error?: string;
   }>;
+  webSearch: (baseUrl: string, query: string) => Promise<{ content?: string; error?: string }>;
+  generateImage: (
+    url: string,
+    model: string,
+    prompt: string
+  ) => Promise<{ ok?: boolean; imageBase64?: string; mime?: string; error?: string }>;
 
   detectHardware: () => Promise<DetectedHardware>;
 }

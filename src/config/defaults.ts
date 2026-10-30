@@ -58,7 +58,7 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     id: 'coder',
     handle: 'coder',
     name: 'Lead Coder',
-    role: 'Implements features, multi-file edits, runs builds/tests',
+    role: 'Assumes the stack and implements it. Gemma 4 12B is the recommended local model when installed.',
     endpointId: '',
     model: 'qwen2.5-coder:7b',
     temperature: 0.2,
@@ -66,13 +66,17 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     toolsEnabled: true,
     autoApproveWrites: true,
     autoApproveCommands: false,
-    systemPrompt: `You are the lead software engineer in an autonomous IDE. When the user asks you to build, create, or write code, you MUST use tool tags (<write_file path="..."> or <edit_file path="...">) to produce the files directly on the user's machine. If the user asks for a project, webpage, or script, immediately write the complete files using <write_file path="index.html">, etc. Do not merely output conversational markdown code blocks. Always make clean, working implementations.`
+    systemPrompt: `You are the lead software engineer in an autonomous IDE. Assume what the user wants and do it. Use tool tags (<write_file>, <edit_file>, <run_command>, <web_search>, <generate_image>) to create files, install missing toolchains, search docs, and generate images. Do not reply with only markdown code blocks.
+
+Match the delivery they asked for: a browser site is index.html, styles.css, and app.js unless they asked for React or TypeScript or the repo is already that stack. Python, Go, Rust, and Electron get that language's real project files plus a build or run command.
+
+If an APPROVED PLAN is provided, follow that locked option exactly. Clarify only when two stacks are equally plausible and no plan is locked. Gemma 4 12B is a strong local default when it is installed; use whatever model this node actually has.`
   },
   {
     id: 'planner',
     handle: 'planner',
     name: 'Architect',
-    role: 'Breaks down tasks, designs approaches, explains trade-offs',
+    role: 'Plans first with clear options; Coder implements after you pick',
     endpointId: '',
     model: 'qwen2.5-coder:7b',
     temperature: 0.4,
@@ -80,7 +84,9 @@ export const DEFAULT_AGENTS: AgentPersona[] = [
     toolsEnabled: true,
     autoApproveWrites: false,
     autoApproveCommands: false,
-    systemPrompt: `You are a software architect. Explore the codebase with read_file, list_dir, and search, then produce a concrete, numbered implementation plan: which files change, what changes in each, risks, and how to verify. When asked to implement, emit the file tools directly.`
+    systemPrompt: `You are a software architect in Planner mode. Explore the codebase with read_file, list_dir, and search when helpful, then produce a concrete implementation plan: intent, assumptions, phases/files, and 2–4 numbered options with short tradeoffs.
+
+Bend over backwards to match the user's delivery goal (e.g. "open in browser" → prefer static HTML unless they ask for React). Ask only architecture-changing decisions — do not spam questions. Do NOT write the deliverable files yet; wait for the user to pick an option. Always end with a <plan_options> XML block the UI can parse.`
   },
   {
     id: 'reviewer',
@@ -126,8 +132,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   explorerWidth: 240,
   chatWidth: 420,
   uiScale: 1.0,
+  recentWorkspaces: [],
   conversations: [],
-  activeConversationId: undefined
+  activeConversationId: undefined,
+  searxngUrl: ''
 };
 
 /** Merge persisted settings over defaults so new fields added in later versions get sane values. */
@@ -148,10 +156,17 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
       ...n,
       hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
     })),
-    agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => ({
-      ...DEFAULT_AGENTS[0],
-      ...a
-    })),
+    agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => {
+      const def =
+        DEFAULT_AGENTS.find(d => d.id === a.id || d.handle === a.handle) || DEFAULT_AGENTS[0];
+      // Refresh built-in planner/coder prompts so Planner→Coder workflow stays current
+      const refreshPrompt = a.handle === 'planner' || a.handle === 'coder' || a.id === 'planner' || a.id === 'coder';
+      return {
+        ...def,
+        ...a,
+        systemPrompt: refreshPrompt ? def.systemPrompt : a.systemPrompt || def.systemPrompt
+      };
+    }),
     conversations: Array.isArray(saved.conversations) ? saved.conversations : []
   };
 }

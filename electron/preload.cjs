@@ -31,9 +31,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveSettings: settings => ipcRenderer.invoke('settings:save', settings),
   settingsPath: () => ipcRenderer.invoke('settings:path'),
   openSettingsFolder: () => ipcRenderer.invoke('settings:openFolder'),
+  exportNodes: (nodes, passphrase) => ipcRenderer.invoke('settings:exportNodes', { nodes, passphrase }),
+  importNodes: passphrase => ipcRenderer.invoke('settings:importNodes', { passphrase }),
 
   // Workspace & user-driven filesystem
   getDefaultWorkspace: () => ipcRenderer.invoke('workspace:default'),
+  loadProjectChats: root => ipcRenderer.invoke('project:loadChats', root),
+  saveProjectChats: (root, payload) => ipcRenderer.invoke('project:saveChats', root, payload),
   selectFolder: () => ipcRenderer.invoke('workspace:select-folder'),
   readDir: dirPath => ipcRenderer.invoke('fs:read-dir', dirPath),
   readFile: filePath => ipcRenderer.invoke('fs:read-file', filePath),
@@ -46,6 +50,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Agent tools (scoped to workspace root in the main process)
   execTool: (root, name, args) => ipcRenderer.invoke('tools:exec', root, name, args),
   typecheckWorkspace: (root, opts) => ipcRenderer.invoke('workspace:typecheck', root, opts),
+  webSearch: (baseUrl, query) => ipcRenderer.invoke('web:search', baseUrl, query),
+  generateImage: (url, model, prompt) => ipcRenderer.invoke('image:generate', url, model, prompt),
 
   // Terminal
   executeCommand: (command, cwd) => ipcRenderer.invoke('terminal:execute', command, cwd),

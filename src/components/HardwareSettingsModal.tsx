@@ -7,7 +7,10 @@ import {
   Trash2,
   RefreshCw,
   Sliders,
-  FolderOpen
+  FolderOpen,
+  Download,
+  Upload,
+  Lock
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta } from '../types';
 import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
@@ -30,6 +33,8 @@ interface HardwareSettingsModalProps {
   frontierTokens: number;
   uiScale: number;
   onUpdateUiScale: (scale: number) => void;
+  searxngUrl: string;
+  onUpdateSearxngUrl: (url: string) => void;
 }
 
 export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
@@ -43,7 +48,9 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   localTokens,
   frontierTokens,
   uiScale,
-  onUpdateUiScale
+  onUpdateUiScale,
+  searxngUrl,
+  onUpdateSearxngUrl
 }) => {
   const [activeTab, setActiveTab] = useState<'nodes' | 'hub' | 'appearance' | 'stats'>('nodes');
   const [selectedNodeId, setSelectedNodeId] = useState<string>(nodes[0]?.id || '');
@@ -70,6 +77,15 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [customPullStatus, setCustomPullStatus] = useState<string | null>(null);
   const [customPullPercent, setCustomPullPercent] = useState<number | null>(null);
   const [inspectingModel, setInspectingModel] = useState<string | null>(null);
+
+  // Encrypted node export / import
+  const [nodesIOMode, setNodesIOMode] = useState<'export' | 'import' | null>(null);
+  const [nodesIOPassphrase, setNodesIOPassphrase] = useState('');
+  const [nodesIOConfirm, setNodesIOConfirm] = useState('');
+  const [nodesIOMergeMode, setNodesIOMergeMode] = useState<'replace' | 'merge'>('replace');
+  const [nodesIOBusy, setNodesIOBusy] = useState(false);
+  const [nodesIOError, setNodesIOError] = useState<string | null>(null);
+
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
 
@@ -383,6 +399,128 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(updated);
   };
 
+  /** Enable or disable all generative models on the currently selected node only. */
+  const handleSetAllModelsEnabled = (node: EndpointNode, enabled: boolean) => {
+    const generative = (node.models || []).filter(m => {
+      const isEmbed = m.capabilities?.includes('embedding') ||
+        m.name.toLowerCase().includes('embed') ||
+        m.name.toLowerCase().includes('bge');
+      return !isEmbed;
+    });
+    if (generative.length === 0) return;
+
+    const updated = nodes.map(n => {
+      if (n.id !== node.id) return n;
+      if (enabled) {
+        const first = generative[0]?.name;
+        const nextActive =
+          n.activeModel && generative.some(m => m.name === n.activeModel)
+            ? n.activeModel
+            : first;
+        return { ...n, disabledModels: [], activeModel: nextActive };
+      }
+      const allNames = generative.map(m => m.name);
+      return { ...n, disabledModels: allNames, activeModel: undefined };
+    });
+    onUpdateNodes(updated);
+  };
+
+  const closeNodesIODialog = () => {
+    setNodesIOMode(null);
+    setNodesIOPassphrase('');
+    setNodesIOConfirm('');
+    setNodesIOMergeMode('replace');
+    setNodesIOBusy(false);
+    setNodesIOError(null);
+  };
+
+  const openNodesIODialog = (mode: 'export' | 'import') => {
+    setNodesIOMode(mode);
+    setNodesIOPassphrase('');
+    setNodesIOConfirm('');
+    setNodesIOMergeMode('replace');
+    setNodesIOBusy(false);
+    setNodesIOError(null);
+  };
+
+  const nodesToExportConfigs = (): NodeConfig[] =>
+    nodes.map(n => {
+      const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n;
+      return cfg;
+    });
+
+  const handleNodesIOSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!window.electronAPI || !nodesIOMode) return;
+    setNodesIOError(null);
+
+    if (nodesIOPassphrase.length < 4) {
+      setNodesIOError('Passphrase must be at least 4 characters');
+      return;
+    }
+    if (nodesIOMode === 'export' && nodesIOPassphrase !== nodesIOConfirm) {
+      setNodesIOError('Passphrases do not match');
+      return;
+    }
+
+    setNodesIOBusy(true);
+    try {
+      if (nodesIOMode === 'export') {
+        const res = await window.electronAPI.exportNodes(nodesToExportConfigs(), nodesIOPassphrase);
+        if (res.canceled) {
+          setNodesIOBusy(false);
+          return;
+        }
+        if (res.error) {
+          setNodesIOError(res.error);
+          setNodesIOBusy(false);
+          return;
+        }
+        closeNodesIODialog();
+        return;
+      }
+
+      const res = await window.electronAPI.importNodes(nodesIOPassphrase);
+      if (res.canceled) {
+        setNodesIOBusy(false);
+        return;
+      }
+      if (res.error || !res.nodes?.length) {
+        setNodesIOError(res.error || 'No nodes in file');
+        setNodesIOBusy(false);
+        return;
+      }
+
+      const imported = res.nodes;
+      let next: NodeConfig[];
+      if (nodesIOMergeMode === 'replace') {
+        next = imported;
+      } else {
+        const byId = new Map(nodesToExportConfigs().map(n => [n.id, n]));
+        const byUrl = new Map(nodesToExportConfigs().map(n => [n.url, n.id]));
+        for (const inc of imported) {
+          const urlMatchId = byUrl.get(inc.url);
+          if (byId.has(inc.id)) {
+            byId.set(inc.id, { ...byId.get(inc.id)!, ...inc });
+          } else if (urlMatchId && byId.has(urlMatchId)) {
+            byId.set(urlMatchId, { ...byId.get(urlMatchId)!, ...inc, id: urlMatchId });
+          } else {
+            byId.set(inc.id, inc);
+          }
+        }
+        next = Array.from(byId.values());
+      }
+
+      onUpdateNodes(next);
+      if (next[0]?.id) setSelectedNodeId(next[0].id);
+      closeNodesIODialog();
+      onRefreshNodes();
+    } catch (err: any) {
+      setNodesIOError(err?.message || 'Operation failed');
+      setNodesIOBusy(false);
+    }
+  };
+
   const handleSetPrimaryModel = (node: EndpointNode, modelName: string) => {
     const disabledSet = new Set(node.disabledModels || []);
     disabledSet.delete(modelName); // Ensure primary model is enabled
@@ -403,6 +541,20 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         modelPrefs: {
           ...(n.modelPrefs || {}),
           [modelName]: { ...(n.modelPrefs?.[modelName] || {}), think: enabled }
+        }
+      };
+    });
+    onUpdateNodes(updated);
+  };
+
+  const handleSetModelNumCtx = (node: EndpointNode, modelName: string, numCtx: number) => {
+    const updated = nodes.map(n => {
+      if (n.id !== node.id) return n;
+      return {
+        ...n,
+        modelPrefs: {
+          ...(n.modelPrefs || {}),
+          [modelName]: { ...(n.modelPrefs?.[modelName] || {}), numCtx }
         }
       };
     });
@@ -514,7 +666,21 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
         {/* Tab 1: Hardware Nodes Configuration & Benchmarking */}
         {activeTab === 'nodes' && (
-          <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <div className="px-3 py-2 border-b border-[#27272a] flex items-center gap-2">
+              <label className="text-[10px] uppercase tracking-wide text-zinc-500 shrink-0" htmlFor="searxng-url">
+                SearXNG
+              </label>
+              <input
+                id="searxng-url"
+                type="text"
+                value={searxngUrl}
+                placeholder="http://127.0.0.1:8080"
+                onChange={e => onUpdateSearxngUrl(e.target.value.trim())}
+                className="min-w-0 flex-1 select-text bg-[#18181d] border border-[#2c2c38] text-zinc-200 rounded px-2 py-1 text-[11px] font-mono"
+              />
+            </div>
+            <div className="flex-1 flex overflow-hidden">
             {/* Left Node Sidebar */}
             <div className="w-64 border-r border-[#27272a] bg-[#121215] flex flex-col justify-between p-2">
               <div className="space-y-1 overflow-y-auto">
@@ -552,13 +718,36 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                 })}
               </div>
 
-              <button
-                onClick={() => setShowAddNode(true)}
-                className="w-full py-2 border border-dashed border-[#2d2d38] hover:border-indigo-500 text-zinc-400 hover:text-indigo-300 text-xs rounded-lg flex items-center justify-center space-x-1.5 transition"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add Node / Frontier API</span>
-              </button>
+              <div className="space-y-1.5 pt-2 border-t border-[#27272a]">
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => openNodesIODialog('export')}
+                    disabled={nodes.length === 0}
+                    className="py-1.5 px-1.5 border border-[#2d2d38] hover:border-indigo-500/60 text-zinc-400 hover:text-indigo-200 text-[10px] rounded-lg flex items-center justify-center space-x-1 transition disabled:opacity-40"
+                    title="Save encrypted backup of node setup (names, URLs, API keys, models prefs)"
+                  >
+                    <Download className="w-3 h-3 shrink-0" />
+                    <span>Export</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openNodesIODialog('import')}
+                    className="py-1.5 px-1.5 border border-[#2d2d38] hover:border-indigo-500/60 text-zinc-400 hover:text-indigo-200 text-[10px] rounded-lg flex items-center justify-center space-x-1 transition"
+                    title="Restore node setup from an encrypted .enc backup"
+                  >
+                    <Upload className="w-3 h-3 shrink-0" />
+                    <span>Import</span>
+                  </button>
+                </div>
+                <button
+                  onClick={() => setShowAddNode(true)}
+                  className="w-full py-2 border border-dashed border-[#2d2d38] hover:border-indigo-500 text-zinc-400 hover:text-indigo-300 text-xs rounded-lg flex items-center justify-center space-x-1.5 transition"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Node / Frontier API</span>
+                </button>
+              </div>
             </div>
 
             {/* Right Node Configuration Panel */}
@@ -749,10 +938,12 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                     customPullPercent={customPullPercent}
                     onDirectPull={handleDirectPull}
                     onToggleModelEnabled={handleToggleModelEnabled}
+                    onSetAllModelsEnabled={handleSetAllModelsEnabled}
                     onSetPrimaryModel={handleSetPrimaryModel}
                     onRunBenchmark={handleRunBenchmark}
                     onDeleteModel={handleDeleteModelFromNode}
                     onToggleThinking={handleToggleThinking}
+                    onSetModelNumCtx={handleSetModelNumCtx}
                     onInspectModel={inspectModel}
                     inspectingModel={inspectingModel}
                   />
@@ -792,6 +983,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   </button>
                 </div>
               )}
+            </div>
             </div>
           </div>
         )}
@@ -935,7 +1127,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
             <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-2">
               <h3 className="text-sm font-bold text-zinc-100">Local settings (not in the EXE)</h3>
               <p className="text-xs text-zinc-400 leading-relaxed">
-                Endpoints, API keys, chats, and layout are saved per Windows user under AppData. Shipping or copying the portable EXE does not include your machine config.
+                Endpoints, API keys, chats, and layout are saved per Windows user under AppData. Shipping or copying the portable EXE does not include your machine config. Use Export / Import on the Hardware Nodes tab for an encrypted node backup across rebuilds.
               </p>
               <code className="block text-[10px] font-mono text-indigo-300/90 break-all bg-[#0e0e11] rounded px-2 py-1.5 border border-[#2a2a34]">
                 {settingsFilePath || '%APPDATA%\\LocalAgents Studio\\settings.json'}
@@ -1101,6 +1293,115 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-medium"
                 >
                   Save Node
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {/* Encrypted Export / Import passphrase dialog */}
+        {nodesIOMode && (
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+            <form
+              onSubmit={handleNodesIOSubmit}
+              className="bg-[#18181d] border border-[#30303e] rounded-xl p-5 w-full max-w-sm space-y-3.5 shadow-2xl"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2 text-sm font-bold text-zinc-100">
+                  <Lock className="w-4 h-4 text-amber-400" />
+                  <span>{nodesIOMode === 'export' ? 'Export nodes (encrypted)' : 'Import nodes (encrypted)'}</span>
+                </div>
+                <button type="button" onClick={closeNodesIODialog} className="p-1 text-zinc-400 hover:text-white">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                {nodesIOMode === 'export'
+                  ? 'Saves node names, URLs, API keys, models prefs, roles, and benchmarks into a passphrase-locked .enc file. Layout and workspace path are not included.'
+                  : 'Decrypt a .enc backup and restore cluster nodes. Choose replace (typical after a new EXE) or merge by id/url.'}
+              </p>
+
+              <div>
+                <label className="text-[11px] text-zinc-400 font-medium">Passphrase</label>
+                <input
+                  type="password"
+                  autoFocus
+                  autoComplete="new-password"
+                  value={nodesIOPassphrase}
+                  onChange={(e) => setNodesIOPassphrase(e.target.value)}
+                  className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none text-xs"
+                  placeholder="Min. 4 characters"
+                />
+              </div>
+
+              {nodesIOMode === 'export' && (
+                <div>
+                  <label className="text-[11px] text-zinc-400 font-medium">Confirm passphrase</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={nodesIOConfirm}
+                    onChange={(e) => setNodesIOConfirm(e.target.value)}
+                    className="w-full mt-1 bg-[#121215] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none text-xs"
+                  />
+                </div>
+              )}
+
+              {nodesIOMode === 'import' && (
+                <div className="space-y-1.5">
+                  <span className="text-[11px] text-zinc-400 font-medium">On import</span>
+                  <label className="flex items-start space-x-2 text-[11px] text-zinc-300 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="nodes-io-merge"
+                      checked={nodesIOMergeMode === 'replace'}
+                      onChange={() => setNodesIOMergeMode('replace')}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="font-medium text-zinc-200">Replace all nodes</span>
+                      <span className="block text-zinc-500">Best for restore after a new build</span>
+                    </span>
+                  </label>
+                  <label className="flex items-start space-x-2 text-[11px] text-zinc-300 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="nodes-io-merge"
+                      checked={nodesIOMergeMode === 'merge'}
+                      onChange={() => setNodesIOMergeMode('merge')}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="font-medium text-zinc-200">Merge by id / URL</span>
+                      <span className="block text-zinc-500">Keep existing nodes; overwrite matches</span>
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              {nodesIOError && (
+                <p className="text-[11px] text-red-400 bg-red-950/30 border border-red-500/30 rounded px-2.5 py-1.5">
+                  {nodesIOError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end space-x-2 pt-1">
+                <button
+                  type="button"
+                  onClick={closeNodesIODialog}
+                  disabled={nodesIOBusy}
+                  className="px-3 py-1.5 text-zinc-400 hover:text-white text-xs disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={nodesIOBusy || !nodesIOPassphrase}
+                  className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center space-x-1.5"
+                >
+                  {nodesIOBusy ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
+                  <span>{nodesIOMode === 'export' ? 'Choose save location…' : 'Choose file…'}</span>
                 </button>
               </div>
             </form>

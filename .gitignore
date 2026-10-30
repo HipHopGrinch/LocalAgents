@@ -23,6 +23,7 @@ Thumbs.db
 # Electron / Vite caches
 .vite/
 out/
+.localagents/
 release/
 *.asar
 

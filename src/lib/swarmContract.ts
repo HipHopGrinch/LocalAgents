@@ -1,5 +1,12 @@
 import { EndpointNode } from '../types';
 import {
+  inferDeliveryStack,
+  isDeliveryStack,
+  stackFromFilePaths,
+  verifyCommandForStack,
+  type DeliveryStack
+} from './deliveryIntent';
+import {
   getEnabledModelsForNode,
   getPreferredModelForNode,
   isFrontierNode,
@@ -25,6 +32,8 @@ export interface SwarmManifest {
   contractFile: string;
   contractCode: string;
   tasks: SwarmTask[];
+  stack: DeliveryStack;
+  verifyCommand?: string | null;
 }
 
 export interface SwarmAssignment {
@@ -162,7 +171,14 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
       .slice(0, 6);
 
     if (!tasks.length) return null;
-    return { contractFile, contractCode, tasks };
+    const fromFiles = stackFromFilePaths(tasks.map(t => t.filePath));
+    const declared = isDeliveryStack(String(parsed.stack || '')) ? (parsed.stack as DeliveryStack) : null;
+    const stack = declared || fromFiles || inferDeliveryStack(userTask);
+    const verifyCommand =
+      typeof parsed.verifyCommand === 'string' && parsed.verifyCommand.trim()
+        ? String(parsed.verifyCommand).trim()
+        : verifyCommandForStack(stack);
+    return { contractFile, contractCode, tasks, stack, verifyCommand };
   } catch {
     return null;
   }
@@ -170,6 +186,158 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
 
 /** Deterministic fallback when Pass 1 JSON fails — still produces a usable contract. */
 export function fallbackSwarmManifest(userTask: string): SwarmManifest {
+  const stack = inferDeliveryStack(userTask);
+  const verifyCommand = verifyCommandForStack(stack);
+  if (stack === 'python') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Shared names\nProject: ${userTask.slice(0, 200)}\n`,
+      tasks: [
+        {
+          filePath: 'main.py',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Implement the Python program for: ${userTask}`,
+          role: 'Main'
+        },
+        {
+          filePath: 'README.md',
+          complexity: 'low',
+          preferredRole: '@docs',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Short run instructions for: ${userTask}`,
+          role: 'Docs'
+        }
+      ]
+    };
+  }
+  if (stack === 'go') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Shared names\n`,
+      tasks: [
+        {
+          filePath: 'go.mod',
+          complexity: 'low',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: 'Create a go.mod module named example.com/app',
+          role: 'Module'
+        },
+        {
+          filePath: 'main.go',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Implement the Go program for: ${userTask}`,
+          role: 'Main'
+        }
+      ]
+    };
+  }
+  if (stack === 'rust') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Shared names\n`,
+      tasks: [
+        {
+          filePath: 'Cargo.toml',
+          complexity: 'low',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: 'Cargo.toml for a binary named app',
+          role: 'Cargo'
+        },
+        {
+          filePath: 'src/main.rs',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Implement the Rust program for: ${userTask}`,
+          role: 'Main'
+        }
+      ]
+    };
+  }
+  if (stack === 'node') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Shared names\n`,
+      tasks: [
+        {
+          filePath: 'package.json',
+          complexity: 'medium',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `package.json for: ${userTask}`,
+          role: 'Package'
+        },
+        {
+          filePath: 'main.js',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Implement the Node/Electron entry for: ${userTask}`,
+          role: 'Main'
+        }
+      ]
+    };
+  }
+  if (stack === 'static-web') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Shared names\nUse the same product names, prices, and image paths in every file.\n`,
+      tasks: [
+        {
+          filePath: 'index.html',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Complete static page for: ${userTask}. Link styles.css and app.js. Use generate_image paths under assets/ when pictures are needed.`,
+          role: 'HTML'
+        },
+        {
+          filePath: 'styles.css',
+          complexity: 'medium',
+          preferredRole: '@docs',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Styles for: ${userTask}`,
+          role: 'CSS'
+        },
+        {
+          filePath: 'app.js',
+          complexity: 'medium',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Browser script (cart or behavior) for: ${userTask}`,
+          role: 'JS'
+        }
+      ]
+    };
+  }
+
   const lower = userTask.toLowerCase();
   const isWeb =
     /\b(web|webpage|website|html|react|ui|dashboard|frontend)\b/.test(lower) ||
@@ -177,6 +345,8 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
 
   if (isWeb) {
     return {
+      stack: 'typescript',
+      verifyCommand: null,
       contractFile: 'src/types/swarm-contract.ts',
       contractCode: `/** Shared contract for Conductor Swarm — do not redefine in worker files. */
 export interface AppState {
@@ -226,6 +396,8 @@ export function createInitialState(): AppState {
   }
 
   return {
+    stack: 'typescript',
+    verifyCommand: null,
     contractFile: 'src/types/swarm-contract.ts',
     contractCode: `/** Shared contract for Conductor Swarm. */
 export interface AppConfig {
@@ -266,10 +438,21 @@ export function getDefaultConfig(): AppConfig {
 export function buildLeadArchitectPrompt(
   userTask: string,
   workspaceOverview: string,
-  existingSnippets: string
+  existingSnippets: string,
+  approvedPlanText?: string | null
 ): string {
+  const planSection = approvedPlanText?.trim()
+    ? `
+### APPROVED PLAN (user already chose — follow this architecture)
+${approvedPlanText.trim()}
+
+If the approved plan chooses static HTML/CSS/JS (or similar), still return valid JSON but set tasks to those HTML/CSS/JS paths. Use a minimal contractFile (e.g. \`src/types/swarm-contract.ts\` exporting shared string constants or empty interfaces) only when needed for TS workers; for pure static sites, prefer task filePaths like \`index.html\`, \`styles.css\`, \`app.js\` and keep contractCode as a tiny valid TS module.
+`
+    : '';
+
   return `You are the Lead Architect (@coder) for LocalAgents Studio's Conductor Swarm.
 Your job is to decompose a multi-file coding request into a strict TypeScript contract BEFORE parallel GPU workers write the implementation files.
+When an APPROVED PLAN is present, honor the chosen stack and scope instead of inventing a different one.
 
 ### WORKSPACE CONTEXT
 Existing file tree:
@@ -280,12 +463,14 @@ ${existingSnippets || '(none loaded)'}
 
 ### USER REQUEST
 ${userTask}
-
+${planSection}
 ### OUTPUT REQUIREMENTS
 Respond ONLY with a valid JSON object matching this exact schema. Do NOT write implementation bodies.
 1. \`contractFile\`: Path where shared interfaces/types must be written (or updated). Prefer \`src/types/swarm-contract.ts\`.
 2. \`contractCode\`: Complete, valid TypeScript that typechecks alone. Prefer shared \`interface\`/\`type\`/\`enum\`. If the contract exports helpers, include minimal stub bodies (not ambient \`declare\`) so \`tsc --noEmit\` succeeds.
 3. \`tasks\`: Array of distinct files to implement in parallel. Each task MUST have a unique \`filePath\` (never the contract file, never duplicates).
+4. \`stack\`: one of "typescript", "static-web", "python", "go", "rust", "node". Use static-web for browser pages that should open without a build. Use typescript only when the user asked for React/TypeScript or the repo is already TypeScript.
+5. \`verifyCommand\`: one shell command to check the result, or null for typescript (tsc is run separately).
 
 Schema:
 {
