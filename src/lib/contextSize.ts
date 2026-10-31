@@ -68,14 +68,36 @@ export function resolveModelMaxContext(
 }
 
 /** Sizes offered in the select, capped by known model max when available. */
-export function ctxSizeOptions(maxCtx?: number): number[] {
-  const base: number[] = [...COMMON_CTX_SIZES];
+export function ctxSizeOptions(maxCtx?: number, current?: number): number[] {
+  let base: number[] = [...COMMON_CTX_SIZES];
   if (maxCtx && maxCtx > 0 && !base.includes(maxCtx)) {
     base.push(maxCtx);
-    base.sort((a, b) => a - b);
   }
-  if (maxCtx && maxCtx > 0) return base.filter(s => s <= maxCtx);
-  return base;
+  // Keep a previously saved value visible in the list (no free-form number entry).
+  if (typeof current === 'number' && current > 0 && !base.includes(current)) {
+    base.push(Math.floor(current));
+  }
+  base.sort((a, b) => a - b);
+  if (maxCtx && maxCtx > 0) base = base.filter(s => s <= maxCtx);
+  // If current was above max, still offer the clamped presets only — caller snaps the value.
+  return base.length ? base : [...COMMON_CTX_SIZES];
+}
+
+/** Nearest preset for a stored num_ctx so the UI never needs a free-form number field. */
+export function snapNumCtxToOption(value: number, maxCtx?: number): number {
+  const options = ctxSizeOptions(maxCtx);
+  const n = clampNumCtx(value, maxCtx);
+  if (options.includes(n)) return n;
+  let best = options[0];
+  let bestDist = Math.abs(best - n);
+  for (const opt of options) {
+    const d = Math.abs(opt - n);
+    if (d < bestDist) {
+      best = opt;
+      bestDist = d;
+    }
+  }
+  return best;
 }
 
 export function resolveModelNumCtx(

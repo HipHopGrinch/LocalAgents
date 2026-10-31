@@ -1,17 +1,17 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { Brain, Download, Gauge, RefreshCw, Trash2, Zap } from 'lucide-react';
 import { EndpointNode } from '../../types';
 import { modelSupportsThinking, thinkingToggleLabel } from '../../lib/thinking';
 import { HelpTip } from '../agent/HelpTip';
 import {
-  COMMON_CTX_SIZES,
   DEFAULT_MODEL_NUM_CTX,
   clampNumCtx,
   ctxSizeOptions,
   estimateContextFit,
   formatCtxLabel,
   resolveModelMaxContext,
-  resolveModelNumCtx
+  resolveModelNumCtx,
+  snapNumCtxToOption
 } from '../../lib/contextSize';
 
 interface InstalledModelsPanelProps {
@@ -66,7 +66,6 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
   const generativeModels = currentNode.models.filter(m => !isEmbeddingModel(m));
   const disabledSet = new Set(currentNode.disabledModels || []);
   const enabledCount = generativeModels.filter(m => !disabledSet.has(m.name)).length;
-  const [customCtxFor, setCustomCtxFor] = useState<string | null>(null);
 
   return (
   <div className="bg-[#121215] border border-[#272730] rounded-xl p-4 space-y-3">
@@ -258,11 +257,9 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
               {/* Context window (num_ctx) — per-model on this node */}
               {!isEmbed && onSetModelNumCtx && currentNode.type !== 'openai' && (() => {
                 const maxCtx = resolveModelMaxContext(m.name, m);
-                const currentCtx = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
-                const options = ctxSizeOptions(maxCtx);
-                const isCustom =
-                  customCtxFor === m.name ||
-                  !(COMMON_CTX_SIZES as readonly number[]).includes(currentCtx);
+                const storedCtx = resolveModelNumCtx(currentNode, m.name, DEFAULT_MODEL_NUM_CTX);
+                const currentCtx = snapNumCtxToOption(storedCtx, maxCtx);
+                const options = ctxSizeOptions(maxCtx, currentCtx);
                 const fit = estimateContextFit(currentCtx);
                 const overMax = maxCtx != null && currentCtx > maxCtx;
                 return (
@@ -297,56 +294,24 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                           </span>
                         )}
                       </div>
-                      <div className="flex items-center space-x-1.5 shrink-0">
-                        {isCustom ? (
-                          <input
-                            type="number"
-                            min={512}
-                            max={maxCtx || 1048576}
-                            step={1024}
-                            value={currentCtx}
-                            onChange={(e) => {
-                              const raw = parseInt(e.target.value, 10);
-                              if (!Number.isFinite(raw)) return;
-                              onSetModelNumCtx(currentNode, m.name, clampNumCtx(raw, maxCtx));
-                            }}
-                            className="w-[5.5rem] bg-[#1a1a20] border border-[#2a2a36] focus:border-indigo-500 text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono text-[11px]"
-                            title="Custom num_ctx"
-                          />
-                        ) : (
-                          <select
-                            value={currentCtx}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              if (v === 'custom') {
-                                setCustomCtxFor(m.name);
-                                return;
-                              }
-                              setCustomCtxFor(null);
-                              onSetModelNumCtx(currentNode, m.name, clampNumCtx(parseInt(v, 10), maxCtx));
-                            }}
-                            className="bg-[#1a1a20] border border-[#2a2a36] focus:border-indigo-500 text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono text-[11px]"
-                            title="Ollama options.num_ctx"
-                          >
-                            {options.map(sz => (
-                              <option key={sz} value={sz}>
-                                {formatCtxLabel(sz)}
-                              </option>
-                            ))}
-                            <option value="custom">Custom…</option>
-                          </select>
-                        )}
-                        {isCustom && (
-                          <button
-                            type="button"
-                            onClick={() => setCustomCtxFor(null)}
-                            className="text-[9px] text-zinc-500 hover:text-zinc-300 px-1"
-                            title="Back to presets"
-                          >
-                            presets
-                          </button>
-                        )}
-                      </div>
+                      <select
+                        value={currentCtx}
+                        onChange={(e) => {
+                          onSetModelNumCtx(
+                            currentNode,
+                            m.name,
+                            clampNumCtx(parseInt(e.target.value, 10), maxCtx)
+                          );
+                        }}
+                        className="bg-[#1a1a20] border border-[#2a2a36] focus:border-indigo-500 text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono text-[11px] shrink-0"
+                        title="Ollama options.num_ctx"
+                      >
+                        {options.map(sz => (
+                          <option key={sz} value={sz}>
+                            {formatCtxLabel(sz)}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                     <p className={`text-[10px] font-mono leading-snug ${overMax ? 'text-amber-400' : 'text-zinc-500'}`}>
                       {fit.label}
