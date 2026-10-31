@@ -102,6 +102,74 @@ export function stripThinkBlocks(raw: string): string {
   return raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
+/** Pull the outermost `{...}` with brace counting (ignores braces inside strings). */
+export function extractJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Fix common local-model JSON mistakes before parse. */
+export function sanitizeLooseJson(raw: string): string {
+  let s = raw.trim();
+  // Trailing commas before } or ]
+  s = s.replace(/,\s*([}\]])/g, '$1');
+  // Unescaped newlines inside double-quoted strings (best-effort)
+  let out = '';
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escape) {
+        out += ch;
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        out += ch;
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      if (ch === '\n' || ch === '\r') {
+        out += '\\n';
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
 /**
  * Parse Pass-1 Lead Architect JSON (tolerates fences + think blocks).
  */
@@ -110,10 +178,14 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
     let cleaned = stripThinkBlocks(raw);
     const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fence) cleaned = fence[1].trim();
-    const startObj = cleaned.indexOf('{');
-    const endObj = cleaned.lastIndexOf('}');
-    if (startObj === -1 || endObj <= startObj) return null;
-    const parsed = JSON.parse(cleaned.slice(startObj, endObj + 1));
+    const slice = extractJsonObject(cleaned);
+    if (!slice) return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(slice);
+    } catch {
+      parsed = JSON.parse(sanitizeLooseJson(slice));
+    }
     if (!parsed || typeof parsed !== 'object') return null;
 
     const contractFile = String(parsed.contractFile || 'src/types/swarm-contract.ts')

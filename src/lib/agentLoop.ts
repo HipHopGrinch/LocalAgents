@@ -2,10 +2,18 @@ import { ChatMessage, ToolCall } from '../types';
 import { applyEdits, formatToolResult, READ_ONLY_TOOLS } from './tools';
 import { pickImageTarget, placeholderSvg } from './imageRouting';
 
-/** Inspect → write re-prompts (not counting command self-correct). */
-export const MAX_TOOL_CONTINUATIONS = 2;
+/** Fallback when settings.maxAgentSteps is missing. */
+export const MAX_TOOL_CONTINUATIONS = 12;
 /** Auto self-correct rounds after a failed terminal command (then stop). */
 export const MAX_COMMAND_FIX_ATTEMPTS = 2;
+/** Failed edit/write re-prompts before the turn stops. */
+export const MAX_WRITE_FIX_ATTEMPTS = 2;
+
+/** Bound the inner tool loop to settings.maxAgentSteps (default 12). */
+export function toolContinuationLimit(maxAgentSteps?: number): number {
+  const n = typeof maxAgentSteps === 'number' && maxAgentSteps > 0 ? Math.floor(maxAgentSteps) : MAX_TOOL_CONTINUATIONS;
+  return Math.max(4, Math.min(n, 24));
+}
 
 const DESTRUCTIVE_CMD =
   /\brm\s+-rf\b|\bformat\s+[a-z]:|\bdiskpart\b|\bdel\s+\/s\b|\bremove-item\b[^\n]*-recurse[^\n]*-force|\bmkfs\b|\bshutdown\s+\/s\b/i;
@@ -298,7 +306,7 @@ export function shouldContinueFromTools(
   const writeFailed = tools.some(
     t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
   );
-  if (writeFailed && (opts.writeFixAttempts ?? 0) < 1) return true;
+  if (writeFailed && (opts.writeFixAttempts ?? 0) < MAX_WRITE_FIX_ATTEMPTS) return true;
 
   const wrote = tools.some(t => isWritableTool(t.name) && t.status === 'done');
   // read_terminal alone must not keep the loop alive
@@ -330,7 +338,11 @@ export function buildContinuationUserPrompt(
   }
 
   if (writeFailed) {
-    return `File write failed:\n${resultsXml}\n\nFix the file with a corrected <write_file> or <edit_file> for the same path. Do not repeat a destructive command.`;
+    const editFailed = feedbackTools.some(t => t.name === 'edit_file' && t.status === 'error');
+    if (editFailed) {
+      return `File edit failed:\n${resultsXml}\n\nThe SEARCH block could not be matched. Output the entire corrected file with <write_file path="..."> (full contents). Do not retry the same SEARCH/REPLACE. Do not repeat a destructive command.`;
+    }
+    return `File write failed:\n${resultsXml}\n\nFix the file with a corrected <write_file> for the same path. Do not repeat a destructive command.`;
   }
 
   if (hadCmd) {

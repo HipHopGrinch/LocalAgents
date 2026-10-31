@@ -803,6 +803,7 @@ export const App: React.FC = () => {
           onOpenFileInEditor={handleOpenFileInEditor}
           onRecordTokens={handleRecordTokens}
           onNoteFreeTierCall={handleNoteFreeTierCall}
+          maxAgentSteps={settings.maxAgentSteps || 12}
           conversation={activeConversation}
           workspaceConversations={workspaceConversations}
           onMessagesChange={handleMessagesChange}

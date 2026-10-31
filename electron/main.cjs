@@ -949,13 +949,18 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
   return new Promise(resolve => {
     let output = '';
     let timedOut = false;
-    const wrapped = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
+    let idleTimedOut = false;
+    const idleMs = 45000;
+    const wrapped =
+      `$env:CI='1'; $env:NONINTERACTIVE='1'; $env:TERM='dumb'; ` +
+      `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${command}`;
     let proc;
     try {
       proc = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', wrapped], {
         cwd: cwd && fs.existsSync(cwd) ? cwd : process.cwd(),
-        env: process.env,
-        windowsHide: true
+        env: { ...process.env, CI: '1', NONINTERACTIVE: '1', TERM: 'dumb' },
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
       });
     } catch (err) {
       return resolve({ code: -1, output: err.message, timedOut });
@@ -963,7 +968,20 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
     activeProcs.add(proc);
     if (echo) echoTerminal(`\n> ${command}\n`);
 
+    let idleTimer = null;
+    const bumpIdle = () => {
+      if (timeoutMs <= 0) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        timedOut = true;
+        killTree(proc);
+      }, idleMs);
+    };
+    bumpIdle();
+
     const onData = data => {
+      bumpIdle();
       const text = data.toString();
       if (capture) output += text;
       if (echo) echoTerminal(text);
@@ -975,8 +993,12 @@ function runPowerShell(command, cwd, { timeoutMs = 0, echo = true, capture = fal
 
     proc.on('close', code => {
       if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       activeProcs.delete(proc);
-      if (echo) echoTerminal(`\n[exit ${code}]\n`);
+      if (echo) {
+        if (idleTimedOut) echoTerminal(`\n[idle timeout ${idleMs}ms — no output]\n`);
+        echoTerminal(`\n[exit ${code}]\n`);
+      }
       send('terminal:state', { running: activeProcs.size > 0 });
       resolve({ code, output, timedOut });
     });

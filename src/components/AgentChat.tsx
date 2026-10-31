@@ -60,7 +60,6 @@ import {
   type SwarmManifest
 } from '../lib/swarmContract';
 import {
-  MAX_TOOL_CONTINUATIONS,
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
   buildContinuationUserPrompt,
@@ -71,7 +70,8 @@ import {
   runCommandTools,
   runAuxTools,
   runReadOnlyTools,
-  shouldContinueFromTools
+  shouldContinueFromTools,
+  toolContinuationLimit
 } from '../lib/agentLoop';
 import { streamChat } from '../lib/ollamaClient';
 import { ToolActionCard } from './agent/ToolActionCard';
@@ -159,6 +159,8 @@ interface AgentChatProps {
   /** Persist think on/off for a model on a node */
   onToggleModelThinking?: (nodeId: string, modelName: string, enabled: boolean) => void;
   searxngUrl?: string;
+  /** Inner tool-loop budget (settings.maxAgentSteps). */
+  maxAgentSteps?: number;
 }
 
 export const AgentChat: React.FC<AgentChatProps> = ({
@@ -184,8 +186,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onSelectConversation,
   onDeleteConversation,
   onToggleModelThinking,
-  searxngUrl = ''
+  searxngUrl = '',
+  maxAgentSteps = 12
 }) => {
+  const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
   const coderAgent = agents.find(a => a.handle === 'coder' || a.id === 'coder') || agents[0];
   const isPlannerSelected =
@@ -627,7 +631,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   ) => {
     const budget = opts?.budget;
     const depth = budget ? budget.depth : continuationDepthRef.current;
-    if (depth >= MAX_TOOL_CONTINUATIONS) return;
+    if (depth >= toolStepLimit) return;
 
     const feedbackTools = collectFeedbackTools(originMsg.toolCalls || []);
     if (feedbackTools.length === 0) return;
@@ -909,6 +913,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       userPrompt: string;
       expectedFilePath: string;
       stepLabel?: string;
+      retriedFrom?: string;
     }) => {
       const { idx, assignment, userPrompt, expectedFilePath } = opts;
       const { node, model, skippedReason } = assignment;
@@ -1044,6 +1049,47 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           return { ...m, pipelineSteps: updatedSteps, toolCalls: allTools };
         });
       } catch (workerErr: any) {
+        const errText = String(workerErr?.message || workerErr || '');
+        const networkish =
+          /timeout|abort|network|fetch|ECONN|ENOTFOUND|ECONNRESET|CUDA|out of memory|oom/i.test(errText);
+        const fallback = networkish && !opts.retriedFrom
+          ? nodes.find(
+              n =>
+                n.id !== node.id &&
+                n.online &&
+                !isFrontierNode(n) &&
+                getEnabledModelsForNode(n).length > 0
+            )
+          : undefined;
+        if (fallback) {
+          const fallbackModel =
+            getPreferredModelForNode(fallback) || getEnabledModelsForNode(fallback)[0];
+          window.electronAPI?.writeLog?.(
+            'warn',
+            `swarm: ${node.name} failed (${errText.slice(0, 120)}); rerouting ${expectedFilePath} to ${fallback.name}`
+          );
+          patchPipelineMsg(m => {
+            if (!m.pipelineSteps) return m;
+            const updatedSteps = [...m.pipelineSteps];
+            if (updatedSteps[idx]) {
+              updatedSteps[idx] = {
+                ...updatedSteps[idx],
+                nodeId: fallback.id,
+                nodeName: fallback.name,
+                modelName: fallbackModel,
+                status: 'running',
+                content: `Rerouted from ${node.name}: ${errText.slice(0, 160)}`
+              };
+            }
+            return { ...m, pipelineSteps: updatedSteps };
+          });
+          await runWorkerTurn({
+            ...opts,
+            assignment: { ...assignment, node: fallback, model: fallbackModel },
+            retriedFrom: node.id
+          });
+          return;
+        }
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
           const updatedSteps = [...m.pipelineSteps];
@@ -1051,7 +1097,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             updatedSteps[idx] = {
               ...updatedSteps[idx],
               status: 'failed',
-              content: `Failed on ${node.name}: ${workerErr?.message || workerErr}`
+              content: `Failed on ${node.name}: ${errText}`
             };
           }
           return { ...m, pipelineSteps: updatedSteps };

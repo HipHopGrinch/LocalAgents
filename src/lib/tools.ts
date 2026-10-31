@@ -197,43 +197,6 @@ export function parseResponse(
     let fallbackIdx = 0;
     const usedNames = new Set<string>();
 
-    const LANG_DEFAULT_FILE: Record<string, string> = {
-      html: 'index.html',
-      htm: 'index.html',
-      css: 'styles.css',
-      scss: 'styles.scss',
-      js: 'app.js',
-      javascript: 'app.js',
-      ts: 'main.ts',
-      typescript: 'main.ts',
-      tsx: 'App.tsx',
-      jsx: 'App.jsx',
-      py: 'main.py',
-      python: 'main.py',
-      cs: 'Program.cs',
-      csharp: 'Program.cs',
-      'c#': 'Program.cs',
-      cpp: 'main.cpp',
-      'c++': 'main.cpp',
-      c: 'main.c',
-      rs: 'main.rs',
-      rust: 'main.rs',
-      go: 'main.go',
-      golang: 'main.go',
-      ps1: 'app.ps1',
-      powershell: 'app.ps1',
-      bat: 'run.bat',
-      batch: 'run.bat',
-      cmd: 'run.cmd',
-      xaml: 'MainWindow.xaml',
-      xml: 'config.xml',
-      json: 'package.json',
-      yaml: 'config.yaml',
-      yml: 'config.yml',
-      sql: 'schema.sql',
-      java: 'Main.java'
-    };
-
     while ((match = codeBlockRe.exec(work)) !== null) {
       const lang = (match[1] || '').toLowerCase().trim();
       const info = (match[2] || '').trim();
@@ -297,25 +260,9 @@ export function parseResponse(
         }
       }
 
-      // 4. Language & Content Signatures — only when createIntent (or conductor path)
-      if (!detectedFilename && createIntent) {
-        if (lang && LANG_DEFAULT_FILE[lang]) {
-          detectedFilename = LANG_DEFAULT_FILE[lang];
-        } else if (content.includes('<!DOCTYPE html>') || content.includes('<html') || (content.includes('<head') && content.includes('<body'))) {
-          detectedFilename = 'index.html';
-        } else if (content.includes('import tkinter') || content.includes('from tkinter') || content.includes('PyQt') || content.includes('def main(')) {
-          detectedFilename = 'main.py';
-        } else if (content.includes('using System') || content.includes('namespace ') || content.includes('Application.Run(')) {
-          detectedFilename = 'Program.cs';
-        } else if (content.includes('#include <windows.h>') || content.includes('int WINAPI WinMain') || content.includes('#include <iostream>')) {
-          detectedFilename = 'main.cpp';
-        } else if (content.includes('Add-Type -AssemblyName System.Windows.Forms')) {
-          detectedFilename = 'app.ps1';
-        }
-      }
-
-      // Without createIntent, only keep fences that named an explicit path
-      if (detectedFilename && !createIntent && !expectedFilePath && !pathExplicit) {
+      // No language-default inventing (main.py from ```python). Path must be explicit
+      // in the fence, surrounding prose, a file comment, or expectedFilePath from Swarm.
+      if (detectedFilename && !expectedFilePath && !pathExplicit) {
         detectedFilename = undefined;
       }
 
@@ -392,11 +339,15 @@ function countOccurrences(hay: string, needle: string): number {
   return n;
 }
 
+/** Collapse tabs, strip trailing spaces, drop CR — for Pass 2 matching. */
+function normalizeLine(s: string): string {
+  return s.replace(/\t/g, '  ').replace(/[ \t]+$/g, '');
+}
+
 /** Fallback: match ignoring leading/trailing whitespace on each line. Returns [startLine, endLine) or null. */
 function fuzzyLineMatch(lines: string[], searchLines: string[]): [number, number] | null {
   const norm = (s: string) => s.trim();
   const target = searchLines.map(norm);
-  // drop leading/trailing blank lines from the search
   while (target.length && !target[0]) target.shift();
   while (target.length && !target[target.length - 1]) target.pop();
   if (!target.length) return null;
@@ -412,6 +363,65 @@ function fuzzyLineMatch(lines: string[], searchLines: string[]): [number, number
     if (ok) hits.push(i);
   }
   return hits.length === 1 ? [hits[0], hits[0] + target.length] : null;
+}
+
+/** Pass 2: unique match after normalizing indent/EOL differences. */
+function normalizedLineMatch(lines: string[], searchLines: string[]): [number, number] | null {
+  const target = searchLines.map(normalizeLine);
+  while (target.length && !target[0].trim()) target.shift();
+  while (target.length && !target[target.length - 1].trim()) target.pop();
+  if (!target.length) return null;
+  const hits: number[] = [];
+  for (let i = 0; i + target.length <= lines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < target.length; j++) {
+      if (normalizeLine(lines[i + j]) !== target[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) hits.push(i);
+  }
+  return hits.length === 1 ? [hits[0], hits[0] + target.length] : null;
+}
+
+function lineSimilarity(a: string, b: string): number {
+  const x = normalizeLine(a).trim();
+  const y = normalizeLine(b).trim();
+  if (x === y) return 1;
+  if (!x.length && !y.length) return 1;
+  if (!x.length || !y.length) return 0;
+  const max = Math.max(x.length, y.length);
+  let dist = 0;
+  const n = Math.min(x.length, y.length);
+  for (let i = 0; i < n; i++) if (x[i] !== y[i]) dist++;
+  dist += Math.abs(x.length - y.length);
+  return Math.max(0, 1 - dist / max);
+}
+
+/**
+ * Pass 3: first/last two non-empty lines as anchors; require ~85% average line similarity
+ * across a window of the same length.
+ */
+function anchorLineMatch(lines: string[], searchLines: string[]): [number, number] | null {
+  const target = [...searchLines];
+  while (target.length && !target[0].trim()) target.shift();
+  while (target.length && !target[target.length - 1].trim()) target.pop();
+  if (target.length < 2) return null;
+  const head = target.slice(0, Math.min(2, target.length)).map(l => normalizeLine(l).trim());
+  const tail = target.slice(-Math.min(2, target.length)).map(l => normalizeLine(l).trim());
+  const len = target.length;
+  const hits: number[] = [];
+  for (let i = 0; i + len <= lines.length; i++) {
+    const windowHead = lines.slice(i, i + head.length).map(l => normalizeLine(l).trim());
+    const windowTail = lines.slice(i + len - tail.length, i + len).map(l => normalizeLine(l).trim());
+    if (windowHead.some((l, j) => l !== head[j])) continue;
+    if (windowTail.some((l, j) => l !== tail[j])) continue;
+    let score = 0;
+    for (let j = 0; j < len; j++) score += lineSimilarity(lines[i + j], target[j]);
+    if (score / len >= 0.85) hits.push(i);
+  }
+  return hits.length === 1 ? [hits[0], hits[0] + len] : null;
 }
 
 export function applyEdits(original: string, body: string): EditResult {
@@ -431,6 +441,7 @@ export function applyEdits(original: string, body: string): EditResult {
       }
       return { applied: i, error: `Block ${i + 1}: empty SEARCH section. To append, search for the last lines of the file.` };
     }
+    // Pass 1: exact
     const count = countOccurrences(text, search);
     if (count === 1) {
       text = text.replace(search, () => replace);
@@ -440,11 +451,17 @@ export function applyEdits(original: string, body: string): EditResult {
       return { applied: i, error: `Block ${i + 1}: SEARCH text matches ${count} places. Include more surrounding lines so it is unique.` };
     }
     const lines = text.split('\n');
-    const range = fuzzyLineMatch(lines, search.split('\n'));
+    const searchLines = search.split('\n');
+    // Pass 2: normalized indent/EOL
+    let range = normalizedLineMatch(lines, searchLines);
+    // Pass 2b: trim-only fuzzy (existing)
+    if (!range) range = fuzzyLineMatch(lines, searchLines);
+    // Pass 3: anchor + similarity
+    if (!range) range = anchorLineMatch(lines, searchLines);
     if (!range) {
       return {
         applied: i,
-        error: `Block ${i + 1}: SEARCH text not found in the file. Re-read the file with read_file and copy the lines exactly.`
+        error: `Block ${i + 1}: SEARCH text not found in the file. Re-read the file with read_file, or emit the full file with <write_file path="...">.`
       };
     }
     lines.splice(range[0], range[1] - range[0], ...replace.split('\n'));
