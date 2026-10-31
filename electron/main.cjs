@@ -1819,7 +1819,7 @@ function setupAutoUpdater() {
     autoUpdater.setFeedURL({
       provider: 'github',
       owner: 'HipHopGrinch',
-      repo: 'LocalAgents'
+      repo: 'LocalAgents-Studio'
     });
   } catch (err) {
     appendLog('warn', `updater setFeedURL: ${err?.message || err}`);

@@ -4,7 +4,9 @@ An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster w
 
 **Discord:** https://discord.gg/ZVkmUfXwW
 
-**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents/wiki) — install, Ollama, nodes, models, projects, the agent, Swarm, and logs.
+**User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents-Studio/wiki) — install, Ollama, nodes, models, projects, the agent, Swarm, and logs.
+
+**Repository:** https://github.com/HipHopGrinch/LocalAgents-Studio
 
 ---
 
@@ -54,7 +56,7 @@ Default nodes are **examples** — edit URLs and hardware in Hardware Settings t
 ## Running the App
 
 ```powershell
-cd path\to\LocalAgents
+cd path\to\LocalAgents-Studio
 .\start.bat
 # or
 npm start
@@ -77,8 +79,8 @@ npm run dist
 
 Artifacts land in `release\`:
 
-- **`LocalAgents Studio-*-portable.exe`** — single portable EXE (no installer)
-- **`LocalAgents Studio-*-setup.exe`** — NSIS installer with Start Menu / desktop shortcuts
+- **`LocalAgents-Studio-*-portable.exe`** — single portable EXE (no installer)
+- **`LocalAgents-Studio-*-setup.exe`** — NSIS installer with Start Menu / desktop shortcuts
 
 Ollama is still installed separately on each machine; the EXE only packages LocalAgents Studio. Your endpoints/API keys stay in `%APPDATA%\LocalAgents Studio\` and are not part of the build.
 
