@@ -142,8 +142,8 @@ export interface PlanOption {
   id: string;
   title: string;
   description: string;
-  /** stop = record the choice and do not start the coder */
-  action?: 'run' | 'stop';
+  /** stop = record the choice and do not start the coder. copy = clipboard. paid = confirm a paid API call. */
+  action?: 'run' | 'stop' | 'copy' | 'paid';
 }
 
 /** Locked plan after the user picks an option — drives Coder / Swarm execution. */

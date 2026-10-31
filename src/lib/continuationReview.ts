@@ -123,6 +123,26 @@ export function pickCapableReviewTarget(nodes: EndpointNode[]): ReviewTarget | u
   return best;
 }
 
+/** Largest enabled local model, then the card with the most VRAM. Used when a step is repeating. */
+export function pickLargestLocalTarget(nodes: EndpointNode[]): ReviewTarget | undefined {
+  const pool = nodes.filter(n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0);
+  let best: ReviewTarget | undefined;
+  let bestSize = -1;
+  let bestVram = -1;
+  for (const node of pool) {
+    const vram = node.hardware?.vramGB || 0;
+    for (const model of getEnabledModelsForNode(node)) {
+      const size = reviewModelSizeB(model);
+      const wins = size > bestSize || (size === bestSize && vram > bestVram);
+      if (!wins) continue;
+      best = { node, model };
+      bestSize = size;
+      bestVram = vram;
+    }
+  }
+  return best;
+}
+
 const FILE_NAME = /[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|md|html|css|go|rs)/g;
 const FIX_LANGUAGE =
   /\b(fix|polish|bug|bugs|broken|repair|correct|missing|incomplete|does not|doesn't|fail|fails|failing|error|errors)\b/i;

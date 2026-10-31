@@ -87,10 +87,12 @@ import {
   FREE_TIER_ASSIST_SYSTEM,
   bumpFreeTierUsage,
   pickFreeTierAssist,
+  pickPaidFrontier,
   reviewNeedsAssist,
   tailForAssist,
   type FreeTierUsage
 } from '../lib/freeTierAssist';
+import { isRepeatStop, nextStuckStage, stuckKey, type StuckStage } from '../lib/stuckEscalation';
 import { compactMessages, historyTokens, shouldCompact } from '../lib/compactChat';
 import {
   advanceNext,
@@ -124,6 +126,7 @@ import {
   MAX_AUTO_CONTINUATIONS,
   parseNextStep,
   pickCapableReviewTarget,
+  pickLargestLocalTarget,
   stripNextStepMarkup,
   taskFixesWrittenFiles,
   tasksTooSimilar
@@ -216,6 +219,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const approvedPlanRef = useRef<ApprovedPlan | null>(conversation?.approvedPlan ?? null);
   const stopRequestedRef = useRef(false);
   const freeTierUsageRef = useRef<Record<string, FreeTierUsage>>({});
+  const stuckRef = useRef<{ key: string; stage: StuckStage }>({ key: '', stage: 'none' });
 
   type LoopBudget = {
     depth: number;
@@ -257,6 +261,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setInput('');
       setPendingImages([]);
       setHistoryOpen(false);
+      stuckRef.current = { key: '', stage: 'none' };
     }
   }, [conversation?.id]);
 
@@ -465,39 +470,52 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return (saved.count || 0) >= (local.count || 0) ? saved : local;
   };
 
-  /** One short frontier reply when the local window cannot hold the job. Null when no free-tier quota is left. */
-  const requestFreeTierBrief = async (purpose: string, payload: string): Promise<string | null> => {
-    const assist = pickFreeTierAssist(nodes, freeTierUsageFor);
-    if (!assist || stopRequestedRef.current) return null;
+  /** One short frontier reply. Free-tier calls count against the daily cap. */
+  const requestAssistBrief = async (
+    target: { node: EndpointNode; model: string },
+    purpose: string,
+    payload: string,
+    countFreeTier: boolean
+  ): Promise<string | null> => {
+    if (stopRequestedRef.current) return null;
     const handle = streamChat(
-      assist.node.url,
+      target.node.url,
       withThink(
         {
-          model: assist.model,
+          model: target.model,
           messages: [
             { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
             { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
           ],
           options: { temperature: 0.1, num_predict: ASSIST_MAX_PREDICT }
         },
-        assist.node,
-        assist.model
+        target.node,
+        target.model
       ),
       () => {},
-      assist.node.type,
-      assist.node.apiKey
+      target.node.type,
+      target.node.apiKey
     );
     activeAbortsRef.current = [...activeAbortsRef.current, handle.abort];
     const result = await handle.done;
     if (result.aborted || stopRequestedRef.current) return null;
     const brief = (result.content || '').replace(/\s+/g, ' ').trim().slice(0, 1800);
     if (!brief) return null;
-    freeTierUsageRef.current[assist.node.id] = bumpFreeTierUsage(freeTierUsageFor(assist.node));
-    onNoteFreeTierCall?.(assist.node.id);
+    if (countFreeTier) {
+      freeTierUsageRef.current[target.node.id] = bumpFreeTierUsage(freeTierUsageFor(target.node));
+      onNoteFreeTierCall?.(target.node.id);
+    }
     if (result.stats?.evalCount) {
       onRecordTokens(0, result.stats.evalCount + (result.stats.promptEvalCount || 0));
     }
     return brief;
+  };
+
+  /** One short frontier reply when the local window cannot hold the job. Null when no free-tier quota is left. */
+  const requestFreeTierBrief = async (purpose: string, payload: string): Promise<string | null> => {
+    const assist = pickFreeTierAssist(nodes, freeTierUsageFor);
+    if (!assist) return null;
+    return requestAssistBrief(assist, purpose, payload, true);
   };
 
   const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
@@ -1841,6 +1859,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     let handoff = false;
     let nextTask = '';
     let pinFix = false;
+    let pinStuck: { node: EndpointNode; model: string } | undefined;
+    let handledLoop = false;
     try {
       const askModel = async (content: string, prior: { role: string; content: string }[]) => {
         const body = withThink(
@@ -1968,11 +1988,87 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       let display = steered?.note || prose || decision?.reason || '';
       let runTask = '';
 
-      if (decision?.decision === 'continue' && !capped && !tasksTooSimilar(previousTask, decision.task)) {
+      const repeatTask =
+        (steered && isRepeatStop(steered.note) && (parsedDecision?.task || previousTask || '').trim()) || '';
+      const similarTask =
+        !repeatTask &&
+        decision?.decision === 'continue' &&
+        !!previousTask &&
+        tasksTooSimilar(previousTask, decision.task)
+          ? decision.task
+          : '';
+      const loopTask = (repeatTask || similarTask).trim();
+      if (loopTask) {
+        handledLoop = true;
+        const key = stuckKey(loopTask);
+        const stage: StuckStage = stuckRef.current.stage;
+        let step = nextStuckStage(stage);
+        stuckRef.current = { key, stage };
+        const stuckPayload = `${progressForPrompt()}\n\nStuck step:\n${loopTask}`;
+        if (step === 'big') {
+          const big = pickLargestLocalTarget(nodes);
+          if (big) {
+            stuckRef.current.stage = 'big';
+            handoff = true;
+            nextTask = loopTask;
+            pinFix = true;
+            pinStuck = big;
+            runTask = loopTask;
+            options = [];
+            display = `Stuck repeating. Retrying on ${big.node.name} · ${big.model} (${big.node.hardware?.vramGB || 0} GB).`;
+          } else {
+            step = 'free';
+          }
+        }
+        if (step === 'free') {
+          stuckRef.current.stage = 'free';
+          let brief: string | null = null;
+          try {
+            brief = await requestFreeTierBrief(
+              'The local models are repeating this step and not fixing it. Give one short solution. Do not rewrite the file.',
+              stuckPayload
+            );
+          } catch (err: any) {
+            window.electronAPI?.writeLog?.('warn', `free-tier stuck: ${err?.message || err}`);
+          }
+          if (brief) {
+            const big = pickLargestLocalTarget(nodes);
+            display = `Free-tier solution:\n\n${brief}`;
+            options = [{ id: 'copy-solution', title: 'Copy solution', description: brief, action: 'copy' }];
+            if (big) {
+              handoff = true;
+              nextTask = `Apply this solution. Do not repeat the failed approach.\n\n${brief}`;
+              pinFix = true;
+              pinStuck = big;
+              runTask = nextTask;
+            }
+          } else {
+            step = 'paid';
+          }
+        }
+        if (step === 'paid') {
+          stuckRef.current.stage = 'paid';
+          const paid = pickPaidFrontier(nodes);
+          handoff = false;
+          runTask = '';
+          nextTask = '';
+          pinStuck = undefined;
+          pinFix = false;
+          if (paid) {
+            display = `Still stuck after the largest local model and the free tier. Confirm before a paid call to ${paid.node.name} · ${paid.model}.`;
+            options = [{ id: 'use-paid-api', title: `Use paid API · ${paid.model}`, description: loopTask, action: 'paid' }];
+          } else {
+            display = 'Still stuck. No paid API node is available. Leave Free tier unchecked on a frontier key to use it as the paid step.';
+            options = [];
+          }
+        }
+      }
+
+      if (!handledLoop && decision?.decision === 'continue' && !capped && !tasksTooSimilar(previousTask, decision.task)) {
         runTask = decision.task;
         display = display || `Continuing automatically.\n\n${decision.reason}`;
         options = [];
-      } else if (decision?.decision === 'continue') {
+      } else if (!handledLoop && decision?.decision === 'continue') {
         display =
           display ||
           `${decision.reason}\n\nI can keep going with: ${decision.task}`;
@@ -1985,13 +2081,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             }
           ];
         }
-      } else if (decision?.decision === 'done') {
+      } else if (!handledLoop && decision?.decision === 'done') {
         display = display || decision.reason || 'The requested work looks complete.';
-      } else if (decision?.decision === 'ask') {
+      } else if (!handledLoop && decision?.decision === 'ask') {
         display = display || decision.reason || 'Need a choice before continuing.';
       }
 
-      if (runTask) display = `Continuing — ${runTask}`;
+      if (runTask && !handledLoop) display = `Continuing — ${runTask}`;
 
       setMessages(prev =>
         prev.map(m =>
@@ -2009,19 +2105,23 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         )
       );
 
-      if (runTask) {
+      if (runTask && !handledLoop) {
         handoff = true;
         nextTask = runTask;
         pinFix = taskFixesWrittenFiles(runTask, touchedPaths);
         updateProgress(log => advanceNext(log, runTask));
+      } else if (runTask && handledLoop) {
+        updateProgress(log => advanceNext(log, runTask));
       } else if (options.length) {
         updateProgress(log => options.reduce((acc, option) => rememberAsked(acc, `${option.title}: ${option.description}`), log));
       }
-      if (!runTask && (decision?.decision === 'done' || decision?.decision === 'ask' || options.length)) {
+      if (!handledLoop && !runTask && (decision?.decision === 'done' || decision?.decision === 'ask' || options.length)) {
         setExecutingPlanNotice(
           decision?.decision === 'done' ? 'Work looks complete — optional next steps below' : 'Waiting for a choice'
         );
-      } else {
+      } else if (handledLoop && options.some(o => o.action === 'paid')) {
+        setExecutingPlanNotice('Waiting for confirmation before a paid API call');
+      } else if (!handoff) {
         setExecutingPlanNotice(null);
       }
     } catch (err: any) {
@@ -2043,22 +2143,29 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
     if (!handoff || stopRequestedRef.current) return;
 
-    setExecutingPlanNotice(`Continuing — ${nextTask.slice(0, 110)}`);
+    const stuckTarget = pinStuck;
+    setExecutingPlanNotice(
+      stuckTarget
+        ? `Retrying on ${stuckTarget.node.name} — ${nextTask.slice(0, 90)}`
+        : `Continuing — ${nextTask.slice(0, 110)}`
+    );
     const planPrefix = approvedPlanRef.current
       ? `${formatApprovedPlanContext(approvedPlanRef.current)}\n\n`
       : '';
     await runSingleNodeTurn({
       userText: `Continue: ${nextTask}`,
-      fullPrompt: pinFix
+      fullPrompt: pinFix || stuckTarget
         ? `${planPrefix}NEXT STEP — fix the existing files with <edit_file>. Do not rewrite a file from scratch when a search/replace will do. Do not add a new feature.\n\n${nextTask}`
         : `${planPrefix}NEXT STEP — do this now, then stop. Do not expand into unrelated features.\n\n${nextTask}`,
       agent: coderAgent,
       planMode: false,
       approvedPlan: approvedPlanRef.current,
-      notice: pinFix
-        ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
-        : `Continuing automatically — ${nextTask.slice(0, 140)}`,
-      ...(pinFix ? { pinRoute: { node, model } } : {})
+      notice: stuckTarget
+        ? `Stuck-loop retry on ${stuckTarget.node.name} · ${stuckTarget.model}`
+        : pinFix
+          ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
+          : `Continuing automatically — ${nextTask.slice(0, 140)}`,
+      ...(stuckTarget ? { pinRoute: stuckTarget } : pinFix ? { pinRoute: { node, model } } : {})
     });
     if (stopRequestedRef.current) return;
     await reviewAndAdvance(depth + 1, nextTask);
@@ -2137,8 +2244,76 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (!stopRequestedRef.current) await reviewAndAdvance(0);
   };
 
+  const confirmPaidAssist = async (task: string) => {
+    const paid = pickPaidFrontier(nodes);
+    if (!paid || !task.trim()) return;
+    setIsStreaming(true);
+    setExecutingPlanNotice(`Asking ${paid.node.name} · ${paid.model}…`);
+    let brief: string | null = null;
+    try {
+      brief = await requestAssistBrief(
+        paid,
+        'The local models are repeating this step and not fixing it. Give one short solution. Do not rewrite the file.',
+        `${progressForPrompt()}\n\nStuck step:\n${task}`,
+        false
+      );
+    } catch (err: any) {
+      window.electronAPI?.writeLog?.('warn', `paid stuck: ${err?.message || err}`);
+    }
+    if (!brief || stopRequestedRef.current) {
+      setIsStreaming(false);
+      setExecutingPlanNotice(brief ? null : 'The paid API did not return a solution.');
+      return;
+    }
+    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    setMessages(prev => [
+      ...prev,
+      {
+        id: `paid-${Date.now()}`,
+        role: 'assistant',
+        raw: brief,
+        display: `Paid API solution:\n\n${brief}`,
+        agentId: coderAgent.id,
+        personaHandle: coderAgent.handle,
+        endpointId: paid.node.id,
+        endpointName: paid.node.name,
+        model: paid.model,
+        timestamp: stamp,
+        notice: `Paid solution from ${paid.node.name}`,
+        planOptions: [{ id: 'copy-paid', title: 'Copy solution', description: brief, action: 'copy' }]
+      }
+    ]);
+    const big = pickLargestLocalTarget(nodes);
+    if (!big) {
+      setIsStreaming(false);
+      setExecutingPlanNotice('Paid solution is in the chat. No local model is online to apply it.');
+      return;
+    }
+    await runSingleNodeTurn({
+      userText: 'Continue: apply the paid API solution',
+      fullPrompt: `Apply this solution from the paid API. Do not repeat the failed approach.\n\n${brief}`,
+      agent: coderAgent,
+      planMode: false,
+      approvedPlan: approvedPlanRef.current,
+      notice: `Applying the paid solution on ${big.node.name} · ${big.model}`,
+      pinRoute: big
+    });
+    if (!stopRequestedRef.current) await reviewAndAdvance(0, brief);
+  };
+
   const handleSelectPlanOption = (option: PlanOption, planMsg: ChatMessage) => {
+    if (option.action === 'copy') {
+      void navigator.clipboard.writeText(option.description);
+      return;
+    }
     if (isStreaming || planMsg.selectedPlanOptionId) return;
+    if (option.action === 'paid') {
+      setMessages(prev =>
+        prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
+      );
+      void confirmPaidAssist(option.description);
+      return;
+    }
     if (option.action === 'stop') {
       setMessages(prev =>
         prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
@@ -2166,6 +2341,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     fitContext(chatNumCtx(selectedNode, activeTargetModel));
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
+    stuckRef.current = { key: '', stage: 'none' };
 
     let fullPrompt = userText;
     if (includeActiveFile && activeTab) {

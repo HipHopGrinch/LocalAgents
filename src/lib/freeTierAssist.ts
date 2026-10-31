@@ -99,3 +99,14 @@ export function pickFreeTierAssist(
   }
   return best;
 }
+
+/** A frontier node that is not marked free tier. */
+export function pickPaidFrontier(nodes: EndpointNode[]): { node: EndpointNode; model: string } | undefined {
+  for (const node of nodes) {
+    if (!node.online || !isFrontierNode(node) || node.freeTier) continue;
+    const model = getPreferredModelForNode(node);
+    if (!model || !getEnabledModelsForNode(node).includes(model)) continue;
+    return { node, model };
+  }
+  return undefined;
+}
