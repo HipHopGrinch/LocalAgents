@@ -514,7 +514,8 @@ export function buildLeadArchitectPrompt(
   workspaceOverview: string,
   existingSnippets: string,
   approvedPlanText?: string | null,
-  workLog?: string | null
+  workLog?: string | null,
+  devHostSection?: string | null
 ): string {
   const planSection = approvedPlanText?.trim()
     ? `
@@ -525,10 +526,21 @@ If the approved plan chooses static HTML/CSS/JS (or similar), still return valid
 `
     : '';
 
+  const hostBlock = devHostSection?.trim()
+    ? `
+### DEVELOPMENT HOST
+${devHostSection.trim()}
+Workers may run on other GPUs; they still write into this Dev workspace. Installs and run_command execute on the Dev PC only.
+`
+    : `
+### DEVELOPMENT HOST
+The workspace, installs, and terminal live on the Dev PC where LocalAgents Studio is open — not necessarily on the GPU that runs this pass. Plan file paths for that Dev workspace.
+`;
+
   return `You are the Lead Architect (@coder) for LocalAgents Studio's Conductor Swarm.
 Your job is to decompose a multi-file coding request into a strict TypeScript contract BEFORE parallel GPU workers write the implementation files.
 When an APPROVED PLAN is present, honor the chosen stack and scope instead of inventing a different one.
-
+${hostBlock}
 ### WORKSPACE CONTEXT
 Existing file tree:
 ${workspaceOverview || '(empty or unknown)'}
@@ -597,6 +609,8 @@ export function buildSwarmWorkerPrompt(opts: {
   siblingSummary: string;
   currentFileContent?: string;
   userPrompt: string;
+  /** Dev-host context (workspace/installs on Studio PC) */
+  devHostSection?: string | null;
 }): string {
   const { task, contractFile, contractCode, siblingSummary, currentFileContent, userPrompt } = opts;
   const imports = task.requiredImports.length
@@ -605,11 +619,21 @@ export function buildSwarmWorkerPrompt(opts: {
   const exports = task.requiredExports.length
     ? task.requiredExports.map(e => `- ${e}`).join('\n')
     : '- (export the public API described in the instructions)';
+  const hostBlock = opts.devHostSection?.trim()
+    ? `
+### DEVELOPMENT HOST
+${opts.devHostSection.trim()}
+You are a collaborative multimodal worker: generate code for the Dev workspace, and when images are in context analyze them. Tool tags that touch files or the terminal execute on the Dev PC — do not treat your GPU host as the install/run machine.
+`
+    : `
+### DEVELOPMENT HOST
+Workspace files, package installs, and run_command execute on the Dev PC (where Studio is open), not on your GPU host. You still fully collaborate — code, review context, and vision when images are provided — for that Dev workspace.
+`;
 
   return `You are an autonomous GPU Worker in a distributed Conductor Swarm.
 You are assigned to implement ONE specific file: \`${task.filePath}\`.
 Other GPU nodes are simultaneously writing the sibling files.
-
+${hostBlock}
 ### STRICT CONTRACT RULES (DO NOT VIOLATE)
 1. You MUST import shared types exactly as specified:
 ${imports}
@@ -652,9 +676,13 @@ export function buildRepairWorkerPrompt(opts: {
   contractCode: string;
   currentFileContent: string;
   tscErrors: string;
+  devHostSection?: string | null;
 }): string {
+  const host = opts.devHostSection?.trim()
+    ? `\n### DEVELOPMENT HOST\n${opts.devHostSection.trim()}\nFixes apply to the Dev workspace; installs/runtime are on that PC.\n`
+    : '';
   return `You own \`${opts.task.filePath}\` in a Conductor Swarm. Workspace typecheck failed for your file.
-
+${host}
 ### CONTRACT (\`${opts.contractFile}\`) — read-only
 \`\`\`typescript
 ${opts.contractCode}

@@ -33,6 +33,7 @@ import { formatConversationTime } from '../lib/conversations';
 import {
   parseResponse,
   buildSystemPrompt,
+  buildDevHostPromptSection,
   getEnabledModelsForNode,
   getPreferredModelForNode,
   selectBestEndpointForTask,
@@ -711,7 +712,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const systemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
         planMode: planModeContinue,
         approvedPlan: planModeContinue ? null : approvedPlanRef.current,
-        progressLog: progressForPrompt()
+        progressLog: progressForPrompt(),
+        nodes,
+        inferenceNodeId: routeNode.id
       });
       const snap = messagesRef.current;
       const conversationPayload = [
@@ -942,7 +945,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
 
       const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
-        progressLog: progressForPrompt()
+        progressLog: progressForPrompt(),
+        nodes,
+        inferenceNodeId: node.id
       });
       const body = withThink(
         {
@@ -1148,12 +1153,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       let manifest: SwarmManifest = fallbackSwarmManifest(swarmTaskText);
       try {
         const snippets = await loadExistingSnippets();
+        const swarmDevHost = buildDevHostPromptSection(nodes, architect.node.id);
         const architectPrompt = buildLeadArchitectPrompt(
           swarmTaskText,
           workspaceOverview,
           snippets,
           lockedPlan ? formatApprovedPlanForSwarm(lockedPlan) : null,
-          progressForPrompt() || null
+          progressForPrompt() || null,
+          swarmDevHost
         );
         const architectBody: Record<string, unknown> = {
           model: architect.model,
@@ -1161,7 +1168,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             {
               role: 'system',
               content:
-                'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON.'
+                'You are the Lead Architect (@coder). Respond ONLY with a valid JSON object for the Swarm manifest. No markdown outside JSON. Workspace/installs/run_command target the Dev PC where Studio is open — not necessarily this inference host.'
             },
             { role: 'user', content: architectPrompt }
           ],
@@ -1384,7 +1391,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               contractCode: manifest.contractCode,
               siblingSummary,
               currentFileContent: current,
-              userPrompt: fullPrompt
+              userPrompt: fullPrompt,
+              devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
             })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
             await runWorkerTurn({
               idx: stepIdx,
@@ -1492,7 +1500,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                     contractFile: manifest.contractFile,
                     contractCode: manifest.contractCode,
                     currentFileContent: current,
-                    tscErrors: errors
+                    tscErrors: errors,
+                    devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
                   });
                   await runWorkerTurn({
                     idx,
@@ -1654,7 +1663,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
         approvedPlan: planMode ? null : approvedPlan,
-        progressLog: progressForPrompt()
+        progressLog: progressForPrompt(),
+        nodes,
+        inferenceNodeId: routedNode.id
       });
       const actionableUserPrompt = planMode
         ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`

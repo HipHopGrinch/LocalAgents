@@ -17,10 +17,12 @@ import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
 import { pullModel } from '../lib/ollamaClient';
 import {
+  assignDevNode,
   assignPreferredRole,
+  findNodeHoldingDev,
   findNodeHoldingRole,
   isEmbeddingModelName,
-  normalizePreferredRoles
+  normalizeClusterNodes
 } from '../lib/tools';
 import { modelSupportsThinking, normalizeThinkingInfo } from '../lib/thinking';
 import { ModelHubPanel } from './hardware/ModelHubPanel';
@@ -213,6 +215,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const handleUpdatePreferredRole = (value: '' | NodeRole) => {
     if (!currentNode) return;
     onUpdateNodes(assignPreferredRole(nodes, currentNode.id, value));
+  };
+
+  const handleUpdateDevNode = (enabled: boolean) => {
+    if (!currentNode) return;
+    onUpdateNodes(assignDevNode(nodes, currentNode.id, enabled));
   };
 
   const preferredRoleOptions: { value: '' | NodeRole; label: string }[] = [
@@ -546,7 +553,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         next = Array.from(byId.values());
       }
 
-      const normalized = normalizePreferredRoles(next);
+      const normalized = normalizeClusterNodes(next);
       onUpdateNodes(normalized);
       if (normalized[0]?.id) setSelectedNodeId(normalized[0].id);
       closeNodesIODialog();
@@ -620,7 +627,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
       }
     };
 
-    onUpdateNodes([...nodes, newNode]);
+    onUpdateNodes(normalizeClusterNodes([...nodes, newNode]));
     setSelectedNodeId(newNode.id);
     setShowAddNode(false);
     setNewNodeName('');
@@ -631,7 +638,7 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
 
   const handleDeleteNode = (id: string) => {
     if (confirm('Delete this endpoint node from cluster?')) {
-      const filtered = nodes.filter(n => n.id !== id);
+      const filtered = normalizeClusterNodes(nodes.filter(n => n.id !== id));
       onUpdateNodes(filtered);
       if (selectedNodeId === id) setSelectedNodeId(filtered[0]?.id || '');
     }
@@ -743,10 +750,17 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           }`}
                         />
                       </div>
-                      <div className="flex items-center justify-between text-[10px] text-zinc-400 font-mono">
-                        <span className="truncate">{isFrontier ? 'Frontier API' : `${n.hardware.vramGB}GB VRAM`}</span>
+                      <div className="flex items-center justify-between text-[10px] text-zinc-400 font-mono gap-1">
+                        <span className="truncate flex items-center gap-1 min-w-0">
+                          {n.isDevNode && (
+                            <span className="shrink-0 text-[9px] uppercase tracking-wide text-sky-300 bg-sky-500/15 border border-sky-500/30 px-1 rounded">
+                              Dev
+                            </span>
+                          )}
+                          <span className="truncate">{isFrontier ? 'Frontier API' : `${n.hardware.vramGB}GB VRAM`}</span>
+                        </span>
                         {n.online && n.latency !== null && (
-                          <span className="text-emerald-400">{n.latency}ms</span>
+                          <span className="text-emerald-400 shrink-0">{n.latency}ms</span>
                         )}
                       </div>
                     </div>
@@ -869,6 +883,47 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           may be assigned to at most one node. An explicit role forces that job
                           (including Frontier); if nobody is tagged, routing falls back to Auto / local-first.
                         </p>
+                      </div>
+                      <div className="col-span-2">
+                        <label className="flex items-start gap-2 text-[11px] text-zinc-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={!!currentNode.isDevNode}
+                            onChange={(e) => handleUpdateDevNode(e.target.checked)}
+                            className="mt-0.5 rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+                          />
+                          <span>
+                            <span className="font-medium text-zinc-200">
+                              Dev node (workspace &amp; installs)
+                            </span>
+                            {(() => {
+                              const holder = findNodeHoldingDev(nodes, currentNode.id);
+                              if (currentNode.isDevNode) {
+                                return (
+                                  <span className="block text-[10px] text-emerald-400/90 mt-0.5">
+                                    This PC hosts the open folder, PowerShell, and package installs.
+                                    Other nodes still analyze images, review, and generate — their
+                                    file/terminal tools run here.
+                                  </span>
+                                );
+                              }
+                              if (holder) {
+                                return (
+                                  <span className="block text-[10px] text-zinc-500 mt-0.5">
+                                    Currently {holder.name}. Checking this box moves Dev here (only
+                                    one). Inference can stay on any GPU.
+                                  </span>
+                                );
+                              }
+                              return (
+                                <span className="block text-[10px] text-zinc-500 mt-0.5">
+                                  Mark where Studio and the project live. Defaults to localhost when
+                                  detectable. Remote GPUs remain full multimodal collaborators.
+                                </span>
+                              );
+                            })()}
+                          </span>
+                        </label>
                       </div>
                     </div>
 

@@ -18,7 +18,7 @@ import {
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
-import { normalizePreferredRoles } from './lib/tools';
+import { normalizeClusterNodes } from './lib/tools';
 import { getLanguageFromPath } from './utils/language';
 import {
   conversationsForWorkspace,
@@ -655,7 +655,7 @@ export const App: React.FC = () => {
   // 7. Node / Hardware Updates
   const handleUpdateNodes = (updatedNodes: NodeConfig[]) => {
     // Persist config fields only (strip live status if present)
-    const configs: NodeConfig[] = normalizePreferredRoles(
+    const configs: NodeConfig[] = normalizeClusterNodes(
       updatedNodes.map(n => {
         const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as EndpointNode;
         return cfg;

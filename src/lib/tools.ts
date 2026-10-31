@@ -480,6 +480,8 @@ export const TOOL_PROTOCOL = `## Autonomous Workspace Tools & Protocol
 You are paired with a developer in an autonomous local IDE. You have direct filesystem access through tool tags.
 Whenever asked to build, create, modify, or run code, you MUST invoke the appropriate tool tags directly. Do NOT just print conversational markdown code blocks or describe what to do—take immediate action by emitting the tool tags!
 
+**Execution host:** Every tool below runs on the **Dev node** PC (where LocalAgents Studio and the open workspace live)—not on a remote GPU/inference host. \`run_command\`, pip/npm/winget installs, and the PowerShell terminal always target that Dev machine.
+
 ### 1. Create or Rewrite Files: <write_file>
 When creating new files (like a webpage, script, component, or config), write the complete file inside <write_file path="...">:
 <write_file path="index.html">
@@ -519,11 +521,12 @@ function hello() {
 <list_dir path="." depth="2"/>
 <search query="searchKeyword" path="src"/>
 
-### 4. Run PowerShell Commands:
+### 4. Run PowerShell Commands (on the Dev / Studio PC):
+Commands execute in PowerShell on the Dev node workspace machine (Studio host), never on a remote Ollama GPU box:
 <run_command>npm test</run_command>
 
 ### 5. Monitor the IDE Terminal (self-correct):
-Read recent PowerShell output from the LocalAgents terminal panel (includes commands the user ran and prior agent runs):
+Read recent PowerShell output from the LocalAgents terminal panel on the Dev PC (includes commands the user ran and prior agent runs):
 <read_terminal/>
 <read_terminal lines="60"/>
 
@@ -548,6 +551,10 @@ export interface BuildSystemPromptOptions {
   approvedPlan?: ApprovedPlan | null;
   /** Done steps and the next step. Survives a compacted chat. */
   progressLog?: string;
+  /** Cluster nodes — used to inject Dev-host context */
+  nodes?: EndpointNode[];
+  /** Node currently running inference (may differ from Dev) */
+  inferenceNodeId?: string;
 }
 
 export function buildSystemPrompt(
@@ -564,6 +571,9 @@ export function buildSystemPrompt(
 - Workspace root: ${workspace || '(no folder open)'}
 - Date: ${new Date().toISOString().slice(0, 10)}`
   ];
+  if (opts?.nodes?.length) {
+    parts.push(buildDevHostPromptSection(opts.nodes, opts.inferenceNodeId));
+  }
   if (planMode) {
     parts.push(PLANNER_PROTOCOL);
     // Read tools only in plan mode — still document protocol but remind not to write deliverables
@@ -774,6 +784,133 @@ export function findNodeHoldingRole(
   );
   if (!hit?.id) return undefined;
   return { id: hit.id, name: hit.name || hit.id };
+}
+
+// ==========================================
+// Dev node (workspace + installs + terminal)
+// ==========================================
+
+type DevBearing = {
+  id?: string;
+  name?: string;
+  url?: string;
+  type?: 'ollama' | 'openai';
+  apiKey?: string;
+  isDevNode?: boolean;
+};
+
+/** True for URLs that look like Ollama on the Studio PC (localhost / loopback). */
+export function isLikelyStudioLocalUrl(url?: string): boolean {
+  if (!url) return false;
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+  } catch {
+    return /localhost|127\.0\.0\.1|\[::1\]/i.test(url);
+  }
+}
+
+export function getDevNode<T extends DevBearing>(nodes: T[]): T | undefined {
+  return nodes.find(n => n.isDevNode);
+}
+
+export function findNodeHoldingDev(
+  nodes: DevBearing[],
+  exceptNodeId?: string
+): { id: string; name: string } | undefined {
+  const hit = nodes.find(n => n.isDevNode && n.id && n.id !== exceptNodeId);
+  if (!hit?.id) return undefined;
+  return { id: hit.id, name: hit.name || hit.id };
+}
+
+/** At most one Dev node (first wins). */
+export function normalizeDevNodes<T extends DevBearing>(nodes: T[]): T[] {
+  let seen = false;
+  return nodes.map(n => {
+    if (!n.isDevNode) return n;
+    if (seen) {
+      const { isDevNode: _d, ...rest } = n;
+      return rest as T;
+    }
+    seen = true;
+    return { ...n, isDevNode: true };
+  });
+}
+
+/** Mark one node as Dev; clear the flag from every other node. Pass enabled=false to clear. */
+export function assignDevNode<T extends DevBearing>(
+  nodes: T[],
+  nodeId: string,
+  enabled: boolean
+): T[] {
+  return nodes.map(n => {
+    if (n.id === nodeId) {
+      if (!enabled) {
+        if (!n.isDevNode) return n;
+        const { isDevNode: _d, ...rest } = n;
+        return rest as T;
+      }
+      return { ...n, isDevNode: true };
+    }
+    if (enabled && n.isDevNode) {
+      const { isDevNode: _d, ...rest } = n;
+      return rest as T;
+    }
+    return n;
+  });
+}
+
+/**
+ * If no Dev node is marked, prefer a localhost/loopback non-frontier node.
+ * Does not invent a Dev flag when only remote/frontier endpoints exist.
+ */
+export function ensureDevNode<T extends DevBearing>(nodes: T[]): T[] {
+  const normalized = normalizeDevNodes(nodes);
+  if (normalized.some(n => n.isDevNode)) return normalized;
+  const local = normalized.find(
+    n => isLikelyStudioLocalUrl(n.url) && n.type !== 'openai' && !n.apiKey
+  );
+  if (!local?.id) return normalized;
+  return assignDevNode(normalized, local.id, true);
+}
+
+/** Preferred Role + Dev node interlocking in one pass (load/import/save). */
+export function normalizeClusterNodes<T extends DevBearing & RoleBearing>(nodes: T[]): T[] {
+  return ensureDevNode(normalizePreferredRoles(nodes));
+}
+
+/**
+ * Prompt block: workspace / installs / terminal are on the Dev PC.
+ * Inference workers remain full collaborative multimodal agents.
+ */
+export function buildDevHostPromptSection(
+  nodes: DevBearing[],
+  inferenceNodeId?: string
+): string {
+  const marked = getDevNode(nodes);
+  const inferred =
+    marked ||
+    nodes.find(n => isLikelyStudioLocalUrl(n.url) && n.type !== 'openai' && !n.apiKey);
+  const devName = inferred?.name?.trim() || inferred?.id || 'the Studio PC';
+  const inference = inferenceNodeId
+    ? nodes.find(n => n.id === inferenceNodeId)
+    : undefined;
+  const inferenceAway =
+    !!inference &&
+    !!inferred?.id &&
+    inference.id !== inferred.id;
+
+  const base = `## Development host (workspace & installs)
+The open workspace, filesystem tools (\`read_file\`, \`write_file\`, \`edit_file\`, \`list_dir\`, \`search\`), PowerShell/\`run_command\`, pip/npm/winget installs, and the IDE terminal all execute on the **Dev node** PC: **${devName}** — that is where LocalAgents Studio is open and where the project runs.
+
+You may be generating on a different GPU/API host. That does **not** limit your job: you are a full collaborative agent. Analyze screenshots and other images when provided, review code, answer questions, write docs, and emit tool tags for the Dev workspace. Report findings in chat. Do **not** assume packages, Python/Node, or the app runtime live on your inference hardware — never say "install on this laptop" or treat the GPU host as the project machine.`;
+
+  if (!inferenceAway) return base;
+
+  const inferName = inference?.name?.trim() || inference?.id || 'this inference node';
+  return `${base}
+
+You are currently inferring on **${inferName}**, which is not the Dev node. Keep generating code, reviews, docs, and vision analysis for the Dev workspace; filesystem and terminal side effects still land on **${devName}**.`;
 }
 
 /** Soft Auto routing: name/id heuristics (and legacy multi-role tags). */

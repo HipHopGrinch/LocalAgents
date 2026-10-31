@@ -92,6 +92,12 @@ export interface NodeConfig {
    * Explicit value forces this node as a candidate for that role (frontier allowed).
    */
   roles?: NodeRole[];
+  /**
+   * Dev node: workspace, installs, package managers, and run_command live here
+   * (the PC where LocalAgents Studio is open). At most one node; independent of
+   * Preferred Role / where inference runs.
+   */
+  isDevNode?: boolean;
   hardware: HardwareProfile;
   benchmarks?: Record<string, BenchmarkResult>; // model -> measured benchmark stats
   disabledModels?: string[]; // models toggled OFF by user on this node

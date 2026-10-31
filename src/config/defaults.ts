@@ -1,7 +1,7 @@
 import { AgentPersona, AppSettings, HardwareProfile, NodeConfig } from '../types';
-import { normalizePreferredRoles } from '../lib/tools';
+import { normalizeClusterNodes } from '../lib/tools';
 
-export const SETTINGS_VERSION = 5;
+export const SETTINGS_VERSION = 6;
 
 /** Memory bandwidth presets (GB/s). Bandwidth, not TFLOPs, is what limits local token generation speed. */
 export const GPU_PRESETS: { name: string; vramGB: number; bandwidth: number }[] = [
@@ -153,7 +153,7 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
     ...saved,
     version: SETTINGS_VERSION,
     uiScale,
-    nodes: normalizePreferredRoles(
+    nodes: normalizeClusterNodes(
       nodes.map(n => ({
         ...n,
         hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
