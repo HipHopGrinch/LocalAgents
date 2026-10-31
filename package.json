@@ -43,10 +43,10 @@
           ]
         }
       ],
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
+      "artifactName": "LocalAgents-Studio-${version}-${arch}.${ext}"
     },
     "portable": {
-      "artifactName": "${productName}-${version}-portable.${ext}"
+      "artifactName": "LocalAgents-Studio-${version}-portable.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -54,7 +54,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "LocalAgents Studio",
-      "artifactName": "${productName}-${version}-setup.${ext}"
+      "artifactName": "LocalAgents-Studio-${version}-setup.${ext}"
     },
     "publish": [
       {
