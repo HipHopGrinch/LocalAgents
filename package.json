@@ -1,6 +1,6 @@
 {
   "name": "local-agents-ide",
-  "version": "1.1.7",
+  "version": "1.1.8",
   "description": "Distributed Local LLM Agent IDE for Windows",
   "author": "LocalAgents",
   "license": "MIT",

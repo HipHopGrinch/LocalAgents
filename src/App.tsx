@@ -79,11 +79,22 @@ export const App: React.FC = () => {
 
   // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
   const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
+  const [appVersion, setAppVersion] = useState<string>('');
 
   // 1. Initial Load: Settings & Workspace
   useEffect(() => {
     async function init() {
       if (!window.electronAPI) return;
+
+      try {
+        const ver = await window.electronAPI.getAppVersion?.();
+        if (ver) {
+          setAppVersion(ver);
+          document.title = `LocalAgents Studio ${ver}`;
+        }
+      } catch {
+        /* ignore */
+      }
 
       const saved = await window.electronAPI.loadSettings();
       const merged = mergeSettings(saved);
@@ -739,6 +750,7 @@ export const App: React.FC = () => {
         frontierTokens={settings.frontierTokensUsed || 0}
         uiScale={uiScale}
         onUpdateUiScale={handleUpdateUiScale}
+        appVersion={appVersion}
       />
       <UpdateBanner />
 

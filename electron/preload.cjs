@@ -79,6 +79,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   showModel: (url, model) => ipcRenderer.invoke('ollama:show', url, model),
 
   // System
+  getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
   detectHardware: () => ipcRenderer.invoke('system:detect-hardware'),
 
   // NSIS in-app updates (unsupported on portable / npm run dev)

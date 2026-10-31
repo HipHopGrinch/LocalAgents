@@ -41,13 +41,14 @@ function createWindow() {
   }
 
   const windowIcon = path.join(__dirname, 'icon.ico');
+  const appTitle = `LocalAgents Studio ${app.getVersion()}`;
   mainWindow = new BrowserWindow({
     width: 1500,
     height: 920,
     minWidth: 1100,
     minHeight: 640,
     backgroundColor: '#18181b',
-    title: 'LocalAgents Studio',
+    title: appTitle,
     icon: fs.existsSync(windowIcon) ? windowIcon : undefined,
     autoHideMenuBar: true,
     webPreferences: {
@@ -1681,6 +1682,8 @@ function run(cmd, args) {
     execFile(cmd, args, { windowsHide: true, timeout: 8000 }, (err, stdout) => resolve(err ? '' : stdout.toString()));
   });
 }
+
+ipcMain.handle('app:getVersion', () => app.getVersion());
 
 ipcMain.handle('system:detect-hardware', async () => {
   const cpu = (os.cpus()[0]?.model || 'Unknown CPU').replace(/\s+/g, ' ').trim();

@@ -434,6 +434,7 @@ export interface ElectronAPI {
     prompt: string
   ) => Promise<{ ok?: boolean; imageBase64?: string; mime?: string; error?: string }>;
 
+  getAppVersion: () => Promise<string>;
   detectHardware: () => Promise<DetectedHardware>;
 
   /** NSIS installer builds only. Portable / dev return supported: false. */

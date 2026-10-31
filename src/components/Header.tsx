@@ -31,6 +31,7 @@ interface HeaderProps {
   frontierTokens: number;
   uiScale: number;
   onUpdateUiScale: (scale: number) => void;
+  appVersion?: string;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -47,7 +48,8 @@ export const Header: React.FC<HeaderProps> = ({
   localTokens,
   frontierTokens,
   uiScale,
-  onUpdateUiScale
+  onUpdateUiScale,
+  appVersion
 }) => {
   const [showScalePopover, setShowScalePopover] = useState(false);
   const [projectsOpen, setProjectsOpen] = useState(false);
@@ -85,7 +87,7 @@ export const Header: React.FC<HeaderProps> = ({
       <div className="flex flex-nowrap items-center gap-3 shrink-0">
         <div className="flex items-center space-x-2 text-indigo-400 font-bold tracking-tight text-sm shrink-0">
           <Layers className="w-5 h-5" />
-          <span>LocalAgents Studio</span>
+          <span>LocalAgents Studio{appVersion ? ` ${appVersion}` : ''}</span>
         </div>
         
         <div className="h-4 w-[1px] bg-[#27272a] shrink-0" />
