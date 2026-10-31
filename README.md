@@ -2,7 +2,7 @@
 
 An autonomous, distributed local-agent IDE built for a multi-PC Ollama cluster with optional Frontier Cloud fallback (xAI Grok, OpenAI, OpenRouter).
 
-**Discord** https://discord.gg/ZVkmUfXwW
+**Discord:** https://discord.gg/ZVkmUfXwW
 
 **User guide:** [GitHub wiki](https://github.com/HipHopGrinch/LocalAgents/wiki) — install, Ollama, nodes, models, projects, the agent, Swarm, and logs.
 
