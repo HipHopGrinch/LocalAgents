@@ -27,6 +27,22 @@ import {
   upsertConversation
 } from './lib/conversations';
 
+/** Keep agent writes inside the open folder, even when a model emits an absolute path. */
+function clampWritePath(root: string, filePath: string): string {
+  let p = (filePath || '').trim().replace(/^["']|["']$/g, '');
+  if (!p) return 'file';
+  const rootNorm = root.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+  let norm = p.replace(/\\/g, '/');
+  const rootLower = rootNorm.toLowerCase();
+  const lower = norm.toLowerCase();
+  if (lower.startsWith(rootLower + '/')) norm = norm.slice(rootNorm.length + 1);
+  else if (/^[a-zA-Z]:\//.test(norm) || norm.startsWith('//') || norm.startsWith('/')) {
+    norm = norm.split('/').filter(Boolean).pop() || 'file';
+  }
+  const parts = norm.split('/').filter(part => part && part !== '.' && part !== '..');
+  return parts.join('/') || 'file';
+}
+
 export const App: React.FC = () => {
   const [workspacePath, setWorkspacePath] = useState<string>('');
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -578,7 +594,7 @@ export const App: React.FC = () => {
 
     // Prefer scoped agent write so paths cannot escape the open workspace
     const scoped = await window.electronAPI.execTool(workspacePath, 'write_file', {
-      path: filePath,
+      path: clampWritePath(workspacePath, filePath),
       content
     });
     if (scoped.error) {

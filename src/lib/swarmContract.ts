@@ -439,7 +439,8 @@ export function buildLeadArchitectPrompt(
   userTask: string,
   workspaceOverview: string,
   existingSnippets: string,
-  approvedPlanText?: string | null
+  approvedPlanText?: string | null,
+  workLog?: string | null
 ): string {
   const planSection = approvedPlanText?.trim()
     ? `
@@ -460,6 +461,10 @@ ${workspaceOverview || '(empty or unknown)'}
 
 Relevant existing files:
 ${existingSnippets || '(none loaded)'}
+
+### WORK LOG
+${workLog?.trim() || '(none yet)'}
+Do not assign a task that is already under Done. Do not ask the user a question listed under Already asked. Plan the Next step, then only the files that step still needs.
 
 ### USER REQUEST
 ${userTask}

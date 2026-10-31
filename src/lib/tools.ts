@@ -118,6 +118,29 @@ export function parseResponse(
     return `\u0000${found.length - 1}\u0000`;
   });
 
+  // A frontier reply often stops inside the last file, with no closing tag.
+  // Closed tags are already placeholders, so the last remaining tag is the cutoff.
+  if (!streaming) {
+    const openRe = /<(write_file|edit_file)\b([^>]*)>/gi;
+    let lastOpen: RegExpExecArray | null = null;
+    let openMatch: RegExpExecArray | null;
+    while ((openMatch = openRe.exec(work)) !== null) lastOpen = openMatch;
+    if (lastOpen && lastOpen.index !== undefined) {
+      const name = lastOpen[1].toLowerCase() as ToolName;
+      const args = parseAttrs(lastOpen[2] || '');
+      if (!args.path) {
+        const fallbackPath = args.file || args.filename || args.target || args.name || expectedFilePath;
+        if (fallbackPath) args.path = fallbackPath;
+      }
+      const rawBody = work.slice(lastOpen.index + lastOpen[0].length);
+      if (args.path && rawBody.trim().length > 0) {
+        found.push({ name, attrs: lastOpen[2] || '', body: rawBody });
+        const idx = found.length - 1;
+        work = `${work.slice(0, lastOpen.index)}\u0000${idx}\u0000`;
+      }
+    }
+  }
+
   const order: number[] = [];
   for (const m of work.matchAll(/\u0000(\d+)\u0000/g)) order.push(Number(m[1]));
 
@@ -504,6 +527,8 @@ export interface BuildSystemPromptOptions {
   planMode?: boolean;
   /** Locked plan after user picked an option */
   approvedPlan?: ApprovedPlan | null;
+  /** Done steps and the next step. Survives a compacted chat. */
+  progressLog?: string;
 }
 
 export function buildSystemPrompt(
@@ -536,6 +561,11 @@ export function buildSystemPrompt(
       parts.push(TOOLCHAIN_PLAYBOOK);
     }
     if (opts?.approvedPlan) parts.push(formatApprovedPlanContext(opts.approvedPlan));
+  }
+  if (opts?.progressLog?.trim()) {
+    parts.push(`## Work log
+This is the memory of the task. Trust it after a compacted chat. Do the Next step. Do not redo Done steps. Do not ask a question listed under Already asked.
+${opts.progressLog.trim()}`);
   }
   if (overview) parts.push(`## Workspace overview\n${overview}`);
   return parts.join('\n\n');
@@ -626,6 +656,36 @@ export function getPreferredModelForNode(node?: EndpointNode, fallbackModel?: st
 export function isFrontierNode(n?: EndpointNode): boolean {
   if (!n) return false;
   return n.type === 'openai' || !!n.apiKey;
+}
+
+/** The reply opened a file tag and never closed it (typical of a capped frontier stream). */
+export function hasUnclosedWrite(text: string): { name: 'write_file' | 'edit_file'; path: string } | null {
+  const opens = [...text.matchAll(/<(write_file|edit_file)\b([^>]*)>/gi)];
+  const closes = (text.match(/<\/(?:write_file|edit_file)>/gi) || []).length;
+  if (opens.length <= closes) return null;
+  const last = opens[opens.length - 1];
+  const attrs = last[2] || '';
+  const path =
+    /(?:path|file|filename|target|name)\s*=\s*"([^"]*)"/i.exec(attrs)?.[1] ||
+    /(?:path|file|filename|target|name)\s*=\s*'([^']*)'/i.exec(attrs)?.[1] ||
+    'file';
+  return { name: last[1].toLowerCase() as 'write_file' | 'edit_file', path };
+}
+
+/** Point an absolute or missing write path at the file this worker was assigned. */
+export function anchorWritePath(tool: ToolCall, expectedFilePath?: string): ToolCall {
+  if (tool.name !== 'write_file' && tool.name !== 'edit_file') return tool;
+  const p = (tool.args?.path || '').trim();
+  const outside =
+    !p ||
+    /^[a-zA-Z]:[\\/]/.test(p) ||
+    p.startsWith('/') ||
+    p.startsWith('\\\\') ||
+    /(^|[\\/])\.\.([\\/]|$)/.test(p);
+  if (outside && expectedFilePath) {
+    return { ...tool, args: { ...tool.args, path: expectedFilePath } };
+  }
+  return tool;
 }
 
 function byCapacity(a: EndpointNode, b: EndpointNode): number {

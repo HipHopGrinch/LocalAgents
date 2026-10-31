@@ -26,7 +26,8 @@ import {
   MessageSquarePlus,
   Brain,
   ImagePlus,
-  X
+  X,
+  Shrink
 } from 'lucide-react';
 import { formatConversationTime } from '../lib/conversations';
 import {
@@ -38,7 +39,9 @@ import {
   findFastestConductor,
   isFrontierNode,
   stripThinking,
-  looksLikeCreateIntent
+  looksLikeCreateIntent,
+  hasUnclosedWrite,
+  anchorWritePath
 } from '../lib/tools';
 import {
   assignSwarmTasksToCluster,
@@ -77,6 +80,20 @@ import { HelpTip } from './agent/HelpTip';
 import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
 import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
 import { resolveModelNumCtx } from '../lib/contextSize';
+import { compactMessages, historyTokens, shouldCompact } from '../lib/compactChat';
+import {
+  advanceNext,
+  avoidRepeat,
+  emptyWorkLog,
+  hasWorkLog,
+  noteSavedFiles,
+  noteUserTurn,
+  parseWorkLog,
+  rememberAsked,
+  renderWorkLog,
+  workLogPath,
+  type WorkLog
+} from '../lib/workLog';
 import { fileToChatImage, modelSupportsVision, toOllamaBase64 } from '../lib/images';
 import {
   buildApprovedPlan,
@@ -162,6 +179,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [includeActiveFile, setIncludeActiveFile] = useState(true);
   const [isPipelineMode, setIsPipelineMode] = useState(false);
   const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(currentAgent.autoApproveWrites ?? true);
+  const autoApplyWritesRef = useRef(currentAgent.autoApproveWrites ?? true);
 
   const [input, setInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -231,6 +249,44 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     }
   }, [conversation?.approvedPlan, conversation?.id]);
 
+  const progressRef = useRef<WorkLog>(emptyWorkLog());
+  const progressRev = useRef(0);
+  const [progressLog, setProgressLog] = useState<WorkLog>(emptyWorkLog());
+
+  const commitProgress = (next: WorkLog) => {
+    progressRev.current += 1;
+    progressRef.current = next;
+    setProgressLog(next);
+    const id = conversationIdRef.current;
+    if (!workspacePath || !id || !window.electronAPI?.writeFile) return;
+    void window.electronAPI.writeFile(workLogPath(workspacePath, id), renderWorkLog(next));
+  };
+
+  const updateProgress = (fn: (log: WorkLog) => WorkLog) => {
+    commitProgress(fn(progressRef.current));
+  };
+
+  useEffect(() => {
+    const id = conversation?.id;
+    const root = workspacePath;
+    if (!id || !root || !window.electronAPI?.readFile) {
+      progressRef.current = emptyWorkLog();
+      setProgressLog(emptyWorkLog());
+      return;
+    }
+    const rev = progressRev.current;
+    let cancel = false;
+    window.electronAPI.readFile(workLogPath(root, id)).then(res => {
+      if (cancel || progressRev.current !== rev || conversationIdRef.current !== id) return;
+      const log = res.content ? parseWorkLog(res.content) : emptyWorkLog();
+      progressRef.current = log;
+      setProgressLog(log);
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [conversation?.id, workspacePath]);
+
   // Persist message edits up to App (skip one tick after conversation switch)
   useEffect(() => {
     if (skipPersistRef.current) {
@@ -261,6 +317,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setTargetNodeId(currentAgent.endpointId);
     }
     if (currentAgent.autoApproveWrites !== undefined) {
+      autoApplyWritesRef.current = currentAgent.autoApproveWrites;
       setAutoApplyWrites(currentAgent.autoApproveWrites);
     }
   }, [currentAgent.id, currentAgent.endpointId, currentAgent.autoApproveWrites]);
@@ -382,11 +439,78 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const chatNumCtx = (node: EndpointNode | undefined, model: string) =>
     resolveModelNumCtx(node, model, currentAgent.numCtx);
 
+  const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
+
+  const fitContext = (numCtx: number, force = false) => {
+    const current = messagesRef.current;
+    if (current.length < 6) return;
+    if (!force && !shouldCompact(current, numCtx)) return;
+    const next = compactMessages(current);
+    if (next.length >= current.length && historyTokens(next) >= historyTokens(current) * 0.9) return;
+    messagesRef.current = next;
+    setMessages(next);
+  };
+
+  /** One extra request when a model stops inside an open write tag, then the file can be saved. */
+  const finishTruncatedWrites = async (
+    node: EndpointNode,
+    model: string,
+    content: string,
+    doneReason?: string
+  ): Promise<string> => {
+    const open = hasUnclosedWrite(content);
+    if (!open || stopRequestedRef.current) return content;
+    // A clean stop just forgot the closing tag — save the body as-is.
+    // Keep going only when the API cut the reply off.
+    if (/^(stop|end_turn|end)$/i.test(doneReason || '')) return content;
+    const body = withThink(
+      {
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'A file write was cut off. Continue from the exact cutoff. Output only the missing remainder of that file, then a closing </' +
+              open.name +
+              '> tag. Do not repeat text already written. Do not open a new file tag.'
+          },
+          { role: 'assistant', content: content.slice(-6000) },
+          {
+            role: 'user',
+            content:
+              'Continue the unfinished <' +
+              open.name +
+              ' path="' +
+              open.path +
+              '"> from the last characters above. End with </' +
+              open.name +
+              '>.'
+          }
+        ],
+        options: { temperature: 0.2, num_ctx: chatNumCtx(node, model) }
+      },
+      node,
+      model
+    );
+    try {
+      const handle = streamChat(node.url, body, () => {}, node.type, node.apiKey);
+      activeAbortsRef.current.push(handle.abort);
+      const res = await handle.done;
+      const extra = (res.content || '').trim();
+      if (!extra) return content;
+      return content + (content.endsWith('\n') ? '' : '\n') + extra;
+    } catch (err: any) {
+      window.electronAPI?.writeLog?.('error', `finish truncated write: ${err?.message || err}`);
+      return content;
+    }
+  };
+
   // ==========================================
   // UNIFIED TOOL EXECUTION & AGENTIC LOOP
   // ==========================================
   const runSingleTool = async (tool: ToolCall): Promise<ToolCall> => {
     const updated = await executeTool(tool, toolDeps);
+    updateProgress(log => noteSavedFiles(log, [updated]));
     let hostMsg: ChatMessage | undefined;
     setMessages(prev =>
       prev.map(m => {
@@ -492,9 +616,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         currentAgent.handle === 'planner' ||
         currentAgent.id === 'planner' ||
         originMsg.personaHandle === 'planner';
+      fitContext(chatNumCtx(routeNode, routeModel));
       const systemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
         planMode: planModeContinue,
-        approvedPlan: planModeContinue ? null : approvedPlanRef.current
+        approvedPlan: planModeContinue ? null : approvedPlanRef.current,
+        progressLog: progressForPrompt()
       });
       const snap = messagesRef.current;
       const conversationPayload = [
@@ -559,7 +685,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       activeAbortsRef.current = [handle.abort];
       const result = await handle.done;
-      let finalParsed = parseResponse(result.content, followUpId, false, {
+      const finished = planModeContinue
+        ? result.content
+        : await finishTruncatedWrites(routeNode, routeModel, result.content, result.stats?.doneReason);
+      let finalParsed = parseResponse(finished, followUpId, false, {
         expectedFilePath: opts?.expectedFilePath,
         createIntent: planModeContinue ? false : (opts?.createIntent ?? true)
       });
@@ -573,21 +702,22 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readPass = await runReadOnlyTools(tools, toolDeps);
       tools = readPass.tools;
 
-      if (!planModeContinue && autoApplyWrites) {
+      if (!planModeContinue && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDeps);
         tools = await runAuxTools(tools, toolDeps);
         const cmdPass = await runCommandTools(tools, toolDeps);
         tools = cmdPass.tools;
+        updateProgress(log => noteSavedFiles(log, tools));
       }
 
       const stillFailing =
         failedCommandSignatures(tools).length > 0 &&
         !shouldContinueFromTools(tools, continueDecisionOpts(budget));
-      const planOptions = planModeContinue ? parsePlanOptions(result.content) : [];
-      const displayBase = stripPlanOptionMarkup(finalParsed.display || result.content);
+      const planOptions = planModeContinue ? parsePlanOptions(finished) : [];
+      const displayBase = stripPlanOptionMarkup(finalParsed.display || finished);
       const followUpMsgFinal: ChatMessage = {
         ...followUpMsg,
-        raw: result.content,
+        raw: finished,
         display: stillFailing
           ? `${displayBase}\n\n⚠️ Still failing after one auto-fix attempt — check the terminal, or ask to try again.`
           : displayBase,
@@ -596,7 +726,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         ...(planOptions.length > 0
           ? {
               planOptions,
-              planSummary: buildPlanSummary(result.content, planOptions)
+              planSummary: buildPlanSummary(finished, planOptions)
             }
           : {})
       };
@@ -632,6 +762,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     opts?: { approvedPlan?: ApprovedPlan | null; skipUserAppend?: boolean }
   ) => {
     resetAgentLoopBudget();
+    fitContext(chatNumCtx(selectedNode, activeTargetModel));
     const lockedPlan = opts?.approvedPlan ?? approvedPlanRef.current;
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
@@ -718,7 +849,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
-      const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview);
+      const workerSystemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
+        progressLog: progressForPrompt()
+      });
       const body = withThink(
         {
           model,
@@ -752,17 +885,21 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         activeAbortsRef.current.push(handle.abort);
         const res = await handle.done;
         recordTok(node, res.stats);
+        const finished = await finishTruncatedWrites(node, model, res.content, res.stats?.doneReason);
 
-        let tools = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
+        let tools = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
           expectedFilePath,
           createIntent: true
-        }).toolCalls;
+        }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
 
         const readPass = await runReadOnlyTools(tools, toolDeps);
         tools = readPass.tools;
 
-        if (autoApplyWrites) {
-          tools = await autoApplyWritableTools(tools, toolDeps);
+        // Node results are the files. Always save them, including when this turn
+        // started under the planner (Auto-apply still off in that closure).
+        tools = await autoApplyWritableTools(tools, toolDeps);
+        updateProgress(log => noteSavedFiles(log, tools));
+        if (autoApplyWritesRef.current) {
           tools = await runAuxTools(tools, toolDeps);
           const cmdPass = await runCommandTools(tools, toolDeps);
           tools = cmdPass.tools;
@@ -778,7 +915,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           const origin: ChatMessage = {
             id: `${agentMsgId}-worker-${idx}`,
             role: 'assistant',
-            raw: res.content,
+            raw: finished,
             display: '',
             toolCalls: tools,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -792,10 +929,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           });
         }
 
-        const parsedDisplay = parseResponse(res.content, `${agentMsgId}-${idx}`, false, {
+        const parsedDisplay = parseResponse(finished, `${agentMsgId}-${idx}`, false, {
           expectedFilePath,
           createIntent: true
         }).display;
+        const writeErrors = tools.filter(
+          t => (t.name === 'write_file' || t.name === 'edit_file') && t.status === 'error'
+        );
 
         patchPipelineMsg(m => {
           if (!m.pipelineSteps) return m;
@@ -803,11 +943,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           if (updatedSteps[idx]) {
             updatedSteps[idx] = {
               ...updatedSteps[idx],
-              status: 'completed',
-              content:
-                opts.stepLabel ||
-                parsedDisplay ||
-                `Completed ${expectedFilePath}`,
+              status: writeErrors.length ? 'failed' : 'completed',
+              content: writeErrors.length
+                ? writeErrors.map(t => t.result || `Failed to write ${t.args?.path || expectedFilePath}`).join('\n')
+                : opts.stepLabel ||
+                  parsedDisplay ||
+                  `Completed ${expectedFilePath}`,
               toolCalls: tools,
               stats:
                 res.stats?.evalCount && res.stats?.evalDuration
@@ -878,7 +1019,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           swarmTaskText,
           workspaceOverview,
           snippets,
-          lockedPlan ? formatApprovedPlanForSwarm(lockedPlan) : null
+          lockedPlan ? formatApprovedPlanForSwarm(lockedPlan) : null,
+          progressForPrompt() || null
         );
         const architectBody: Record<string, unknown> = {
           model: architect.model,
@@ -918,6 +1060,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       });
 
       const writeOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+      if (writeOk) {
+        updateProgress(log => noteSavedFiles(log, [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }]));
+      }
       if (!writeOk) {
         patchPipelineMsg({
           display: `⚠️ Failed to write contract file \`${manifest.contractFile}\`. Aborting swarm.`
@@ -976,7 +1121,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             const repaired = parseSwarmManifest(repairRes.content, swarmTaskText);
             if (repaired) {
               manifest = repaired;
-              await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+              const repairedOk = await onApplyFileWrite(manifest.contractFile, manifest.contractCode);
+              if (repairedOk) {
+                updateProgress(log =>
+                  noteSavedFiles(log, [{ name: 'write_file', status: 'done', args: { path: manifest.contractFile } }])
+                );
+              }
               check = await window.electronAPI.typecheckWorkspace(workspacePath, {
                 mode: 'contract',
                 file: manifest.contractFile,
@@ -1094,14 +1244,15 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               });
             }
             const current = await readWorkspaceRel(assignment.task.filePath);
-            const workerPrompt = buildSwarmWorkerPrompt({
+            const workerLog = progressForPrompt();
+            const workerPrompt = `${buildSwarmWorkerPrompt({
               task: assignment.task,
               contractFile: manifest.contractFile,
               contractCode: manifest.contractCode,
               siblingSummary,
               currentFileContent: current,
               userPrompt: fullPrompt
-            });
+            })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
             await runWorkerTurn({
               idx: stepIdx,
               assignment,
@@ -1357,9 +1508,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setIsStreaming(true);
 
     try {
+      fitContext(chatNumCtx(routedNode, routedModel));
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
-        approvedPlan: planMode ? null : approvedPlan
+        approvedPlan: planMode ? null : approvedPlan,
+        progressLog: progressForPrompt()
       });
       const actionableUserPrompt = planMode
         ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
@@ -1422,7 +1575,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       activeAbortsRef.current = [handle.abort];
       const result = await handle.done;
-      const finalParsed = parseResponse(result.content, agentMsgId, false, { createIntent });
+      const finished = planMode
+        ? result.content
+        : await finishTruncatedWrites(routedNode, routedModel, result.content, result.stats?.doneReason);
+      const finalParsed = parseResponse(finished, agentMsgId, false, { createIntent });
 
       let tools = finalParsed.toolCalls;
       if (planMode) {
@@ -1435,11 +1591,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readPass = await runReadOnlyTools(tools, toolDeps);
       tools = readPass.tools;
 
-      if (!planMode && autoApplyWrites) {
+      if (!planMode && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDeps);
         tools = await runAuxTools(tools, toolDeps);
         const cmdPass = await runCommandTools(tools, toolDeps);
         tools = cmdPass.tools;
+        updateProgress(log => noteSavedFiles(log, tools));
       }
 
       let stats = undefined;
@@ -1458,13 +1615,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
-      const options = planMode ? parsePlanOptions(result.content) : [];
-      const displayText = stripPlanOptionMarkup(finalParsed.display || result.content);
+      const options = planMode ? parsePlanOptions(finished) : [];
+      const displayText = stripPlanOptionMarkup(finalParsed.display || finished);
 
       const origin: ChatMessage = {
         id: agentMsgId,
         role: 'assistant',
-        raw: result.content,
+        raw: finished,
         display: displayText,
         thinking: finalParsed.thinking || result.thinking,
         toolCalls: tools,
@@ -1478,7 +1635,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         ...(options.length > 0
           ? {
               planOptions: options,
-              planSummary: buildPlanSummary(result.content, options)
+              planSummary: buildPlanSummary(finished, options)
             }
           : {}),
         ...(notice ? { notice } : {})
@@ -1557,6 +1714,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       approvedPlanText: planText,
       recentTranscript: transcript,
       workspaceOverview,
+      workLog: progressForPrompt(),
       capped
     });
 
@@ -1652,10 +1810,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
-      const decision = parseNextStep(content);
+      const parsedDecision = parseNextStep(content);
+      const steered = parsedDecision
+        ? avoidRepeat(progressRef.current, parsedDecision.decision, parsedDecision.task, parsedDecision.options)
+        : null;
+      const decision = parsedDecision
+        ? { ...parsedDecision, decision: steered!.decision, task: steered!.task, options: steered!.options }
+        : null;
       const prose = stripNextStepMarkup(stripPlanOptionMarkup(stripThinking(content)));
       let options = decision?.options || [];
-      let display = prose || decision?.reason || '';
+      let display = steered?.note || prose || decision?.reason || '';
       let runTask = '';
 
       if (decision?.decision === 'continue' && !capped && !tasksTooSimilar(previousTask, decision.task)) {
@@ -1681,6 +1845,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         display = display || decision.reason || 'Need a choice before continuing.';
       }
 
+      if (runTask) display = `Continuing — ${runTask}`;
+
       setMessages(prev =>
         prev.map(m =>
           m.id === agentMsgId
@@ -1699,7 +1865,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       if (runTask) {
         handoff = true;
         nextTask = runTask;
-      } else if (decision?.decision === 'done' || decision?.decision === 'ask' || options.length) {
+        updateProgress(log => advanceNext(log, runTask));
+      } else if (options.length) {
+        updateProgress(log => options.reduce((acc, option) => rememberAsked(acc, `${option.title}: ${option.description}`), log));
+      }
+      if (!runTask && (decision?.decision === 'done' || decision?.decision === 'ask' || options.length)) {
         setExecutingPlanNotice(
           decision?.decision === 'done' ? 'Work looks complete — optional next steps below' : 'Waiting for a choice'
         );
@@ -1755,6 +1925,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     onSelectAgent(coderAgent.id);
     onConversationPatch?.({ approvedPlan: approved, agentId: coderAgent.id });
     if (coderAgent.autoApproveWrites !== undefined) {
+      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
       setAutoApplyWrites(coderAgent.autoApproveWrites);
     }
 
@@ -1762,6 +1933,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setExecutingPlanNotice(notice);
 
     const confirmDisplay = confirmationText.trim() || `Option ${option.id}: ${option.title}`;
+    updateProgress(log => noteUserTurn(log, `${option.title}. ${option.description}`));
+    fitContext(chatNumCtx(selectedNode, activeTargetModel));
     const userConfirm: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
@@ -1836,6 +2009,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         : '');
     setInput('');
     setPendingImages([]);
+    updateProgress(log => noteUserTurn(log, userText));
+    fitContext(chatNumCtx(selectedNode, activeTargetModel));
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
 
@@ -1922,6 +2097,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       updated.push(await executeTool(tool, toolDeps));
     }
 
+    updateProgress(log => noteSavedFiles(log, updated));
     const nextMsg: ChatMessage = { ...msg, toolCalls: updated };
     setMessages(prev => prev.map(m => (m.id === msg.id ? nextMsg : m)));
     setIsStreaming(false);
@@ -2041,6 +2217,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
             <button
               type="button"
+              onClick={() => fitContext(chatNumCtx(selectedNode, activeTargetModel), true)}
+              disabled={isStreaming || messages.length < 6}
+              className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-300"
+              title="Compact this chat. The work log keeps the finished steps and the next step."
+            >
+              <Shrink className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Compact</span>
+            </button>
+            <button
+              type="button"
               onClick={handleNewChatClick}
               className="flex items-center space-x-1 px-1.5 py-1 rounded text-[11px] font-medium text-zinc-300 hover:text-white hover:bg-[#202026] border border-transparent hover:border-[#2a2a36] transition"
               title="New chat (Ctrl+L)"
@@ -2077,8 +2263,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               <li><b className="text-zinc-300">docs</b> — explanations, tests, docs; prefers the server</li>
             </ul>
             <p>On Planner, click an option button or type <span className="font-mono text-zinc-300">option 1</span>. The next turn executes as Coder. After each coding step another node checks the work and keeps going, or stops with the next choices.</p>
+            <p>Compact folds older messages when the chat gets large. Finished steps and the next step stay in the project work log and are sent with every turn, so the Conductor does not ask the same question again.</p>
           </HelpTip>
         </div>
+
+        {(progressLog.next || progressLog.done.length > 0) && (
+          <div className="text-[10px] text-zinc-400 truncate" title={renderWorkLog(progressLog)}>
+            <span className="text-emerald-300/90 font-medium">Next:</span> {progressLog.next || '—'}
+            <span className="text-zinc-500"> · {progressLog.done.length} done</span>
+          </div>
+        )}
 
         {executingPlanNotice && (
           <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
@@ -2248,7 +2442,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               <input
                 type="checkbox"
                 checked={autoApplyWrites}
-                onChange={(e) => setAutoApplyWrites(e.target.checked)}
+                onChange={(e) => {
+                  autoApplyWritesRef.current = e.target.checked;
+                  setAutoApplyWrites(e.target.checked);
+                }}
                 className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
               />
               <span>Auto-apply</span>

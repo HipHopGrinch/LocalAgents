@@ -1219,12 +1219,61 @@ async function streamNdjson(requestId, url, body, channel, onLine) {
   return true;
 }
 
+function frontierMaxTokens(url) {
+  const u = String(url || '');
+  if (/googleapis\.com/i.test(u)) return 65536;
+  if (/x\.ai|grok/i.test(u)) return 32768;
+  return 16384;
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => (typeof part === 'string' ? part : part?.text || part?.content || '')).join('');
+  }
+  return '';
+}
+
+function absorbToolCall(acc, delta) {
+  const calls = delta?.tool_calls;
+  if (!Array.isArray(calls)) return;
+  for (const tc of calls) {
+    const i = tc.index ?? 0;
+    if (!acc[i]) acc[i] = { name: '', args: '' };
+    if (tc.function?.name) acc[i].name += tc.function.name;
+    if (typeof tc.function?.arguments === 'string') acc[i].args += tc.function.arguments;
+  }
+}
+
+function writeTagsFromToolCalls(acc) {
+  const chunks = [];
+  for (const tool of acc) {
+    if (!tool) continue;
+    const name = String(tool.name || '').toLowerCase();
+    let parsed = {};
+    try { parsed = JSON.parse(tool.args || '{}'); } catch { parsed = {}; }
+    const path = parsed.path || parsed.file_path || parsed.filepath || parsed.filename || parsed.file || parsed.target || '';
+    const body = parsed.content ?? parsed.contents ?? parsed.code ?? parsed.text ?? parsed.body ?? '';
+    const isWrite = /write|create_file|save_file/.test(name);
+    const isEdit = /edit|patch|search_replace|str_replace/.test(name);
+    if (!path || (typeof body !== 'string' && typeof body !== 'number')) continue;
+    const safePath = String(path).replace(/"/g, '');
+    const text = String(body);
+    if (isWrite) chunks.push(`<write_file path="${safePath}">\n${text}\n</write_file>`);
+    else if (isEdit) chunks.push(`<edit_file path="${safePath}">\n${text}\n</edit_file>`);
+  }
+  return chunks.join('\n');
+}
+
 async function streamOpenAI(requestId, url, apiKey, body, channel) {
   const controller = new AbortController();
   streams.set(requestId, controller);
   const started = Date.now();
   let firstTokenTime = 0;
   let tokenCount = 0;
+  let finishReason = '';
+  let full = '';
+  const toolAcc = [];
 
   try {
     const baseUrl = normalizeFrontierEndpoint(url);
@@ -1237,18 +1286,30 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
       }
     }
 
-    const resp = await fetch(endpoint, {
+    const postCompletion = payload => fetch(endpoint, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: controller.signal
     });
+
+    let payload = { ...body };
+    let resp = await postCompletion(payload);
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
       let msg = text;
       try { msg = JSON.parse(text).error?.message || text; } catch {}
-      throw new Error(`HTTP ${resp.status}: ${msg}`);
+      const capRejected = payload.max_tokens && /max_tokens|max_output_tokens|max_completion_tokens|output token|maximum tokens/i.test(String(msg));
+      if (!capRejected) throw new Error(`HTTP ${resp.status}: ${msg}`);
+      delete payload.max_tokens;
+      resp = await postCompletion(payload);
+      if (!resp.ok) {
+        const text2 = await resp.text().catch(() => '');
+        let msg2 = text2;
+        try { msg2 = JSON.parse(text2).error?.message || text2; } catch {}
+        throw new Error(`HTTP ${resp.status}: ${msg2}`);
+      }
     }
 
     const reader = resp.body.getReader();
@@ -1268,16 +1329,31 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
         if (dataStr === '[DONE]') break;
         try {
           const parsed = JSON.parse(dataStr);
-          const delta = parsed.choices?.[0]?.delta || {};
-          const content = delta.content || '';
-          const thinking = delta.reasoning_content || delta.thinking || '';
+          const choice = parsed.choices?.[0] || {};
+          const delta = choice.delta || {};
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+          absorbToolCall(toolAcc, delta);
+          let content = textFromContent(delta.content ?? delta.text ?? choice.message?.content ?? '');
+          if (!content && Array.isArray(parsed.candidates?.[0]?.content?.parts)) {
+            content = parsed.candidates[0].content.parts.map(part => part.text || '').join('');
+          }
+          const thinking = textFromContent(delta.reasoning_content || delta.thinking || '');
           if (content || thinking) {
             if (!firstTokenTime) firstTokenTime = Date.now();
-            tokenCount += content ? Math.ceil(content.length / 4) : 0;
+            if (content) {
+              full += content;
+              tokenCount += Math.ceil(content.length / 4);
+            }
             send(channel, { requestId, type: 'chunk', content, thinking });
           }
         } catch {}
       }
+    }
+
+    const extra = writeTagsFromToolCalls(toolAcc);
+    if (extra && !/<write_file\b|<edit_file\b/i.test(full)) {
+      tokenCount += Math.ceil(extra.length / 4);
+      send(channel, { requestId, type: 'chunk', content: `\n${extra}\n`, thinking: '' });
     }
 
     const totalDuration = Date.now() - started;
@@ -1288,7 +1364,8 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
         evalCount: tokenCount,
         evalDuration: (totalDuration - (firstTokenTime ? firstTokenTime - started : 0)) * 1e6,
         totalDuration: totalDuration * 1e6,
-        promptEvalDuration: (firstTokenTime ? firstTokenTime - started : 0) * 1e6
+        promptEvalDuration: (firstTokenTime ? firstTokenTime - started : 0) * 1e6,
+        doneReason: finishReason || undefined
       }
     });
     return true;
@@ -1316,12 +1393,13 @@ ipcMain.handle('ollama:chat', async (_e, requestId, url, body, nodeType, apiKey)
       }
       return { role: m.role, content: parts };
     });
+    const requested = Number(body.options?.num_predict);
     const openAiBody = {
       model: body.model,
       messages,
       stream: true,
       temperature: body.options?.temperature ?? 0.3,
-      max_tokens: body.options?.num_predict
+      max_tokens: Number.isFinite(requested) && requested > 0 ? requested : frontierMaxTokens(base)
     };
     return await streamOpenAI(requestId, base, apiKey, openAiBody, 'ollama:chat-event');
   }

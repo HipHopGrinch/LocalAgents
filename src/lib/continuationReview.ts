@@ -58,7 +58,10 @@ Rules:
 - Do not repeat the step that just finished.
 - ask only when two real directions remain and picking the wrong one would waste work.
 - done when the chosen scope is in place. Still offer 2–3 optional next steps in <plan_options>.
-- Prefer continue over ask. Automate anything that does not need a product decision.`;
+- Prefer continue over ask. Automate anything that does not need a product decision.
+- The work log is the source of truth. Never continue or ask a step listed under Done or Already asked.
+- If Next is set, that is the step to run. Do not invent a different question.
+- If the latest turn already tried Next, say what is still missing in one sentence. Do not ask the same question again.`;
 
 export function pickReviewNode(
   nodes: EndpointNode[],
@@ -134,6 +137,7 @@ export function buildContinuationReviewPrompt(input: {
   approvedPlanText?: string;
   recentTranscript: string;
   workspaceOverview: string;
+  workLog?: string;
   capped?: boolean;
 }): string {
   const plan = input.approvedPlanText?.trim()
@@ -142,7 +146,10 @@ export function buildContinuationReviewPrompt(input: {
   const cap = input.capped
     ? '\n\nYou are out of automatic steps. Use decision ask or done. Do not use continue.'
     : '';
-  return `${plan}
+  const log = input.workLog?.trim()
+    ? `\n\nWork log (do not repeat Done or Already asked; run Next if it is set):\n${input.workLog.trim()}`
+    : '';
+  return `${plan}${log}
 
 Workspace (top level):
 ${input.workspaceOverview || '(empty or still loading)'}
