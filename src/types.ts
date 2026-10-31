@@ -98,6 +98,12 @@ export interface NodeConfig {
   modelPrefs?: Record<string, ModelPref>;
   /** Optional forced image-generation model. Empty = auto-detect. */
   imageModel?: string;
+  /** This API key is a free tier. Models on the node are short assists, not writers. */
+  freeTier?: boolean;
+  /** Assist calls allowed per local day. Default 20. */
+  freeTierDailyCap?: number;
+  /** Calls already made on the local calendar day. */
+  freeTierUsage?: { day: string; count: number };
 }
 
 /** Live node status (merged into NodeConfig at runtime) */

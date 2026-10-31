@@ -80,6 +80,17 @@ import { HelpTip } from './agent/HelpTip';
 import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
 import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
 import { resolveModelNumCtx } from '../lib/contextSize';
+import {
+  ASSIST_MAX_PREDICT,
+  contextOverflow,
+  estimateTokens,
+  FREE_TIER_ASSIST_SYSTEM,
+  bumpFreeTierUsage,
+  pickFreeTierAssist,
+  reviewNeedsAssist,
+  tailForAssist,
+  type FreeTierUsage
+} from '../lib/freeTierAssist';
 import { compactMessages, historyTokens, shouldCompact } from '../lib/compactChat';
 import {
   advanceNext,
@@ -108,11 +119,13 @@ import {
 } from '../lib/planOptions';
 import {
   buildContinuationReviewPrompt,
+  collectWrittenPaths,
   CONTINUATION_REVIEW_SYSTEM,
   MAX_AUTO_CONTINUATIONS,
   parseNextStep,
-  pickReviewNode,
+  pickCapableReviewTarget,
   stripNextStepMarkup,
+  taskFixesWrittenFiles,
   tasksTooSimilar
 } from '../lib/continuationReview';
 
@@ -130,6 +143,8 @@ interface AgentChatProps {
   onExecuteToolCommand: (command: string) => Promise<string>;
   onOpenFileInEditor: (filePath: string) => void;
   onRecordTokens: (localTokens: number, frontierTokens: number) => void;
+  /** Count one free-tier assist call against that node's daily cap. */
+  onNoteFreeTierCall?: (nodeId: string) => void;
   /** Active chat thread (controlled by App) */
   conversation: ChatConversation | null;
   workspaceConversations: ChatConversation[];
@@ -157,6 +172,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onExecuteToolCommand,
   onOpenFileInEditor,
   onRecordTokens,
+  onNoteFreeTierCall,
   conversation,
   workspaceConversations,
   onMessagesChange,
@@ -199,6 +215,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const conversationIdRef = useRef<string | null>(conversation?.id ?? null);
   const approvedPlanRef = useRef<ApprovedPlan | null>(conversation?.approvedPlan ?? null);
   const stopRequestedRef = useRef(false);
+  const freeTierUsageRef = useRef<Record<string, FreeTierUsage>>({});
 
   type LoopBudget = {
     depth: number;
@@ -438,6 +455,50 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   /** Per-model num_ctx from Hardware Settings; falls back to agent persona. */
   const chatNumCtx = (node: EndpointNode | undefined, model: string) =>
     resolveModelNumCtx(node, model, currentAgent.numCtx);
+
+  const freeTierUsageFor = (node: EndpointNode): FreeTierUsage | undefined => {
+    const saved = node.freeTierUsage;
+    const local = freeTierUsageRef.current[node.id];
+    if (!saved) return local;
+    if (!local) return saved;
+    if (saved.day !== local.day) return saved.day > local.day ? saved : local;
+    return (saved.count || 0) >= (local.count || 0) ? saved : local;
+  };
+
+  /** One short frontier reply when the local window cannot hold the job. Null when no free-tier quota is left. */
+  const requestFreeTierBrief = async (purpose: string, payload: string): Promise<string | null> => {
+    const assist = pickFreeTierAssist(nodes, freeTierUsageFor);
+    if (!assist || stopRequestedRef.current) return null;
+    const handle = streamChat(
+      assist.node.url,
+      withThink(
+        {
+          model: assist.model,
+          messages: [
+            { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
+            { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
+          ],
+          options: { temperature: 0.1, num_predict: ASSIST_MAX_PREDICT }
+        },
+        assist.node,
+        assist.model
+      ),
+      () => {},
+      assist.node.type,
+      assist.node.apiKey
+    );
+    activeAbortsRef.current = [...activeAbortsRef.current, handle.abort];
+    const result = await handle.done;
+    if (result.aborted || stopRequestedRef.current) return null;
+    const brief = (result.content || '').replace(/\s+/g, ' ').trim().slice(0, 1800);
+    if (!brief) return null;
+    freeTierUsageRef.current[assist.node.id] = bumpFreeTierUsage(freeTierUsageFor(assist.node));
+    onNoteFreeTierCall?.(assist.node.id);
+    if (result.stats?.evalCount) {
+      onRecordTokens(0, result.stats.evalCount + (result.stats.promptEvalCount || 0));
+    }
+    return brief;
+  };
 
   const progressForPrompt = () => (hasWorkLog(progressRef.current) ? renderWorkLog(progressRef.current) : '');
 
@@ -1430,6 +1491,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     userMsgExtra?: Partial<ChatMessage>;
     skipUserAppend?: boolean;
     notice?: string;
+    /** Keep a fix on the review model instead of the worker that wrote the files. */
+    pinRoute?: { node: EndpointNode; model: string };
   }) => {
     const {
       userText,
@@ -1440,10 +1503,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       approvedPlan,
       userMsgExtra,
       skipUserAppend,
-      notice
+      notice,
+      pinRoute
     } = opts;
 
-    const route = resolveRoute(userText, agent);
+    const route = pinRoute
+      ? {
+          routedNode: pinRoute.node,
+          routedModel: pinRoute.model,
+          routedIsFrontier: pinRoute.node.type === 'openai' || !!pinRoute.node.apiKey
+        }
+      : resolveRoute(userText, agent);
     if (!route) {
       setMessages(prev => [
         ...prev,
@@ -1516,15 +1586,40 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       });
       const actionableUserPrompt = planMode
         ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
-        : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
+        : pinRoute
+          ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
+          : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
       const ollamaImages = attachedImages.map(toOllamaBase64);
+
+      const history = historyForModel(messagesRef.current, stripThinking);
+      const draftTokens = estimateTokens(
+        [systemPrompt, ...history.map(m => m.content), actionableUserPrompt].join('\n')
+      );
+      let userContent = actionableUserPrompt;
+      let historySent = history;
+      if (!routedIsFrontier && contextOverflow(draftTokens, chatNumCtx(routedNode, routedModel))) {
+        try {
+          const brief = await requestFreeTierBrief(
+            `The local model context is ${chatNumCtx(routedNode, routedModel)} tokens and this job does not fit. Brief the coder.`,
+            [systemPrompt, ...history.map(m => `${m.role}: ${m.content}`), actionableUserPrompt].join('\n\n')
+          );
+          if (brief) {
+            userContent = `${actionableUserPrompt}\n\n[FREE-TIER BRIEF — the rest of the context did not fit this model. Trust this brief.]\n${brief}`;
+            historySent = history.slice(-2);
+            setExecutingPlanNotice(`Context did not fit ${routedModel}. Using a short free-tier brief.`);
+          }
+        } catch (err: any) {
+          window.electronAPI?.writeLog?.('warn', `free-tier assist: ${err?.message || err}`);
+        }
+      }
+      if (stopRequestedRef.current) return;
 
       const conversationPayload = [
         { role: 'system', content: systemPrompt },
-        ...historyForModel(messagesRef.current, stripThinking),
+        ...historySent,
         {
           role: 'user',
-          content: actionableUserPrompt,
+          content: userContent,
           ...(ollamaImages.length ? { images: ollamaImages } : {})
         }
       ];
@@ -1669,8 +1764,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   };
 
   /**
-   * After a coding step, another node checks the workspace. It keeps implementing
-   * when the next step is obvious, and stops with choices when the user must decide.
+   * After a coding step, the largest enabled local model checks the workspace.
+   * It may patch bugs in the files just written. A fix to those files stays on
+   * this model. A new feature goes through the normal local route.
    */
   const reviewAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
     if (stopRequestedRef.current) return;
@@ -1692,9 +1788,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       );
     if (depth === 0 && !didWork) return;
 
-    const node = pickReviewNode(nodes, targetNodeId);
-    const model = getPreferredModelForNode(node);
-    if (!node || !model) return;
+    const target = pickCapableReviewTarget(nodes);
+    if (!target) return;
+    const { node, model } = target;
+    const touchedPaths = collectWrittenPaths(recent);
 
     const reviewer = agents.find(a => a.handle === 'reviewer' || a.id === 'reviewer') || agents[0];
     const capped = depth >= MAX_AUTO_CONTINUATIONS;
@@ -1710,11 +1807,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const planText = approvedPlanRef.current
       ? formatApprovedPlanContext(approvedPlanRef.current)
       : '';
-    const userContent = buildContinuationReviewPrompt({
+    let userContent = buildContinuationReviewPrompt({
       approvedPlanText: planText,
       recentTranscript: transcript,
       workspaceOverview,
       workLog: progressForPrompt(),
+      writtenPaths: touchedPaths,
       capped
     });
 
@@ -1742,6 +1840,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
     let handoff = false;
     let nextTask = '';
+    let pinFix = false;
     try {
       const askModel = async (content: string, prior: { role: string; content: string }[]) => {
         const body = withThink(
@@ -1777,6 +1876,38 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return handle.done;
       };
 
+      if (touchedPaths.length > 0 && window.electronAPI?.execTool) {
+        const chunks: string[] = [];
+        let chars = 0;
+        for (const path of touchedPaths.slice(0, 8)) {
+          if (chars > 160000) break;
+          try {
+            const res = await window.electronAPI.execTool(workspacePath, 'read_file', { path });
+            const body = (res.content || '').slice(0, 40000);
+            if (!body) continue;
+            chunks.push(`FILE ${path}\n${body}`);
+            chars += body.length;
+          } catch {
+            /* a missing file stays a local review */
+          }
+        }
+        const bundle = chunks.join('\n\n');
+        if (bundle && reviewNeedsAssist(chunks.length, bundle.length, chatNumCtx(node, model))) {
+          try {
+            const brief = await requestFreeTierBrief(
+              'Review these files for bugs the local model should patch. List only real defects.',
+              bundle
+            );
+            if (brief) {
+              userContent += `\n\nFree-tier review brief (patch these if they match the files):\n${brief}`;
+              setExecutingPlanNotice(`Asked the free-tier key for a short review of ${chunks.length} files.`);
+            }
+          } catch (err: any) {
+            window.electronAPI?.writeLog?.('warn', `free-tier review: ${err?.message || err}`);
+          }
+        }
+      }
+
       const first = await askModel(userContent, []);
       if (first.aborted || stopRequestedRef.current) return;
       if (first.stats?.evalCount) {
@@ -1786,17 +1917,19 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
 
       let content = first.content;
-      const reads = parseResponse(content, agentMsgId, false).toolCalls.filter(t =>
+      let readTools: ToolCall[] = [];
+      const firstReads = parseResponse(content, agentMsgId, false).toolCalls.filter(t =>
         ['read_file', 'list_dir', 'search'].includes(t.name)
       );
-      if (reads.length && !stopRequestedRef.current) {
-        const ran = await runReadOnlyTools(reads, toolDeps);
+      if (firstReads.length && !stopRequestedRef.current) {
+        const ran = await runReadOnlyTools(firstReads, toolDeps);
+        readTools = ran.tools;
         setMessages(prev =>
           prev.map(m => (m.id === agentMsgId ? { ...m, toolCalls: ran.tools } : m))
         );
         const follow = `Tool results:\n${ran.tools
           .map(t => `${t.name} ${t.args.path || t.args.query || ''}: ${(t.result || '').slice(0, 1200)}`)
-          .join('\n\n')}\n\nOutput only the <next_step> block now.`;
+          .join('\n\n')}\n\nYou may emit <edit_file> patches for bugs in the files you just read. Do not start a new feature. Do not rewrite a whole file when a search/replace will do. Then end with exactly one <next_step> block.`;
         const second = await askModel(follow, [
           { role: 'user', content: userContent },
           { role: 'assistant', content: content }
@@ -1810,6 +1943,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
+      let editTools = parseResponse(content, agentMsgId, false).toolCalls.filter(t => t.name === 'edit_file');
+      if (editTools.length) {
+        if (autoApplyWritesRef.current) {
+          editTools = await autoApplyWritableTools(editTools, toolDeps);
+          updateProgress(log => noteSavedFiles(log, editTools));
+        }
+        for (const tool of editTools) {
+          if (tool.args?.path) touchedPaths.push(tool.args.path);
+        }
+      }
+      const reviewTools = [...readTools, ...editTools];
+
       const parsedDecision = parseNextStep(content);
       const steered = parsedDecision
         ? avoidRepeat(progressRef.current, parsedDecision.decision, parsedDecision.task, parsedDecision.options)
@@ -1817,7 +1962,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const decision = parsedDecision
         ? { ...parsedDecision, decision: steered!.decision, task: steered!.task, options: steered!.options }
         : null;
-      const prose = stripNextStepMarkup(stripPlanOptionMarkup(stripThinking(content)));
+      const visible = parseResponse(content, agentMsgId, false).display || stripThinking(content);
+      const prose = stripNextStepMarkup(stripPlanOptionMarkup(visible));
       let options = decision?.options || [];
       let display = steered?.note || prose || decision?.reason || '';
       let runTask = '';
@@ -1854,6 +2000,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                 ...m,
                 raw: content,
                 display,
+                toolCalls: reviewTools,
                 ...(options.length
                   ? { planOptions: options, planSummary: buildPlanSummary(content, options) }
                   : {})
@@ -1865,6 +2012,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       if (runTask) {
         handoff = true;
         nextTask = runTask;
+        pinFix = taskFixesWrittenFiles(runTask, touchedPaths);
         updateProgress(log => advanceNext(log, runTask));
       } else if (options.length) {
         updateProgress(log => options.reduce((acc, option) => rememberAsked(acc, `${option.title}: ${option.description}`), log));
@@ -1901,11 +2049,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       : '';
     await runSingleNodeTurn({
       userText: `Continue: ${nextTask}`,
-      fullPrompt: `${planPrefix}NEXT STEP — do this now, then stop. Do not expand into unrelated features.\n\n${nextTask}`,
+      fullPrompt: pinFix
+        ? `${planPrefix}NEXT STEP — fix the existing files with <edit_file>. Do not rewrite a file from scratch when a search/replace will do. Do not add a new feature.\n\n${nextTask}`
+        : `${planPrefix}NEXT STEP — do this now, then stop. Do not expand into unrelated features.\n\n${nextTask}`,
       agent: coderAgent,
       planMode: false,
       approvedPlan: approvedPlanRef.current,
-      notice: `Continuing automatically — ${nextTask.slice(0, 140)}`
+      notice: pinFix
+        ? `Fixing on ${node.name} — ${nextTask.slice(0, 120)}`
+        : `Continuing automatically — ${nextTask.slice(0, 140)}`,
+      ...(pinFix ? { pinRoute: { node, model } } : {})
     });
     if (stopRequestedRef.current) return;
     await reviewAndAdvance(depth + 1, nextTask);
@@ -2262,7 +2415,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               <li><b className="text-zinc-300">reviewer</b> — bugs/security review; prefers the laptop node</li>
               <li><b className="text-zinc-300">docs</b> — explanations, tests, docs; prefers the server</li>
             </ul>
-            <p>On Planner, click an option button or type <span className="font-mono text-zinc-300">option 1</span>. The next turn executes as Coder. After each coding step another node checks the work and keeps going, or stops with the next choices.</p>
+            <p>On Planner, click an option button or type <span className="font-mono text-zinc-300">option 1</span>. The next turn executes as Coder. After each coding step the largest enabled local model checks the work, may patch a bug in those files, and keeps going or stops with the next choices.</p>
             <p>Compact folds older messages when the chat gets large. Finished steps and the next step stay in the project work log and are sent with every turn, so the Conductor does not ask the same question again.</p>
           </HelpTip>
         </div>

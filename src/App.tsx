@@ -16,6 +16,7 @@ import {
   ChatMessage
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
+import { bumpFreeTierUsage } from './lib/freeTierAssist';
 import { getLanguageFromPath } from './utils/language';
 import {
   conversationsForWorkspace,
@@ -695,6 +696,19 @@ export const App: React.FC = () => {
     handleUpdateNodes(updatedConfigs);
   };
 
+  const handleNoteFreeTierCall = (nodeId: string) => {
+    const stamp = bumpFreeTierUsage;
+    setSettings(prev => {
+      const next = {
+        ...prev,
+        nodes: prev.nodes.map(n => n.id === nodeId ? { ...n, freeTierUsage: stamp(n.freeTierUsage) } : n)
+      };
+      window.electronAPI?.saveSettings(next);
+      return next;
+    });
+    setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, freeTierUsage: stamp(n.freeTierUsage) } : n));
+  };
+
   const handleRecordTokens = (localCount: number, frontierCount: number) => {
     updateSettings({
       localTokensGenerated: (settings.localTokensGenerated || 0) + localCount,
@@ -788,6 +802,7 @@ export const App: React.FC = () => {
           onExecuteToolCommand={handleExecuteToolCommand}
           onOpenFileInEditor={handleOpenFileInEditor}
           onRecordTokens={handleRecordTokens}
+          onNoteFreeTierCall={handleNoteFreeTierCall}
           conversation={activeConversation}
           workspaceConversations={workspaceConversations}
           onMessagesChange={handleMessagesChange}

@@ -205,6 +205,20 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(updated);
   };
 
+  const handleUpdateFreeTier = (enabled: boolean, dailyCap?: number) => {
+    if (!currentNode) return;
+    const updated = nodes.map(n => {
+      if (n.id !== currentNode.id) return n;
+      const cap = dailyCap ?? n.freeTierDailyCap ?? 20;
+      return {
+        ...n,
+        freeTier: enabled,
+        freeTierDailyCap: Math.min(500, Math.max(1, Math.floor(cap) || 20))
+      };
+    });
+    onUpdateNodes(updated);
+  };
+
   const handleApplyGpuPreset = (presetName: string) => {
     const preset = GPU_PRESETS.find(p => p.name === presetName);
     if (!preset) return;
@@ -822,8 +836,41 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           onChange={(e) => handleUpdateNodeProp('apiKey', e.target.value)}
                           className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
                         />
+                        <label className="mt-2 flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={!!currentNode.freeTier}
+                            onChange={(e) => handleUpdateFreeTier(e.target.checked)}
+                            className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+                          />
+                          <span>Free tier</span>
+                        </label>
+                        {currentNode.freeTier && (
+                          <label className="mt-1.5 flex items-center gap-2 text-[10px] text-zinc-400">
+                            <span>Assist calls per day</span>
+                            <input
+                              type="number"
+                              min={1}
+                              max={500}
+                              value={currentNode.freeTierDailyCap ?? 20}
+                              onChange={(e) => handleUpdateFreeTier(true, Number(e.target.value))}
+                              className="w-16 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-1.5 py-0.5 outline-none font-mono"
+                            />
+                            <span>
+                              used {(() => {
+                                const usage = currentNode.freeTierUsage;
+                                const today = new Date();
+                                const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+                                return usage?.day === day ? usage.count || 0 : 0;
+                              })()} today
+                            </span>
+                          </label>
+                        )}
                         <p className="text-[10px] text-zinc-500 mt-1">
                           Stored only on this PC under %APPDATA%\LocalAgents Studio\settings.json — never inside the EXE. Plaintext, not encrypted.
+                          {currentNode.freeTier
+                            ? ' Free tier means every model on this node is a short assist. Local GPUs still write the code. This key is called when a prompt does not fit a local context window, or several files do not fit the local reviewer. The reply is kept short.'
+                            : ''}
                         </p>
                       </div>
                     )}

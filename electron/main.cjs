@@ -262,6 +262,10 @@ function stripNodeForExport(n) {
   if (typeof n.activeModel === 'string') cfg.activeModel = n.activeModel;
   if (n.modelMeta && typeof n.modelMeta === 'object') cfg.modelMeta = n.modelMeta;
   if (n.modelPrefs && typeof n.modelPrefs === 'object') cfg.modelPrefs = n.modelPrefs;
+  if (n.freeTier === true) cfg.freeTier = true;
+  if (typeof n.freeTierDailyCap === 'number' && n.freeTierDailyCap >= 1) {
+    cfg.freeTierDailyCap = Math.min(500, Math.floor(n.freeTierDailyCap));
+  }
   return cfg;
 }
 
