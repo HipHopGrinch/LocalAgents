@@ -12,11 +12,16 @@ import {
   Upload,
   Lock
 } from 'lucide-react';
-import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta } from '../types';
+import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
 import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
 import { pullModel } from '../lib/ollamaClient';
-import { isEmbeddingModelName } from '../lib/tools';
+import {
+  assignPreferredRole,
+  findNodeHoldingRole,
+  isEmbeddingModelName,
+  normalizePreferredRoles
+} from '../lib/tools';
 import { modelSupportsThinking, normalizeThinkingInfo } from '../lib/thinking';
 import { ModelHubPanel } from './hardware/ModelHubPanel';
 import { InstalledModelsPanel } from './hardware/InstalledModelsPanel';
@@ -204,6 +209,19 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     });
     onUpdateNodes(updated);
   };
+
+  const handleUpdatePreferredRole = (value: '' | NodeRole) => {
+    if (!currentNode) return;
+    onUpdateNodes(assignPreferredRole(nodes, currentNode.id, value));
+  };
+
+  const preferredRoleOptions: { value: '' | NodeRole; label: string }[] = [
+    { value: '', label: 'Auto — soft name/id preference, local-first' },
+    { value: 'coder', label: 'Coder — force for coding / Auto-Node coder picks' },
+    { value: 'planner', label: 'Planner — force for Planner persona & Swarm Pass-1' },
+    { value: 'reviewer', label: 'Reviewer — force for reviewer persona & review tasks' },
+    { value: 'docs', label: 'Docs — force for docs persona & README/test tasks' }
+  ];
 
   const handleUpdateFreeTier = (enabled: boolean, dailyCap?: number) => {
     if (!currentNode) return;
@@ -528,8 +546,9 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
         next = Array.from(byId.values());
       }
 
-      onUpdateNodes(next);
-      if (next[0]?.id) setSelectedNodeId(next[0].id);
+      const normalized = normalizePreferredRoles(next);
+      onUpdateNodes(normalized);
+      if (normalized[0]?.id) setSelectedNodeId(normalized[0].id);
       closeNodesIODialog();
       onRefreshNodes();
     } catch (err: any) {
@@ -815,6 +834,41 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                           onChange={(e) => handleUpdateNodeProp('url', e.target.value)}
                           className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-mono text-[11px]"
                         />
+                      </div>
+                      <div className="col-span-2">
+                        <label className="text-[11px] text-zinc-400 font-medium">Preferred Role</label>
+                        <select
+                          value={currentNode.roles?.[0] || ''}
+                          onChange={(e) =>
+                            handleUpdatePreferredRole((e.target.value || '') as '' | NodeRole)
+                          }
+                          className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-sans"
+                        >
+                          {preferredRoleOptions.map(opt => {
+                            if (!opt.value) {
+                              return (
+                                <option key="auto" value="">
+                                  {opt.label}
+                                </option>
+                              );
+                            }
+                            const holder = findNodeHoldingRole(nodes, opt.value, currentNode.id);
+                            const taken = !!holder;
+                            const holderLabel = holder?.name || holder?.id || 'another node';
+                            return (
+                              <option key={opt.value} value={opt.value} disabled={taken}>
+                                {taken
+                                  ? `${opt.value[0].toUpperCase()}${opt.value.slice(1)} (used by ${holderLabel})`
+                                  : opt.label}
+                              </option>
+                            );
+                          })}
+                        </select>
+                        <p className="text-[10px] text-zinc-500 mt-1">
+                          Auto can be on any number of nodes. Each of Coder / Planner / Reviewer / Docs
+                          may be assigned to at most one node. An explicit role forces that job
+                          (including Frontier); if nobody is tagged, routing falls back to Auto / local-first.
+                        </p>
                       </div>
                     </div>
 

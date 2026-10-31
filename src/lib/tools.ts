@@ -1,6 +1,8 @@
-import { AgentPersona, ApprovedPlan, EndpointNode, ToolCall, ToolName } from '../types';
+import { AgentPersona, ApprovedPlan, EndpointNode, NodeRole, ToolCall, ToolName } from '../types';
 import { PLANNER_PROTOCOL, formatApprovedPlanContext } from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
+
+const NODE_ROLES: NodeRole[] = ['coder', 'reviewer', 'docs', 'planner'];
 
 export const READ_ONLY_TOOLS: ToolName[] = ['read_file', 'list_dir', 'search', 'read_terminal'];
 const ALL_TOOLS: ToolName[] = [
@@ -711,8 +713,72 @@ function byCapacity(a: EndpointNode, b: EndpointNode): number {
   return score(b) - score(a);
 }
 
+type RoleBearing = { id?: string; name?: string; roles?: NodeRole[] };
+
+/** Preferred role from Hardware Settings (first entry only; empty = Auto). */
+export function getPreferredRole(n: RoleBearing): NodeRole | undefined {
+  const first = n.roles?.[0];
+  return first && NODE_ROLES.includes(first) ? first : undefined;
+}
+
+export function nodeHasExplicitRole(n: RoleBearing, role: string): boolean {
+  return getPreferredRole(n) === role;
+}
+
+function clearRoles<T extends RoleBearing>(n: T): T {
+  if (!n.roles?.length) return n;
+  const { roles: _drop, ...rest } = n;
+  return rest as T;
+}
+
+/**
+ * Each explicit role may belong to at most one node (first wins; later → Auto).
+ * Also clamps multi-role legacy data to a single preferred role.
+ */
+export function normalizePreferredRoles<T extends RoleBearing>(nodes: T[]): T[] {
+  const seen = new Set<NodeRole>();
+  return nodes.map(n => {
+    const role = getPreferredRole(n);
+    if (!role) return clearRoles(n);
+    if (seen.has(role)) return clearRoles(n);
+    seen.add(role);
+    if (n.roles?.length === 1 && n.roles[0] === role) return n;
+    return { ...n, roles: [role] };
+  });
+}
+
+/** Assign Preferred Role on one node; clear the same role from every other node. */
+export function assignPreferredRole<T extends RoleBearing>(
+  nodes: T[],
+  nodeId: string,
+  role: NodeRole | ''
+): T[] {
+  return nodes.map(n => {
+    if (n.id === nodeId) {
+      if (!role) return clearRoles(n);
+      return { ...n, roles: [role] };
+    }
+    if (role && getPreferredRole(n) === role) return clearRoles(n);
+    return n;
+  });
+}
+
+/** Node that currently holds an explicit role (optionally excluding one id). */
+export function findNodeHoldingRole(
+  nodes: RoleBearing[],
+  role: NodeRole,
+  exceptNodeId?: string
+): { id: string; name: string } | undefined {
+  const hit = nodes.find(
+    n => n.id && n.id !== exceptNodeId && getPreferredRole(n) === role
+  );
+  if (!hit?.id) return undefined;
+  return { id: hit.id, name: hit.name || hit.id };
+}
+
+/** Soft Auto routing: name/id heuristics (and legacy multi-role tags). */
 function nodeHasRole(n: EndpointNode, role: string): boolean {
-  if (n.roles?.includes(role as any)) return true;
+  if (n.roles?.includes(role as NodeRole)) return true;
   const id = (n.id || '').toLowerCase();
   const name = (n.name || '').toLowerCase();
   if (role === 'reviewer') return id.includes('laptop') || name.includes('laptop') || name.includes('review');
@@ -721,6 +787,21 @@ function nodeHasRole(n: EndpointNode, role: string): boolean {
     return id.includes('main') || id.includes('rig') || name.includes('main') || (n.roles?.includes('coder') ?? false);
   }
   return false;
+}
+
+/**
+ * Prefer nodes with an explicit Preferred Role tag (frontier allowed, no local-first).
+ * Otherwise soft-match on the local-first pool.
+ */
+function pickEndpointForRole(
+  role: string,
+  onlineUsable: EndpointNode[],
+  localFirstPool: EndpointNode[]
+): EndpointNode | undefined {
+  const tagged = onlineUsable.filter(n => nodeHasExplicitRole(n, role)).sort(byCapacity);
+  if (tagged[0]) return tagged[0];
+  const soft = localFirstPool.filter(n => nodeHasRole(n, role)).sort(byCapacity);
+  return soft[0];
 }
 
 /**
@@ -735,37 +816,45 @@ export function selectBestEndpointForTask(
   if (!nodes.length) return undefined;
   const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
   const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
-  // Local-first; frontier only when no local workers are available
+  // Local-first; frontier only when no local workers are available (soft / Auto path)
   const pool = onlineLocal.length > 0 ? onlineLocal : onlineUsable;
   if (pool.length === 0) {
     return nodes.find(n => n.online) || nodes[0];
   }
 
   const lower = taskText.toLowerCase();
-  const byRole = (role: string) => pool.filter(n => nodeHasRole(n, role)).sort(byCapacity);
+  const byRole = (role: string) => pickEndpointForRole(role, onlineUsable, pool);
 
-  // Explicit agent persona routing (role tags first, legacy IDs as soft preference)
+  // Explicit agent persona routing (Preferred Role tags first, then soft heuristics)
+  if (agentHandle === 'planner') {
+    const hit = byRole('planner');
+    if (hit) return hit;
+  }
   if (agentHandle === 'reviewer') {
-    const hits = byRole('reviewer');
-    if (hits[0]) return hits[0];
+    const hit = byRole('reviewer');
+    if (hit) return hit;
   }
   if (agentHandle === 'docs') {
-    const hits = byRole('docs');
-    if (hits[0]) return hits[0];
+    const hit = byRole('docs');
+    if (hit) return hit;
+  }
+  if (agentHandle === 'coder') {
+    const hit = byRole('coder');
+    if (hit) return hit;
   }
 
   // Task content routing when in auto-endpoint mode
   if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
-    const hits = byRole('docs');
-    if (hits[0]) return hits[0];
+    const hit = byRole('docs');
+    if (hit) return hit;
   }
   if (/\b(review|lint|typo|css|style|color|format|quick)\b/.test(lower)) {
-    const hits = byRole('reviewer');
-    if (hits[0]) return hits[0];
+    const hit = byRole('reviewer');
+    if (hit) return hit;
   }
 
-  const coderHits = byRole('coder');
-  if (coderHits[0]) return coderHits[0];
+  const coderHit = byRole('coder');
+  if (coderHit) return coderHit;
 
   // Fallback to node with highest capacity
   return [...pool].sort(byCapacity)[0];
@@ -846,15 +935,21 @@ export function pickBestModelForComplexity(
 
 /**
  * Finds the best Conductor (planner) model.
- * Local-first: frontier endpoints are only considered when no local workers are online.
+ * Explicit Preferred Role = Planner wins (frontier allowed). Otherwise local-first Auto.
  */
 export function findFastestConductor(
   nodes: EndpointNode[]
 ): { node: EndpointNode; model: string; tokPerSec: number; usedFrontierBackup?: boolean } | null {
   const onlineUsable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
   const onlineLocal = onlineUsable.filter(n => !isFrontierNode(n));
-  const usedFrontierBackup = onlineLocal.length === 0 && onlineUsable.length > 0;
-  const pool = onlineLocal.length > 0 ? onlineLocal : onlineUsable;
+  const explicitPlanners = onlineUsable.filter(n => nodeHasExplicitRole(n, 'planner'));
+  const usedExplicitPlanner = explicitPlanners.length > 0;
+  const usedFrontierBackup = !usedExplicitPlanner && onlineLocal.length === 0 && onlineUsable.length > 0;
+  const pool = usedExplicitPlanner
+    ? explicitPlanners
+    : onlineLocal.length > 0
+      ? onlineLocal
+      : onlineUsable;
   if (pool.length === 0) return null;
 
   let bestNode = pool[0];

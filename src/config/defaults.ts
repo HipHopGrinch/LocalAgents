@@ -1,4 +1,5 @@
 import { AgentPersona, AppSettings, HardwareProfile, NodeConfig } from '../types';
+import { normalizePreferredRoles } from '../lib/tools';
 
 export const SETTINGS_VERSION = 5;
 
@@ -152,10 +153,12 @@ export function mergeSettings(saved: Partial<AppSettings> | null): AppSettings {
     ...saved,
     version: SETTINGS_VERSION,
     uiScale,
-    nodes: nodes.map(n => ({
-      ...n,
-      hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
-    })),
+    nodes: normalizePreferredRoles(
+      nodes.map(n => ({
+        ...n,
+        hardware: { ...DEFAULT_HARDWARE, ...n.hardware }
+      }))
+    ),
     agents: (saved.agents?.length ? saved.agents : DEFAULT_AGENTS).map(a => {
       const def =
         DEFAULT_AGENTS.find(d => d.id === a.id || d.handle === a.handle) || DEFAULT_AGENTS[0];

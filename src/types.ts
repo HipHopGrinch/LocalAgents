@@ -86,7 +86,11 @@ export interface NodeConfig {
   type?: 'ollama' | 'openai'; // 'ollama' for local Ollama, 'openai' for frontier models (Grok, OpenRouter, OpenAI)
   apiKey?: string;
   dnsAlias?: string;
-  /** Soft routing hints for auto-endpoint selection */
+  /**
+   * Preferred role for Auto-Node / Swarm routing (store at most one).
+   * Empty/omit = Auto (soft name/id heuristics + local-first).
+   * Explicit value forces this node as a candidate for that role (frontier allowed).
+   */
   roles?: NodeRole[];
   hardware: HardwareProfile;
   benchmarks?: Record<string, BenchmarkResult>; // model -> measured benchmark stats

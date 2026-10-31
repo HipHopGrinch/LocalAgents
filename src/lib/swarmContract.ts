@@ -9,7 +9,9 @@ import {
 import {
   getEnabledModelsForNode,
   getPreferredModelForNode,
+  getPreferredRole,
   isFrontierNode,
+  nodeHasExplicitRole,
   pickBestModelForComplexity,
   type ConductorFileJob
 } from './tools';
@@ -686,15 +688,16 @@ function nodeTokPerSec(n: EndpointNode, model: string): number {
 }
 
 function roleMatches(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
-  const roles = n.roles || [];
-  if (preferred === '@coder') return roles.includes('coder') || roles.includes('planner');
-  if (preferred === '@docs') return roles.includes('docs');
-  if (preferred === '@reviewer') return roles.includes('reviewer');
+  const role = getPreferredRole(n);
+  if (preferred === '@coder') return role === 'coder' || role === 'planner';
+  if (preferred === '@docs') return role === 'docs';
+  if (preferred === '@reviewer') return role === 'reviewer';
   return false;
 }
 
 /**
- * Lead Architect node: prefer high-VRAM local (≥16GB) coder, else best local, else frontier.
+ * Lead Architect (Pass-1): Preferred Role = Planner wins (frontier allowed).
+ * Otherwise high-VRAM local (≥16GB), else best local, else frontier.
  */
 export function findLeadArchitect(
   nodes: EndpointNode[]
@@ -702,6 +705,7 @@ export function findLeadArchitect(
   const online = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
   const local = online.filter(n => !isFrontierNode(n));
   const highVram = local.filter(n => (n.hardware?.vramGB || 0) >= 16);
+  const explicitPlanners = online.filter(n => nodeHasExplicitRole(n, 'planner'));
 
   const scoreNode = (n: EndpointNode) => {
     const model = pickBestModelForComplexity(n, 'heavy');
@@ -711,7 +715,14 @@ export function findLeadArchitect(
     return { model, speed, score: vram * 50 + speed + roleBonus };
   };
 
-  const pool = highVram.length > 0 ? highVram : local.length > 0 ? local : online;
+  const pool =
+    explicitPlanners.length > 0
+      ? explicitPlanners
+      : highVram.length > 0
+        ? highVram
+        : local.length > 0
+          ? local
+          : online;
   if (!pool.length) return null;
 
   let best = pool[0];
@@ -728,7 +739,8 @@ export function findLeadArchitect(
     node: best,
     model: bestMeta.model,
     tokPerSec: bestMeta.speed,
-    usedFrontierBackup: isFrontierNode(best)
+    // Intentional Planner tag on frontier is not a "backup" failover
+    usedFrontierBackup: explicitPlanners.length === 0 && isFrontierNode(best)
   };
 }
 

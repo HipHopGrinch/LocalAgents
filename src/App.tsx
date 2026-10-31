@@ -18,6 +18,7 @@ import {
 } from './types';
 import { DEFAULT_SETTINGS, mergeSettings } from './config/defaults';
 import { bumpFreeTierUsage } from './lib/freeTierAssist';
+import { normalizePreferredRoles } from './lib/tools';
 import { getLanguageFromPath } from './utils/language';
 import {
   conversationsForWorkspace,
@@ -654,19 +655,22 @@ export const App: React.FC = () => {
   // 7. Node / Hardware Updates
   const handleUpdateNodes = (updatedNodes: NodeConfig[]) => {
     // Persist config fields only (strip live status if present)
-    const configs: NodeConfig[] = updatedNodes.map(n => {
-      const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as EndpointNode;
-      return cfg;
-    });
+    const configs: NodeConfig[] = normalizePreferredRoles(
+      updatedNodes.map(n => {
+        const { online: _o, latency: _l, models: _m, loaded: _ld, error: _e, ...cfg } = n as EndpointNode;
+        return cfg;
+      })
+    );
     updateSettings({ nodes: configs });
     setNodes(prev =>
-      updatedNodes.map(un => {
-        const existing = prev.find(p => p.id === un.id);
-        const meta = un.modelMeta || existing?.modelMeta || {};
-        const incomingModels = (un as EndpointNode).models;
+      configs.map(cfg => {
+        const incoming = updatedNodes.find(u => u.id === cfg.id) as EndpointNode | undefined;
+        const existing = prev.find(p => p.id === cfg.id);
+        const meta = cfg.modelMeta || existing?.modelMeta || {};
+        const incomingModels = incoming?.models;
         const liveModels = Array.isArray(incomingModels) ? incomingModels : (existing?.models ?? []);
         return {
-          ...un,
+          ...cfg,
           online: existing?.online ?? false,
           latency: existing?.latency ?? null,
           loaded: existing?.loaded ?? [],
