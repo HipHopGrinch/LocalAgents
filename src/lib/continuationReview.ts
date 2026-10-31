@@ -4,6 +4,7 @@ import { DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
 import { parsePlanOptions } from './planOptions';
 import { normTag, parseParams } from './recommender';
 import { getEnabledModelsForNode, isFrontierNode } from './tools';
+import { isDurableStep, isInspectionOnly } from './workLog';
 
 /** Extra coding steps the app may run without asking. Then it stops and shows choices. */
 export const MAX_AUTO_CONTINUATIONS = 4;
@@ -34,12 +35,12 @@ replacement lines
 
 Use <edit_file> only for a bug in work that just landed (broken controls, a script that does not load, a rule the page does not implement). Do not start a new feature. Do not rewrite a whole file when a search/replace will do.
 
-After any reads, you may emit <edit_file> patches. End with exactly one <next_step> block.
+Reading is a tool inside this turn, never a <task>. Do not set <task> to "Read …", "Verify …", "Examine …", or "Check …". A <task> must change a file or run a command (fix, edit, wire, implement). If the user reported a bug, the <task> must fix that bug. After any reads, emit <edit_file> patches when needed, then exactly one <next_step> block.
 
 <next_step>
 <decision>continue</decision>
 <reason>one or two sentences</reason>
-<task>One concrete next implementation step. Name the files. The coder must be able to do it without asking the user.</task>
+<task>One concrete fix or implementation step that edits or writes a named file. Not a read or verify.</task>
 </next_step>
 
 OR
@@ -73,8 +74,10 @@ Rules:
 - Prefer continue over ask. Automate anything that does not need a product decision.
 - If an edit_file patch already fixes the bug, use done. Use continue only for work you did not just patch.
 - The work log is the source of truth. Never continue or ask a step listed under Done or Already asked.
-- If Next is set, that is the step to run. Do not invent a different question.
-- If the latest turn already tried Next, say what is still missing in one sentence. Do not ask the same question again.`;
+- If Bug is set, that bug is the priority until a related file is edited or written.
+- If Next is set and durable, that is the step to run. Do not invent a different question.
+- If the latest turn already tried Next, say what is still missing in one sentence. Do not ask the same question again.
+- Never continue with an inspection-only task.`;
 
 /** Parameters the model actually runs. Catalog active size, else catalog size, else the tag. */
 export function reviewModelSizeB(modelName: string): number {
@@ -225,6 +228,44 @@ export function tasksTooSimilar(a: string, b: string): boolean {
   return shorter.length > 40 && longer.includes(shorter);
 }
 
+/**
+ * Drop inspection-only continue tasks. Prefer a durable Bug/Next from the work log
+ * when the model only asked to read or verify again.
+ */
+export function filterInspectionContinue(
+  decision: NextStepDecision,
+  fallbackDurable = ''
+): NextStepDecision {
+  if (decision.decision !== 'continue') return decision;
+  if (!decision.task || (!isInspectionOnly(decision.task) && isDurableStep(decision.task))) {
+    return decision;
+  }
+  const fallback = fallbackDurable.trim();
+  if (fallback && isDurableStep(fallback)) {
+    return {
+      ...decision,
+      task: fallback,
+      reason: decision.reason || 'Inspection-only continue was replaced with the durable work-log step.'
+    };
+  }
+  return {
+    decision: 'ask',
+    reason:
+      decision.reason ||
+      'Need a concrete fix step (edit or write a file), not another read/verify.',
+    task: '',
+    options: decision.options.length
+      ? decision.options
+      : [
+          {
+            id: '1',
+            title: 'Keep fixing',
+            description: fallback || 'Apply a concrete file fix for the reported bug.'
+          }
+        ]
+  };
+}
+
 /** Parse the checker's decision. Missing markup means do not auto-continue. */
 export function parseNextStep(raw: string): NextStepDecision | null {
   const text = (raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
@@ -271,7 +312,7 @@ export function buildContinuationReviewPrompt(input: {
     ? '\n\nYou are out of automatic steps. Use decision ask or done. Do not use continue.'
     : '';
   const log = input.workLog?.trim()
-    ? `\n\nWork log (do not repeat Done or Already asked; run Next if it is set):\n${input.workLog.trim()}`
+    ? `\n\nWork log (Bug and durable Next are priority; do not repeat Done or Already asked; never continue with Read/Verify only):\n${input.workLog.trim()}`
     : '';
   const files = input.writtenPaths?.length
     ? `\n\nFiles just written (read these, then patch bugs in them with edit_file):\n${input.writtenPaths.join('\n')}`

@@ -123,6 +123,7 @@ import {
   buildContinuationReviewPrompt,
   collectWrittenPaths,
   CONTINUATION_REVIEW_SYSTEM,
+  filterInspectionContinue,
   MAX_AUTO_CONTINUATIONS,
   parseNextStep,
   pickCapableReviewTarget,
@@ -2022,11 +2023,20 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const reviewTools = [...readTools, ...editTools];
 
       const parsedDecision = parseNextStep(content);
-      const steered = parsedDecision
-        ? avoidRepeat(progressRef.current, parsedDecision.decision, parsedDecision.task, parsedDecision.options)
+      const durableFallback = (progressRef.current.bug || progressRef.current.next || '').trim();
+      const filteredDecision = parsedDecision
+        ? filterInspectionContinue(parsedDecision, durableFallback)
         : null;
-      const decision = parsedDecision
-        ? { ...parsedDecision, decision: steered!.decision, task: steered!.task, options: steered!.options }
+      const steered = filteredDecision
+        ? avoidRepeat(
+            progressRef.current,
+            filteredDecision.decision,
+            filteredDecision.task,
+            filteredDecision.options
+          )
+        : null;
+      const decision = filteredDecision
+        ? { ...filteredDecision, decision: steered!.decision, task: steered!.task, options: steered!.options }
         : null;
       const visible = parseResponse(content, agentMsgId, false).display || stripThinking(content);
       const prose = stripNextStepMarkup(stripPlanOptionMarkup(visible));
