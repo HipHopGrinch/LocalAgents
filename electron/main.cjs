@@ -40,6 +40,7 @@ function createWindow() {
     app.setAppUserModelId('com.localagents.studio');
   }
 
+  const windowIcon = path.join(__dirname, 'icon.ico');
   mainWindow = new BrowserWindow({
     width: 1500,
     height: 920,
@@ -47,6 +48,7 @@ function createWindow() {
     minHeight: 640,
     backgroundColor: '#18181b',
     title: 'LocalAgents Studio',
+    icon: fs.existsSync(windowIcon) ? windowIcon : undefined,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),

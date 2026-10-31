@@ -1,6 +1,6 @@
 {
   "name": "local-agents-ide",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "Distributed Local LLM Agent IDE for Windows",
   "author": "LocalAgents",
   "license": "MIT",
@@ -28,6 +28,7 @@
     ],
     "asar": true,
     "win": {
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         {
@@ -54,6 +55,9 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "LocalAgents Studio",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
       "artifactName": "LocalAgents-Studio-${version}-setup.${ext}"
     },
     "publish": [
