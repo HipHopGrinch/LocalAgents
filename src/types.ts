@@ -435,6 +435,36 @@ export interface ElectronAPI {
   ) => Promise<{ ok?: boolean; imageBase64?: string; mime?: string; error?: string }>;
 
   detectHardware: () => Promise<DetectedHardware>;
+
+  /** NSIS installer builds only. Portable / dev return supported: false. */
+  getUpdateStatus: () => Promise<AppUpdateStatus>;
+  checkForUpdate: () => Promise<AppUpdateStatus>;
+  downloadUpdate: () => Promise<AppUpdateStatus>;
+  installUpdate: () => Promise<AppUpdateStatus>;
+  setUpdateBusy: (busy: boolean) => Promise<{ busy: boolean; idle: boolean }>;
+  onUpdateStatus: (cb: (status: AppUpdateStatus) => void) => () => void;
+}
+
+export type AppUpdateState =
+  | 'idle'
+  | 'unsupported'
+  | 'checking'
+  | 'available'
+  | 'up-to-date'
+  | 'downloading'
+  | 'downloaded'
+  | 'waiting-idle'
+  | 'installing'
+  | 'error';
+
+export interface AppUpdateStatus {
+  supported: boolean;
+  state: AppUpdateState;
+  currentVersion: string;
+  version: string | null;
+  percent: number;
+  message: string;
+  error: string | null;
 }
 
 declare global {

@@ -90,7 +90,10 @@ process.on('unhandledRejection', reason => {
   appendLog('error', `unhandledRejection: ${text}`);
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow();
+  setupAutoUpdater();
+});
 app.on('window-all-closed', () => {
   killAllProcesses();
   app.quit();
@@ -1241,6 +1244,7 @@ async function streamNdjson(requestId, url, body, channel, onLine) {
     return false;
   } finally {
     streams.delete(requestId);
+    tryInstallWhenIdle();
   }
   return true;
 }
@@ -1401,6 +1405,7 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
     return false;
   } finally {
     streams.delete(requestId);
+    tryInstallWhenIdle();
   }
 }
 
@@ -1712,3 +1717,258 @@ function formatBytes(n) {
   if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1048576).toFixed(1)} MB`;
 }
+
+// ==========================================
+// AUTO-UPDATE (NSIS install only — portable is manual)
+// ==========================================
+
+/** True when the user launched the single-file portable wrapper. */
+function isPortableBuild() {
+  return !!(process.env.PORTABLE_EXECUTABLE_FILE || process.env.PORTABLE_EXECUTABLE_DIR);
+}
+
+let rendererBusy = false;
+let installWhenIdle = false;
+let updateCheckTimer = null;
+const updateState = {
+  supported: false,
+  state: 'idle',
+  currentVersion: app.getVersion(),
+  version: null,
+  percent: 0,
+  message: '',
+  error: null
+};
+
+function pushUpdateStatus(partial = {}) {
+  Object.assign(updateState, partial);
+  send('update:status', { ...updateState });
+}
+
+function appIsIdle() {
+  return !rendererBusy && streams.size === 0;
+}
+
+function tryInstallWhenIdle() {
+  if (!installWhenIdle) return;
+  if (!appIsIdle()) {
+    pushUpdateStatus({
+      state: 'waiting-idle',
+      message: 'Update ready. Waiting for model calls to finish before restarting.'
+    });
+    return;
+  }
+  installWhenIdle = false;
+  pushUpdateStatus({ state: 'installing', message: 'Restarting to apply the update…' });
+  try {
+    // isSilent=false, isForceRunAfter=true — relaunch after NSIS finishes
+    require('electron-updater').autoUpdater.quitAndInstall(false, true);
+  } catch (err) {
+    pushUpdateStatus({
+      state: 'error',
+      error: err?.message || String(err),
+      message: 'Could not start the installer.'
+    });
+  }
+}
+
+function setupAutoUpdater() {
+  updateState.currentVersion = app.getVersion();
+
+  if (!app.isPackaged) {
+    pushUpdateStatus({
+      supported: false,
+      state: 'unsupported',
+      message: 'Updates are only checked in a packaged install (not npm run dev).'
+    });
+    return;
+  }
+
+  if (isPortableBuild()) {
+    pushUpdateStatus({
+      supported: false,
+      state: 'unsupported',
+      message: 'Portable builds update by downloading a new exe from GitHub. Use the Setup installer for in-app updates.'
+    });
+    return;
+  }
+
+  let autoUpdater;
+  try {
+    autoUpdater = require('electron-updater').autoUpdater;
+  } catch (err) {
+    pushUpdateStatus({
+      supported: false,
+      state: 'error',
+      error: err?.message || String(err),
+      message: 'Updater module failed to load.'
+    });
+    return;
+  }
+
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  // Releases are currently unsigned; skip Win code-signature gate.
+  if (typeof autoUpdater.verifyUpdateCodeSignature === 'boolean') {
+    autoUpdater.verifyUpdateCodeSignature = false;
+  }
+
+  try {
+    autoUpdater.setFeedURL({
+      provider: 'github',
+      owner: 'HipHopGrinch',
+      repo: 'LocalAgents'
+    });
+  } catch (err) {
+    appendLog('warn', `updater setFeedURL: ${err?.message || err}`);
+  }
+
+  autoUpdater.on('checking-for-update', () => {
+    pushUpdateStatus({
+      supported: true,
+      state: 'checking',
+      message: 'Checking GitHub for a newer release…',
+      error: null
+    });
+  });
+
+  autoUpdater.on('update-available', info => {
+    pushUpdateStatus({
+      supported: true,
+      state: 'available',
+      version: info?.version || null,
+      percent: 0,
+      message: `Version ${info?.version || '?'} is available.`,
+      error: null
+    });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    pushUpdateStatus({
+      supported: true,
+      state: 'up-to-date',
+      version: null,
+      percent: 0,
+      message: `You are on the latest version (${app.getVersion()}).`,
+      error: null
+    });
+  });
+
+  autoUpdater.on('download-progress', progress => {
+    const percent = Math.max(0, Math.min(100, Math.round(progress?.percent || 0)));
+    pushUpdateStatus({
+      supported: true,
+      state: 'downloading',
+      percent,
+      message: `Downloading update… ${percent}%`,
+      error: null
+    });
+  });
+
+  autoUpdater.on('update-downloaded', info => {
+    pushUpdateStatus({
+      supported: true,
+      state: 'downloaded',
+      version: info?.version || updateState.version,
+      percent: 100,
+      message: `Version ${info?.version || updateState.version || ''} downloaded. Will restart when idle.`,
+      error: null
+    });
+    installWhenIdle = true;
+    tryInstallWhenIdle();
+  });
+
+  autoUpdater.on('error', err => {
+    appendLog('error', `updater: ${err?.message || err}`);
+    pushUpdateStatus({
+      supported: true,
+      state: 'error',
+      error: err?.message || String(err),
+      message: 'Update check or download failed.'
+    });
+  });
+
+  pushUpdateStatus({
+    supported: true,
+    state: 'idle',
+    message: `Installed version ${app.getVersion()}.`
+  });
+
+  // Quiet check a few seconds after launch; user can also check manually.
+  updateCheckTimer = setTimeout(() => {
+    autoUpdater.checkForUpdates().catch(err => {
+      appendLog('warn', `updater check: ${err?.message || err}`);
+    });
+  }, 8000);
+}
+
+ipcMain.handle('update:getStatus', () => ({ ...updateState }));
+
+ipcMain.handle('update:check', async () => {
+  if (!updateState.supported) return { ...updateState };
+  try {
+    const { autoUpdater } = require('electron-updater');
+    await autoUpdater.checkForUpdates();
+  } catch (err) {
+    pushUpdateStatus({
+      state: 'error',
+      error: err?.message || String(err),
+      message: 'Update check failed.'
+    });
+  }
+  return { ...updateState };
+});
+
+ipcMain.handle('update:download', async () => {
+  if (!updateState.supported) return { ...updateState };
+  if (updateState.state === 'downloading' || updateState.state === 'downloaded' || updateState.state === 'waiting-idle') {
+    return { ...updateState };
+  }
+  try {
+    pushUpdateStatus({
+      state: 'downloading',
+      percent: 0,
+      message: 'Starting download…',
+      error: null
+    });
+    const { autoUpdater } = require('electron-updater');
+    await autoUpdater.downloadUpdate();
+  } catch (err) {
+    pushUpdateStatus({
+      state: 'error',
+      error: err?.message || String(err),
+      message: 'Download failed.'
+    });
+  }
+  return { ...updateState };
+});
+
+ipcMain.handle('update:install', async () => {
+  if (!updateState.supported) return { ...updateState };
+  installWhenIdle = true;
+  if (updateState.state !== 'downloaded' && updateState.state !== 'waiting-idle' && updateState.state !== 'installing') {
+    // Download first if needed, then install when idle via update-downloaded.
+    try {
+      const { autoUpdater } = require('electron-updater');
+      if (updateState.state === 'available' || updateState.state === 'up-to-date' || updateState.state === 'idle') {
+        pushUpdateStatus({ state: 'downloading', percent: 0, message: 'Starting download…', error: null });
+        await autoUpdater.downloadUpdate();
+      }
+    } catch (err) {
+      pushUpdateStatus({
+        state: 'error',
+        error: err?.message || String(err),
+        message: 'Download failed.'
+      });
+      return { ...updateState };
+    }
+  }
+  tryInstallWhenIdle();
+  return { ...updateState };
+});
+
+ipcMain.handle('update:setBusy', (_e, busy) => {
+  rendererBusy = !!busy;
+  if (installWhenIdle && !rendererBusy) tryInstallWhenIdle();
+  return { busy: rendererBusy, idle: appIsIdle() };
+});

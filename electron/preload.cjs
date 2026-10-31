@@ -79,5 +79,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   showModel: (url, model) => ipcRenderer.invoke('ollama:show', url, model),
 
   // System
-  detectHardware: () => ipcRenderer.invoke('system:detect-hardware')
+  detectHardware: () => ipcRenderer.invoke('system:detect-hardware'),
+
+  // NSIS in-app updates (unsupported on portable / npm run dev)
+  getUpdateStatus: () => ipcRenderer.invoke('update:getStatus'),
+  checkForUpdate: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  setUpdateBusy: busy => ipcRenderer.invoke('update:setBusy', busy),
+  onUpdateStatus: subscribe('update:status')
 });

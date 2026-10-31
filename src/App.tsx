@@ -5,6 +5,7 @@ import { EditorView } from './components/EditorView';
 import { TerminalPanel } from './components/TerminalPanel';
 import { AgentChat } from './components/AgentChat';
 import { HardwareSettingsModal } from './components/HardwareSettingsModal';
+import { UpdateBanner } from './components/UpdateBanner';
 
 import {
   EndpointNode,
@@ -716,6 +717,10 @@ export const App: React.FC = () => {
     });
   };
 
+  const handleAgentBusyChange = useCallback((busy: boolean) => {
+    void window.electronAPI?.setUpdateBusy?.(busy);
+  }, []);
+
   return (
     <div className="flex flex-col h-screen w-screen bg-[#18181b] text-zinc-100 overflow-hidden font-sans select-none">
       {/* Top Header */}
@@ -735,6 +740,7 @@ export const App: React.FC = () => {
         uiScale={uiScale}
         onUpdateUiScale={handleUpdateUiScale}
       />
+      <UpdateBanner />
 
       {/* Main Studio Body */}
       <div className="flex-1 flex overflow-hidden">
@@ -813,6 +819,7 @@ export const App: React.FC = () => {
           onDeleteConversation={handleDeleteConversation}
           onToggleModelThinking={handleToggleModelThinking}
           searxngUrl={settings.searxngUrl || ''}
+          onBusyChange={handleAgentBusyChange}
         />
       </div>
 

@@ -162,6 +162,8 @@ interface AgentChatProps {
   searxngUrl?: string;
   /** Inner tool-loop budget (settings.maxAgentSteps). */
   maxAgentSteps?: number;
+  /** True while a local/frontier agent turn (or stuck ladder) is in flight — blocks update restart. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 export const AgentChat: React.FC<AgentChatProps> = ({
@@ -188,7 +190,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   onDeleteConversation,
   onToggleModelThinking,
   searxngUrl = '',
-  maxAgentSteps = 12
+  maxAgentSteps = 12,
+  onBusyChange
 }) => {
   const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
@@ -209,6 +212,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>(conversation?.messages || []);
   const [isStreaming, setIsStreaming] = useState(false);
+  useEffect(() => {
+    onBusyChange?.(isStreaming);
+    return () => onBusyChange?.(false);
+  }, [isStreaming, onBusyChange]);
   const [historyOpen, setHistoryOpen] = useState(false);
   /** Banner after user picks a plan option — Coder is running the locked plan */
   const [executingPlanNotice, setExecutingPlanNotice] = useState<string | null>(null);

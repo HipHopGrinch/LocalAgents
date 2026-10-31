@@ -1,6 +1,6 @@
 {
   "name": "local-agents-ide",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Distributed Local LLM Agent IDE for Windows",
   "author": "LocalAgents",
   "license": "MIT",
@@ -32,11 +32,15 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "${productName}-${version}-${arch}.${ext}"
@@ -51,7 +55,14 @@
       "createStartMenuShortcut": true,
       "shortcutName": "LocalAgents Studio",
       "artifactName": "${productName}-${version}-setup.${ext}"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "HipHopGrinch",
+        "repo": "LocalAgents"
+      }
+    ]
   },
   "devDependencies": {
     "@monaco-editor/react": "^4.7.0",
@@ -74,5 +85,8 @@
     "typescript": "^5.7.3",
     "vite": "^6.1.0",
     "wait-on": "^8.0.2"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
   }
 }
