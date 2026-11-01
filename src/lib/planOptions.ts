@@ -42,8 +42,27 @@ ${plan.planMarkdown || plan.summary}
 Implement this option now. Use tool tags to write files. Match the chosen stack and scope exactly (e.g. static HTML if that was chosen — do not switch to React unless the option says so).`;
 }
 
-/** Format approved plan for Swarm Lead Architect Pass 1. */
+/**
+ * Slim approved-plan text for Swarm Pass 1 (Lead Architect).
+ * Intentionally omits full planMarkdown — that dump caused workers to echo
+ * "Intent Analysis" into build.bat / headers.
+ */
 export function formatApprovedPlanForSwarm(plan: ApprovedPlan): string {
+  const title = (plan.chosenOptionTitle || '').toLowerCase();
+  const desc = (plan.chosenOptionDescription || '').toLowerCase();
+  const blob = `${title} ${desc} ${plan.originalUserRequest || ''}`.toLowerCase();
+  let stackHint =
+    'Infer stack from the chosen option. Prefer HTML/CSS/JS for static sites; TypeScript contract workflow only when React/TypeScript was chosen.';
+  if (/\b(c\+\+|cpp|win32|gdi|msvc|native)\b/.test(blob) && !/\belectron\b/.test(blob)) {
+    stackHint =
+      'Stack MUST be "native-win32". contractFile = "SWARM.md" (short shared notes in markdown, not TypeScript). Tasks: real .cpp/.h/.rc/.bat (or .cs) paths with concrete per-file instructions. Do NOT invent a TypeScript SPA.';
+  } else if (/\b(static|html|css)\b/.test(blob) && !/\breact|typescript\b/.test(blob)) {
+    stackHint =
+      'Stack MUST be "static-web". Tasks like index.html, styles.css, app.js. Minimal or markdown contractFile — do NOT force React/TypeScript.';
+  } else if (/\breact|typescript|\.tsx\b/.test(blob)) {
+    stackHint = 'Stack "typescript" with a shared TypeScript contractFile is appropriate.';
+  }
+
   return `APPROVED USER PLAN (already chosen — follow exactly):
 
 Original request: ${plan.originalUserRequest}
@@ -51,11 +70,15 @@ Original request: ${plan.originalUserRequest}
 Chosen option (#${plan.chosenOptionId}): ${plan.chosenOptionTitle}
 ${plan.chosenOptionDescription}
 
-${plan.planMarkdown || plan.summary}
+${stackHint}
 
-IMPORTANT: Decompose and implement according to the chosen option's stack and scope.
-If the option says static HTML (or similar), prefer HTML/CSS/JS file tasks — do NOT force a React/TypeScript SPA unless the chosen option requires it.
-If the option explicitly asks for TypeScript/React, then use the shared TS contract workflow.`;
+Decompose into 2–4 parallel file tasks with SHORT, file-specific instructions (what that file must contain). Never paste planning essays, option lists, or Intent Analysis into contractCode or task instructions.`;
+}
+
+/** One-screen brief for Swarm workers — no planner essay. */
+export function formatApprovedPlanBrief(plan: ApprovedPlan): string {
+  return `Original request: ${plan.originalUserRequest}
+Chosen option: ${plan.chosenOptionTitle} — ${plan.chosenOptionDescription}`;
 }
 
 function stripFencesAround(block: string): string {

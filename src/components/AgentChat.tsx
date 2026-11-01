@@ -57,6 +57,7 @@ import {
   endpointQueueKey,
   parseSwarmManifest,
   queueAssignmentsByGpu,
+  shouldRejectPlannerWrite,
   type SwarmAssignment,
   type SwarmManifest
 } from '../lib/swarmContract';
@@ -114,6 +115,7 @@ import {
   buildPlanSummary,
   findPendingPlanMessage,
   findPlanOriginalRequest,
+  formatApprovedPlanBrief,
   formatApprovedPlanContext,
   formatApprovedPlanForSwarm,
   matchPlanOption,
@@ -989,6 +991,21 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           createIntent: true
         }).toolCalls.map(t => anchorWritePath(t, expectedFilePath));
 
+        tools = tools.map(t => {
+          if (
+            (t.name === 'write_file' || t.name === 'edit_file') &&
+            shouldRejectPlannerWrite(t.args?.path || expectedFilePath || '', t.body || '')
+          ) {
+            return {
+              ...t,
+              status: 'error' as const,
+              result:
+                'Rejected: body looks like planner/option prose, not source for this path. Rewrite with real file contents only.'
+            };
+          }
+          return t;
+        });
+
         const readPass = await runReadOnlyTools(tools, toolDeps);
         tools = readPass.tools;
 
@@ -1385,13 +1402,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             }
             const current = await readWorkspaceRel(assignment.task.filePath);
             const workerLog = progressForPrompt();
+            const workerOverall = lockedPlan
+              ? formatApprovedPlanBrief(lockedPlan)
+              : userText;
             const workerPrompt = `${buildSwarmWorkerPrompt({
               task: assignment.task,
               contractFile: manifest.contractFile,
               contractCode: manifest.contractCode,
               siblingSummary,
               currentFileContent: current,
-              userPrompt: fullPrompt,
+              userPrompt: workerOverall,
+              stack: manifest.stack,
               devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
             })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
             await runWorkerTurn({

@@ -52,6 +52,52 @@ export interface SwarmWorkItem {
   stepIdx: number;
 }
 
+/** Planner / option-list prose that must never land in source files. */
+export function looksLikePlannerProse(text: string): boolean {
+  const t = (text || '').trim();
+  if (!t) return false;
+  if (/<plan_options\b/i.test(t)) return true;
+  if (/###\s*Intent Analysis/i.test(t)) return true;
+  if (/Please pick an option/i.test(t)) return true;
+  if (/Options for Architecture/i.test(t)) return true;
+  if (/Proposed Plan/i.test(t) && /Option\s*1\s*:/i.test(t)) return true;
+  if (/IMPORTANT:\s*Decompose and implement/i.test(t)) return true;
+  // Multiple numbered architecture options = plan dump, not code
+  const optionHits = (t.match(/\*\*Option\s*\d+/gi) || []).length + (t.match(/<option\s+id=/gi) || []).length;
+  if (optionHits >= 2 && t.length > 400) return true;
+  return false;
+}
+
+/** Short request line for fallbacks — never the full approved-plan essay. */
+export function briefUserTask(userTask: string, max = 220): string {
+  const line = (userTask || '')
+    .replace(/APPROVED USER PLAN[\s\S]*$/i, '')
+    .replace(/Chosen option[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (line || userTask || 'the requested app').slice(0, max);
+}
+
+export function sanitizeTaskInstructions(
+  instructions: string,
+  filePath: string,
+  userTask: string
+): string {
+  const brief = briefUserTask(userTask);
+  const clean = (instructions || '').trim();
+  if (!clean || looksLikePlannerProse(clean) || clean.length > 900) {
+    return `Write complete, valid contents for \`${filePath}\` for this project: ${brief}. Output only that file's real source — no Intent Analysis, option lists, or markdown plans.`;
+  }
+  return clean;
+}
+
+/** True when a write_file body is planner prose for a path that should be real source. */
+export function shouldRejectPlannerWrite(path: string, body: string): boolean {
+  if (!looksLikePlannerProse(body)) return false;
+  const p = (path || '').toLowerCase();
+  return /\.(bat|cmd|ps1|h|hpp|c|cpp|cc|cxx|rc|cs|py|go|rs|js|jsx|ts|tsx|html|css|json)$/i.test(p);
+}
+
 /** Same Ollama URL shares one GPU, even if two node entries point at it. */
 export function endpointQueueKey(node: EndpointNode): string {
   return (node.url || node.id || '').replace(/\/+$/, '').toLowerCase();
@@ -229,9 +275,11 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
           requiredImports: Array.isArray(t.requiredImports)
             ? t.requiredImports.map(String)
             : [],
-          instructions:
-            String(t.instructions || '').trim() ||
-            `Implement ${filePath} for: ${userTask}`,
+          instructions: sanitizeTaskInstructions(
+            String(t.instructions || '').trim(),
+            filePath,
+            userTask
+          ),
           role: String(t.role || preferredRole || 'Worker')
         } as SwarmTask;
       })
@@ -247,7 +295,12 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
     if (!tasks.length) return null;
     const fromFiles = stackFromFilePaths(tasks.map(t => t.filePath));
     const declared = isDeliveryStack(String(parsed.stack || '')) ? (parsed.stack as DeliveryStack) : null;
-    const stack = declared || fromFiles || inferDeliveryStack(userTask);
+    // Prefer file paths over a mistaken "typescript" declaration when sources are native.
+    const stack =
+      (fromFiles === 'native-win32' ? fromFiles : null) ||
+      declared ||
+      fromFiles ||
+      inferDeliveryStack(userTask);
     const verifyCommand =
       typeof parsed.verifyCommand === 'string' && parsed.verifyCommand.trim()
         ? String(parsed.verifyCommand).trim()
@@ -262,12 +315,68 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
 export function fallbackSwarmManifest(userTask: string): SwarmManifest {
   const stack = inferDeliveryStack(userTask);
   const verifyCommand = verifyCommandForStack(stack);
+  const brief = briefUserTask(userTask);
+  if (stack === 'native-win32') {
+    return {
+      stack,
+      verifyCommand,
+      contractFile: 'SWARM.md',
+      contractCode: `# Native Windows swarm notes\nRequest: ${brief}\nShared: American checkers rules, 8x8 board, Win32 message loop owns input.\n`,
+      tasks: [
+        {
+          filePath: 'Checkers.h',
+          complexity: 'medium',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `C/C++ header: board state, piece types, move APIs, and window proc declarations for a Win32 checkers game (${brief}). Real #ifndef guards and prototypes only — no markdown.`,
+          role: 'Headers'
+        },
+        {
+          filePath: 'Resource.h',
+          complexity: 'low',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Win32 resource IDs only (#define IDC_*, IDM_*, IDI_*). No planner prose.`,
+          role: 'Resources'
+        },
+        {
+          filePath: 'Checkers.cpp',
+          complexity: 'high',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Complete Win32 + GDI checkers implementation: window, board draw, clicks, turns, jumps, kings (${brief}). Valid C++ only.`,
+          role: 'Main'
+        },
+        {
+          filePath: 'Checkers.rc',
+          complexity: 'low',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `Valid .rc script including Resource.h (menu/icon/dialog stubs as needed).`,
+          role: 'RC'
+        },
+        {
+          filePath: 'build.bat',
+          complexity: 'low',
+          preferredRole: '@coder',
+          requiredExports: [],
+          requiredImports: [],
+          instructions: `@echo off batch that compiles Checkers.cpp / Checkers.rc with cl.exe or g++ into Checkers.exe. Real commands only — never paste a plan.`,
+          role: 'Build'
+        }
+      ]
+    };
+  }
   if (stack === 'python') {
     return {
       stack,
       verifyCommand,
       contractFile: 'SWARM.md',
-      contractCode: `# Shared names\nProject: ${userTask.slice(0, 200)}\n`,
+      contractCode: `# Shared names\nProject: ${brief}\n`,
       tasks: [
         {
           filePath: 'main.py',
@@ -275,7 +384,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Implement the Python program for: ${userTask}`,
+          instructions: `Implement the Python program for: ${brief}`,
           role: 'Main'
         },
         {
@@ -284,7 +393,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@docs',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Short run instructions for: ${userTask}`,
+          instructions: `Short run instructions for: ${brief}`,
           role: 'Docs'
         }
       ]
@@ -312,7 +421,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Implement the Go program for: ${userTask}`,
+          instructions: `Implement the Go program for: ${brief}`,
           role: 'Main'
         }
       ]
@@ -340,7 +449,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Implement the Rust program for: ${userTask}`,
+          instructions: `Implement the Rust program for: ${brief}`,
           role: 'Main'
         }
       ]
@@ -359,7 +468,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `package.json for: ${userTask}`,
+          instructions: `package.json for: ${brief}`,
           role: 'Package'
         },
         {
@@ -368,7 +477,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Implement the Node/Electron entry for: ${userTask}`,
+          instructions: `Implement the Node/Electron entry for: ${brief}`,
           role: 'Main'
         }
       ]
@@ -387,7 +496,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Complete static page for: ${userTask}. Link styles.css and app.js. Use generate_image paths under assets/ when pictures are needed.`,
+          instructions: `Complete static page for: ${brief}. Link styles.css and app.js. Use generate_image paths under assets/ when pictures are needed.`,
           role: 'HTML'
         },
         {
@@ -396,7 +505,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@docs',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Styles for: ${userTask}`,
+          instructions: `Styles for: ${brief}`,
           role: 'CSS'
         },
         {
@@ -405,7 +514,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Browser script (cart or behavior) for: ${userTask}`,
+          instructions: `Browser script (cart or behavior) for: ${brief}`,
           role: 'JS'
         }
       ]
@@ -444,7 +553,7 @@ export function createInitialState(): AppState {
             "import type { AppState } from './types/swarm-contract';",
             "import { createInitialState } from './types/swarm-contract';"
           ],
-          instructions: `Implement application bootstrap using createInitialState for: ${userTask}`,
+          instructions: `Implement application bootstrap using createInitialState for: ${brief}`,
           role: 'Core App'
         },
         {
@@ -453,7 +562,7 @@ export function createInitialState(): AppState {
           preferredRole: '@docs',
           requiredExports: ['export function renderApp(root: HTMLElement, state: AppState): void'],
           requiredImports: ["import type { AppState } from './types/swarm-contract';"],
-          instructions: `Implement UI rendering helpers for: ${userTask}`,
+          instructions: `Implement UI rendering helpers for: ${brief}`,
           role: 'UI'
         },
         {
@@ -462,7 +571,7 @@ export function createInitialState(): AppState {
           preferredRole: '@reviewer',
           requiredExports: [],
           requiredImports: [],
-          instructions: `Create index.html that loads the app entry for: ${userTask}`,
+          instructions: `Create index.html that loads the app entry for: ${brief}`,
           role: 'HTML Shell'
         }
       ]
@@ -493,7 +602,7 @@ export function getDefaultConfig(): AppConfig {
           "import type { AppConfig } from './types/swarm-contract';",
           "import { getDefaultConfig } from './types/swarm-contract';"
         ],
-        instructions: `Implement main entry for: ${userTask}`,
+        instructions: `Implement main entry for: ${brief}`,
         role: 'Main'
       },
       {
@@ -502,7 +611,7 @@ export function getDefaultConfig(): AppConfig {
         preferredRole: '@coder',
         requiredExports: ['export function describeConfig(cfg: AppConfig): string'],
         requiredImports: ["import type { AppConfig } from './types/swarm-contract';"],
-        instructions: `Implement service helpers for: ${userTask}`,
+        instructions: `Implement service helpers for: ${brief}`,
         role: 'Services'
       }
     ]
@@ -521,8 +630,6 @@ export function buildLeadArchitectPrompt(
     ? `
 ### APPROVED PLAN (user already chose — follow this architecture)
 ${approvedPlanText.trim()}
-
-If the approved plan chooses static HTML/CSS/JS (or similar), still return valid JSON but set tasks to those HTML/CSS/JS paths. Use a minimal contractFile (e.g. \`src/types/swarm-contract.ts\` exporting shared string constants or empty interfaces) only when needed for TS workers; for pure static sites, prefer task filePaths like \`index.html\`, \`styles.css\`, \`app.js\` and keep contractCode as a tiny valid TS module.
 `
     : '';
 
@@ -537,9 +644,9 @@ Workers may run on other GPUs; they still write into this Dev workspace. Install
 The workspace, installs, and terminal live on the Dev PC where LocalAgents Studio is open — not necessarily on the GPU that runs this pass. Plan file paths for that Dev workspace.
 `;
 
-  return `You are the Lead Architect (@coder) for LocalAgents Studio's Conductor Swarm.
-Your job is to decompose a multi-file coding request into a strict TypeScript contract BEFORE parallel GPU workers write the implementation files.
-When an APPROVED PLAN is present, honor the chosen stack and scope instead of inventing a different one.
+  return `You are the Lead Architect for LocalAgents Studio's Conductor Swarm.
+Decompose a multi-file coding request into a JSON manifest, then parallel GPU workers each write ONE file.
+When an APPROVED PLAN is present, honor the chosen stack and scope — never invent React/TypeScript for native C++/Win32 or static HTML.
 ${hostBlock}
 ### WORKSPACE CONTEXT
 Existing file tree:
@@ -550,23 +657,43 @@ ${existingSnippets || '(none loaded)'}
 
 ### WORK LOG
 ${workLog?.trim() || '(none yet)'}
-Do not assign a task that is already under Done. Do not ask the user a question listed under Already asked. Plan the Next step, then only the files that step still needs.
+Do not assign a task that is already under Done. Do not ask the user a question listed under Already asked.
 
 ### USER REQUEST
 ${userTask}
 ${planSection}
 ### OUTPUT REQUIREMENTS
-Respond ONLY with a valid JSON object matching this exact schema. Do NOT write implementation bodies.
-1. \`contractFile\`: Path where shared interfaces/types must be written (or updated). Prefer \`src/types/swarm-contract.ts\`.
-2. \`contractCode\`: Complete, valid TypeScript that typechecks alone. Prefer shared \`interface\`/\`type\`/\`enum\`. If the contract exports helpers, include minimal stub bodies (not ambient \`declare\`) so \`tsc --noEmit\` succeeds.
-3. \`tasks\`: Array of distinct files to implement in parallel. Each task MUST have a unique \`filePath\` (never the contract file, never duplicates).
-4. \`stack\`: one of "typescript", "static-web", "python", "go", "rust", "node". Use static-web for browser pages that should open without a build. Use typescript only when the user asked for React/TypeScript or the repo is already TypeScript.
-5. \`verifyCommand\`: one shell command to check the result, or null for typescript (tsc is run separately).
+Respond ONLY with a valid JSON object. Do NOT write full implementation bodies in the JSON.
+1. \`stack\`: one of "typescript", "static-web", "python", "go", "rust", "node", "native-win32".
+2. \`contractFile\` + \`contractCode\`:
+   - typescript: prefer \`src/types/swarm-contract.ts\` with real shared types that typecheck alone.
+   - static-web / python / go / rust / node / native-win32: prefer \`SWARM.md\` with SHORT shared notes (names, APIs, rules). Markdown is fine — not TypeScript unless the stack is typescript.
+3. \`tasks\`: 2–4 distinct \`filePath\`s (never the contract file). Each needs SHORT \`instructions\` (1–3 sentences: what THAT file must contain). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`.
+4. \`verifyCommand\`: one shell check, or null when typescript (tsc is run separately). For native-win32, prefer verifying \`build.bat\` exists and is a real batch file.
 
-Schema:
+Example (native Win32):
+{
+  "stack": "native-win32",
+  "contractFile": "SWARM.md",
+  "contractCode": "# Shared\\n8x8 checkers, Win32 UI\\n",
+  "tasks": [
+    {
+      "filePath": "Checkers.cpp",
+      "complexity": "high",
+      "preferredRole": "@coder",
+      "requiredExports": [],
+      "requiredImports": [],
+      "instructions": "Win32 GDI checkers game: window, board, moves, jumps, kings. Valid C++ only."
+    }
+  ],
+  "verifyCommand": null
+}
+
+Example (TypeScript):
 {
   "contractFile": "src/types/swarm-contract.ts",
   "contractCode": "export interface Example { id: string }\\n",
+  "stack": "typescript",
   "tasks": [
     {
       "filePath": "src/example.ts",
@@ -580,7 +707,7 @@ Schema:
 }
 
 Use complexity "high" | "medium" | "low" and preferredRole "@coder" | "@docs" | "@reviewer".
-Prefer 2–4 tasks. Output JSON only.`;
+Output JSON only.`;
 }
 
 export function buildContractRepairPrompt(
@@ -611,14 +738,17 @@ export function buildSwarmWorkerPrompt(opts: {
   userPrompt: string;
   /** Dev-host context (workspace/installs on Studio PC) */
   devHostSection?: string | null;
+  stack?: DeliveryStack;
 }): string {
   const { task, contractFile, contractCode, siblingSummary, currentFileContent, userPrompt } = opts;
+  const stack = opts.stack || 'typescript';
+  const tsMode = stack === 'typescript' && isTypeScriptContractPath(contractFile);
   const imports = task.requiredImports.length
     ? task.requiredImports.map(i => `- ${i}`).join('\n')
-    : '- (none specified — import shared types from the contract path as needed)';
+    : '- (none specified)';
   const exports = task.requiredExports.length
     ? task.requiredExports.map(e => `- ${e}`).join('\n')
-    : '- (export the public API described in the instructions)';
+    : '- (export what the instructions require)';
   const hostBlock = opts.devHostSection?.trim()
     ? `
 ### DEVELOPMENT HOST
@@ -630,24 +760,37 @@ You are a collaborative multimodal worker: generate code for the Dev workspace, 
 Workspace files, package installs, and run_command execute on the Dev PC (where Studio is open), not on your GPU host. You still fully collaborate — code, review context, and vision when images are provided — for that Dev workspace.
 `;
 
-  return `You are an autonomous GPU Worker in a distributed Conductor Swarm.
-You are assigned to implement ONE specific file: \`${task.filePath}\`.
-Other GPU nodes are simultaneously writing the sibling files.
-${hostBlock}
-### STRICT CONTRACT RULES (DO NOT VIOLATE)
-1. You MUST import shared types exactly as specified:
+  const contractBlock = tsMode
+    ? `### STRICT TYPESCRIPT CONTRACT
+1. Import shared types as specified:
 ${imports}
 
-2. Here is the exact read-only TypeScript contract (\`${contractFile}\`) already written to disk:
+2. Read-only contract (\`${contractFile}\`):
 \`\`\`typescript
 ${contractCode}
 \`\`\`
 
-3. Your file MUST export these exact signatures (do not rename parameters, return types, or export names):
+3. Export these signatures when listed:
 ${exports}
 
-4. Do NOT redefine interfaces/types that already exist in \`${contractFile}\`.
-5. Scope your output strictly to \`${task.filePath}\`.
+4. Do NOT redefine types from \`${contractFile}\`.
+5. Scope output strictly to \`${task.filePath}\`.`
+    : `### SHARED NOTES (\`${contractFile}\`) — read-only context, not a TypeScript mandate
+\`\`\`
+${contractCode}
+\`\`\`
+
+Write real contents for \`${task.filePath}\` only (${stack}).
+- If this is \`.bat\` / \`.cmd\`: real shell commands (\`@echo off\`, compile/link). NEVER paste plans or Intent Analysis.
+- If this is \`.h\` / \`.hpp\`: include guards and declarations only.
+- If this is \`.cpp\` / \`.c\` / \`.cs\` / \`.rc\`: valid source for that language.
+- Do not invent React/TypeScript unless this path is \`.ts\`/\`.tsx\`.`;
+
+  return `You are an autonomous GPU Worker in a distributed Conductor Swarm.
+You are assigned to implement ONE specific file: \`${task.filePath}\` (stack: ${stack}).
+Other GPU nodes write sibling files in parallel.
+${hostBlock}
+${contractBlock}
 
 ### SIBLING FILES (written in parallel)
 ${siblingSummary}
@@ -660,14 +803,14 @@ ${currentFileContent?.trim()
 ### TASK INSTRUCTIONS
 ${task.instructions}
 
-### OVERALL USER REQUEST
+### OVERALL REQUEST (brief — do not paste this into the file)
 ${userPrompt}
 
 Output the complete file using:
 <write_file path="${task.filePath}">
-...complete code...
+...complete source for this path only...
 </write_file>
-Do not omit code with placeholders.`;
+Never put Intent Analysis, option lists, or markdown plans inside the write_file body.`;
 }
 
 export function buildRepairWorkerPrompt(opts: {
