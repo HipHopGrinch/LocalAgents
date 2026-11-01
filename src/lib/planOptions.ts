@@ -99,21 +99,22 @@ Break the chosen option into **ordered steps**. Each step has concrete coder tas
 ### Rules
 1. 2–6 steps covering the whole chosen option (not a single mega-step).
 2. Each step: 1–6 tasks with clear file targets when possible.
-3. Do NOT write deliverable project files.
-4. End with exactly one machine-readable \`<execution_plan>\` block.
+3. **Dependency order:** put shared types / models / headers in earlier steps (or earlier tasks) than files that import them. Never put a consumer file in an earlier step than its dependency.
+4. Do NOT write deliverable project files.
+5. End with exactly one machine-readable \`<execution_plan>\` block.
 
 <execution_plan>
 <summary>One-line plan goal</summary>
 <step id="1" title="Core types and rules">
 <task id="1a" file="types.go" title="Define board types">Square and GameState matching the chosen approach.</task>
-<task id="1b" file="game_logic.go" title="Move generation">Legal moves, captures, promotions.</task>
+<task id="1b" file="game_logic.go" title="Move generation">Legal moves, captures, promotions — depends on types.go.</task>
 </step>
 <step id="2" title="UI wiring">
-<task id="2a" file="board_ui.go" title="Render board">Draw pieces and handle clicks.</task>
+<task id="2a" file="board_ui.go" title="Render board">Draw pieces and handle clicks — depends on types/logic from step 1.</task>
 </step>
 </execution_plan>
 
-Coders will implement one step at a time. Reviewer will Yay/Nay each step. Do not invent later product features outside the chosen option.`;
+Coders will implement one step at a time (Swarm also respects per-file dependsOn within a step). Reviewer will Yay/Nay each step. Do not invent later product features outside the chosen option.`;
 
 /** Reviewer protocol when verifying a Planner step (Yay/Nay only). */
 export const STEP_VERDICT_PROTOCOL = `## Reviewer step verdict (MANDATORY)

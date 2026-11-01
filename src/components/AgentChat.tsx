@@ -58,6 +58,7 @@ import {
   isTypeScriptContractPath,
   endpointQueueKey,
   parseSwarmManifest,
+  partitionSwarmTasksIntoWaves,
   queueAssignmentsByGpu,
   shouldRejectPlannerWrite,
   type SwarmAssignment,
@@ -98,7 +99,10 @@ import {
   estimateTokens,
   FREE_TIER_ASSIST_SYSTEM,
   bumpFreeTierUsage,
+  isRateLimitError,
   pickFreeTierAssist,
+  rateLimitBackoffMs,
+  waitForFreeTierRpm,
   pickPaidFrontier,
   tailForAssist,
   type FreeTierUsage
@@ -638,7 +642,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return (saved.count || 0) >= (local.count || 0) ? saved : local;
   };
 
-  /** One short frontier reply. Free-tier calls count against the daily cap. */
+  /** One short frontier reply. Free-tier calls pace to RPM and count against the daily cap. */
   const requestAssistBrief = async (
     target: { node: EndpointNode; model: string },
     purpose: string,
@@ -646,27 +650,81 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     countFreeTier: boolean
   ): Promise<string | null> => {
     if (stopRequestedRef.current) return null;
-    const handle = streamChat(
-      target.node.url,
-      withThink(
-        {
-          model: target.model,
-          messages: [
-            { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
-            { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
-          ],
-          options: { temperature: 0.1, num_predict: ASSIST_MAX_PREDICT }
-        },
-        target.node,
-        target.model
-      ),
-      () => {},
-      target.node.type,
-      target.node.apiKey
-    );
-    activeAbortsRef.current = [...activeAbortsRef.current, handle.abort];
-    const result = await handle.done;
+
+    const runOnce = async (): Promise<{ content: string; aborted: boolean; stats?: { evalCount?: number; promptEvalCount?: number }; error?: string }> => {
+      if (countFreeTier) {
+        const waited = await waitForFreeTierRpm(target.node, {
+          signal: stopRequestedRef.current ? { aborted: true } : undefined,
+          onWait: ms => {
+            setExecutingPlanNotice(
+              `Free-tier RPM limit — waiting ${Math.ceil(ms / 1000)}s before assist on ${target.node.name}…`
+            );
+          }
+        });
+        if (stopRequestedRef.current) return { content: '', aborted: true };
+        if (waited > 0) {
+          window.electronAPI?.writeLog?.(
+            'info',
+            `free-tier RPM wait ${waited}ms on ${target.node.name}`
+          );
+        }
+      }
+      const handle = streamChat(
+        target.node.url,
+        withThink(
+          {
+            model: target.model,
+            messages: [
+              { role: 'system', content: FREE_TIER_ASSIST_SYSTEM },
+              { role: 'user', content: `${purpose}\n\n${tailForAssist(payload)}` }
+            ],
+            options: { temperature: 0.1, num_predict: ASSIST_MAX_PREDICT }
+          },
+          target.node,
+          target.model
+        ),
+        () => {},
+        target.node.type,
+        target.node.apiKey
+      );
+      activeAbortsRef.current = [...activeAbortsRef.current, handle.abort];
+      try {
+        const result = await handle.done;
+        return {
+          content: result.content || '',
+          aborted: result.aborted,
+          stats: result.stats
+        };
+      } catch (err: any) {
+        return { content: '', aborted: false, error: err?.message || String(err) };
+      }
+    };
+
+    let result = await runOnce();
+    // If the stream layer still surfaces a rate-limit error, wait and retry once more.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (result.aborted || stopRequestedRef.current) return null;
+      if (!isRateLimitError(result.error) && result.content.trim()) break;
+      if (!isRateLimitError(result.error) && !result.error) break;
+      if (!isRateLimitError(result.error)) break;
+      const backoff = rateLimitBackoffMs(result.error, attempt);
+      setExecutingPlanNotice(
+        `Free-tier rate limit — waiting ${Math.ceil(backoff / 1000)}s then retrying assist…`
+      );
+      window.electronAPI?.writeLog?.(
+        'warn',
+        `free-tier rate limit retry in ${backoff}ms: ${result.error}`
+      );
+      await new Promise<void>(r => setTimeout(r, backoff));
+      if (stopRequestedRef.current) return null;
+      result = await runOnce();
+    }
+
     if (result.aborted || stopRequestedRef.current) return null;
+    if (result.error && !result.content.trim()) {
+      window.electronAPI?.writeLog?.('warn', `free-tier assist failed: ${result.error}`);
+      return null;
+    }
     const brief = (result.content || '').replace(/\s+/g, ' ').trim().slice(0, 1800);
     if (!brief) return null;
     if (countFreeTier) {
@@ -1564,8 +1622,17 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
-      // ── Pass 2: Fan Out Parallel File Workers ──
-      const assignments = assignSwarmTasksToCluster(manifest.tasks, nodes);
+      // ── Pass 2: Fan out by dependency waves (parallel within a wave) ──
+      const taskWaves = partitionSwarmTasksIntoWaves(manifest.tasks);
+      const assignments: SwarmAssignment[] = [];
+      const assignmentWaveIndex: number[] = [];
+      taskWaves.forEach((wave, wi) => {
+        const waveAssign = assignSwarmTasksToCluster(wave, nodes);
+        for (const a of waveAssign) {
+          assignments.push(a);
+          assignmentWaveIndex.push(wi);
+        }
+      });
       if (!assignments.length) {
         patchPipelineMsg({
           display: '⚠️ No worker assignments produced. Check Hardware Settings for online nodes.'
@@ -1573,16 +1640,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return;
       }
 
-      const gpuQueues = queueAssignmentsByGpu(assignments);
-      const queueHeadSteps = new Set(gpuQueues.map(queue => queue[0].stepIdx));
       const localCount = assignments.filter(a => !isFrontierNode(a.node)).length;
       const frontierCount = assignments.length - localCount;
-      const siblingSummary = assignments
-        .map(
-          a =>
-            `- ${a.task.filePath} (${a.task.complexity}${a.task.role ? `, ${a.task.role}` : ''}): ${a.task.instructions.slice(0, 120)}`
-        )
-        .join('\n');
+      const waveLabel =
+        taskWaves.length > 1
+          ? ` · ${taskWaves.length} dependency waves (foundation files first)`
+          : '';
 
       const initialSteps: PipelineStep[] = [
         {
@@ -1593,14 +1656,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           agentHandle: 'coder',
           role: `Lead Architect · contract${architect.usedFrontierBackup ? ' (frontier)' : ' (local)'}`,
           status: 'completed',
-          content: `Locked shared contract (${manifest.tasks.length} tasks)`,
+          content: `Locked shared contract (${manifest.tasks.length} tasks${waveLabel})`,
           toolCalls: []
         },
         ...assignments.map(({ task, node, model, skippedReason }, i) => {
-          const stepIdx = i + 1;
           const offline = !!(skippedReason && !node.online);
-          const isHead = queueHeadSteps.has(stepIdx);
-          const status: PipelineStep['status'] = offline ? 'failed' : isHead ? 'running' : 'pending';
+          const wave = assignmentWaveIndex[i] ?? 0;
+          const deps =
+            task.dependsOn && task.dependsOn.length
+              ? ` after ${task.dependsOn.join(', ')}`
+              : '';
           return {
             nodeId: node.id,
             nodeName: `${node.name} → ${task.filePath}`,
@@ -1610,12 +1675,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             role: `${task.role || task.preferredRole} · ${model}${
               isFrontierNode(node) ? ' (frontier)' : ' (local)'
             }${skippedReason ? ` — ${skippedReason}` : ''}`,
-            status,
+            status: (offline ? 'failed' : 'pending') as PipelineStep['status'],
             content: offline
               ? `Skipped: ${skippedReason}`
-              : isHead
-                ? `Generating ${task.filePath} on ${node.name} using ${model}…`
-                : `Queued on ${node.name} — one model at a time (${model})`,
+              : `Wave ${wave + 1}/${taskWaves.length}${deps} — waiting…`,
             toolCalls: [] as PipelineStep['toolCalls']
           };
         })
@@ -1624,56 +1687,125 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       patchPipelineMsg({
         display:
           frontierCount > 0 && localCount === 0
-            ? `⚡ Pass 2 — dispatched ${assignments.length} files via frontier backup (contract locked):`
-            : `⚡ Pass 2 — ${assignments.length} files across ${gpuQueues.length} GPU${
-                gpuQueues.length === 1 ? '' : 's'
-              } (${localCount} local worker${localCount === 1 ? '' : 's'}${
-                frontierCount ? ` + ${frontierCount} frontier` : ''
-              }). Each machine runs one file at a time:`,
+            ? `⚡ Pass 2 — ${assignments.length} files via frontier (contract locked)${waveLabel}:`
+            : `⚡ Pass 2 — ${assignments.length} files in ${taskWaves.length} wave${
+                taskWaves.length === 1 ? '' : 's'
+              } (${localCount} local${frontierCount ? ` + ${frontierCount} frontier` : ''}). Same-wave files may run in parallel; later waves wait for dependencies:`,
         pipelineSteps: initialSteps
       });
 
-      await Promise.allSettled(
-        gpuQueues.map(async queue => {
-          for (let n = 0; n < queue.length; n++) {
-            const { assignment, stepIdx } = queue[n];
-            if (n > 0) {
-              patchPipelineMsg(m => {
-                if (!m.pipelineSteps?.[stepIdx]) return m;
-                const updatedSteps = [...m.pipelineSteps];
-                updatedSteps[stepIdx] = {
-                  ...updatedSteps[stepIdx],
-                  status: 'running',
-                  modelName: assignment.model,
-                  content: `Generating ${assignment.task.filePath} on ${assignment.node.name} using ${assignment.model}…`
-                };
-                return { ...m, pipelineSteps: updatedSteps };
+      const completedPaths: string[] = [];
+      let flatOffset = 0;
+      for (let wi = 0; wi < taskWaves.length; wi++) {
+        const waveAssign = assignments.slice(flatOffset, flatOffset + taskWaves[wi].length);
+        flatOffset += taskWaves[wi].length;
+        const waveItems = waveAssign.map((assignment, j) => {
+          // pipelineSteps[0] is contract; worker steps are 1..n in assignment order
+          const stepIdx = assignments.indexOf(assignment) + 1;
+          return { assignment, stepIdx, j };
+        });
+
+        const priorSnippets: string[] = [];
+        for (const p of completedPaths.slice(-8)) {
+          const body = await readWorkspaceRel(p);
+          if (body != null) {
+            priorSnippets.push(
+              `### ${p} (already written)\n\`\`\`\n${body.slice(0, 3500)}\n\`\`\``
+            );
+          }
+        }
+        const planSibling = waveAssign
+          .map(
+            a =>
+              `- ${a.task.filePath} (wave ${wi + 1}${
+                a.task.dependsOn?.length ? `, needs ${a.task.dependsOn.join(', ')}` : ''
+              }): ${a.task.instructions.slice(0, 120)}`
+          )
+          .join('\n');
+        const siblingSummary = [
+          priorSnippets.length
+            ? `## Already written (do not rewrite)\n${priorSnippets.join('\n\n')}`
+            : '',
+          `## This wave\n${planSibling}`
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+
+        for (const { assignment, stepIdx } of waveItems) {
+          patchPipelineMsg(m => {
+            if (!m.pipelineSteps?.[stepIdx]) return m;
+            const updatedSteps = [...m.pipelineSteps];
+            updatedSteps[stepIdx] = {
+              ...updatedSteps[stepIdx],
+              status: assignment.skippedReason && !assignment.node.online ? 'failed' : 'running',
+              modelName: assignment.model,
+              content: `Wave ${wi + 1}: generating ${assignment.task.filePath} on ${assignment.node.name}…`
+            };
+            return { ...m, pipelineSteps: updatedSteps };
+          });
+        }
+
+        // Parallel across GPUs within the wave; serialize per GPU URL.
+        const gpuQueues = queueAssignmentsByGpu(waveAssign);
+        // Fix stepIdx on work items to match global pipeline indices
+        const queuesWithIdx = gpuQueues.map(queue =>
+          queue.map(item => {
+            const globalIdx = assignments.findIndex(
+              a => a.task.filePath === item.assignment.task.filePath && a.node.id === item.assignment.node.id
+            );
+            return {
+              assignment: item.assignment,
+              stepIdx: globalIdx >= 0 ? globalIdx + 1 : item.stepIdx
+            };
+          })
+        );
+
+        await Promise.allSettled(
+          queuesWithIdx.map(async queue => {
+            for (let n = 0; n < queue.length; n++) {
+              const { assignment, stepIdx } = queue[n];
+              if (n > 0) {
+                patchPipelineMsg(m => {
+                  if (!m.pipelineSteps?.[stepIdx]) return m;
+                  const updatedSteps = [...m.pipelineSteps];
+                  updatedSteps[stepIdx] = {
+                    ...updatedSteps[stepIdx],
+                    status: 'running',
+                    modelName: assignment.model,
+                    content: `Wave ${wi + 1}: generating ${assignment.task.filePath} on ${assignment.node.name}…`
+                  };
+                  return { ...m, pipelineSteps: updatedSteps };
+                });
+              }
+              const current = await readWorkspaceRel(assignment.task.filePath);
+              const workerLog = progressForPrompt();
+              const workerOverall = lockedPlan
+                ? formatApprovedPlanBrief(lockedPlan)
+                : userText;
+              const workerPrompt = `${buildSwarmWorkerPrompt({
+                task: assignment.task,
+                contractFile: manifest.contractFile,
+                contractCode: manifest.contractCode,
+                siblingSummary,
+                currentFileContent: current,
+                userPrompt: workerOverall,
+                stack: manifest.stack,
+                devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
+              })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
+              await runWorkerTurn({
+                idx: stepIdx,
+                assignment,
+                userPrompt: workerPrompt,
+                expectedFilePath: assignment.task.filePath
               });
             }
-            const current = await readWorkspaceRel(assignment.task.filePath);
-            const workerLog = progressForPrompt();
-            const workerOverall = lockedPlan
-              ? formatApprovedPlanBrief(lockedPlan)
-              : userText;
-            const workerPrompt = `${buildSwarmWorkerPrompt({
-              task: assignment.task,
-              contractFile: manifest.contractFile,
-              contractCode: manifest.contractCode,
-              siblingSummary,
-              currentFileContent: current,
-              userPrompt: workerOverall,
-              stack: manifest.stack,
-              devHostSection: buildDevHostPromptSection(nodes, assignment.node.id)
-            })}${workerLog ? `\n\nWork log (do not redo Done steps or re-ask Already asked):\n${workerLog}` : ''}`;
-            await runWorkerTurn({
-              idx: stepIdx,
-              assignment,
-              userPrompt: workerPrompt,
-              expectedFilePath: assignment.task.filePath
-            });
-          }
-        })
-      );
+          })
+        );
+
+        for (const a of waveAssign) {
+          completedPaths.push(a.task.filePath);
+        }
+      }
 
       // ── Stage 4: Verify (tsc only for TypeScript stacks) ──
       if (manifest.stack !== 'typescript' && manifest.verifyCommand) {

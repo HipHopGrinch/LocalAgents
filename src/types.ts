@@ -113,6 +113,8 @@ export interface NodeConfig {
   freeTier?: boolean;
   /** Assist calls allowed per local day. Default 20. */
   freeTierDailyCap?: number;
+  /** Max free-tier requests per rolling minute. Default 10. Studio waits when the limit is hit. */
+  freeTierRpm?: number;
   /** Calls already made on the local calendar day. */
   freeTierUsage?: { day: string; count: number };
 }

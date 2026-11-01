@@ -29,6 +29,11 @@ export interface SwarmTask {
   instructions: string;
   /** Display role label for UI */
   role?: string;
+  /**
+   * Other task filePaths that must finish before this one starts.
+   * Empty/omitted = can run in the first wave (after the shared contract).
+   */
+  dependsOn?: string[];
 }
 
 export interface SwarmManifest {
@@ -266,6 +271,16 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
                 : 'medium';
         const preferredRole: SwarmPreferredRole =
           t.preferredRole === '@docs' || t.preferredRole === '@reviewer' ? t.preferredRole : '@coder';
+        const dependsOn = Array.isArray(t.dependsOn)
+          ? t.dependsOn
+              .map((d: unknown) =>
+                String(d || '')
+                  .trim()
+                  .replace(/^[\\/]+/, '')
+                  .replace(/\.\.[\\/]+/g, '')
+              )
+              .filter(Boolean)
+          : [];
         return {
           filePath,
           complexity,
@@ -276,6 +291,7 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
           requiredImports: Array.isArray(t.requiredImports)
             ? t.requiredImports.map(String)
             : [],
+          dependsOn,
           instructions: sanitizeTaskInstructions(
             String(t.instructions || '').trim(),
             filePath,
@@ -293,8 +309,9 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
       })
       .slice(0, 6);
 
-    if (!tasks.length) return null;
-    const fromFiles = stackFromFilePaths(tasks.map(t => t.filePath));
+    const tasksFinal = inferTaskDependsOn(tasks);
+    if (!tasksFinal.length) return null;
+    const fromFiles = stackFromFilePaths(tasksFinal.map(t => t.filePath));
     const declared = isDeliveryStack(String(parsed.stack || '')) ? (parsed.stack as DeliveryStack) : null;
     // Prefer file paths over a mistaken "typescript" declaration when sources are native.
     const stack =
@@ -306,10 +323,106 @@ export function parseSwarmManifest(raw: string, userTask: string): SwarmManifest
       typeof parsed.verifyCommand === 'string' && parsed.verifyCommand.trim()
         ? String(parsed.verifyCommand).trim()
         : verifyCommandForStack(stack);
-    return { contractFile, contractCode, tasks, stack, verifyCommand };
+    return { contractFile, contractCode, tasks: tasksFinal, stack, verifyCommand };
   } catch {
     return null;
   }
+}
+
+function normPathKey(p: string): string {
+  return (p || '').replace(/\\/g, '/').trim().toLowerCase();
+}
+
+function basenameNoExt(p: string): string {
+  const base = (p || '').replace(/\\/g, '/').split('/').pop() || '';
+  return base.replace(/\.[^.]+$/, '').toLowerCase();
+}
+
+/**
+ * Fill missing dependsOn from requiredImports that clearly name another task file,
+ * and drop dependsOn entries that are not sibling tasks (or self).
+ */
+export function inferTaskDependsOn(tasks: SwarmTask[]): SwarmTask[] {
+  const byKey = new Map(tasks.map(t => [normPathKey(t.filePath), t.filePath]));
+  const byBase = new Map<string, string>();
+  for (const t of tasks) {
+    const b = basenameNoExt(t.filePath);
+    if (b && !byBase.has(b)) byBase.set(b, t.filePath);
+  }
+
+  return tasks.map(task => {
+    const selfKey = normPathKey(task.filePath);
+    const declared = [...(task.dependsOn || [])];
+    for (const imp of task.requiredImports || []) {
+      // from './foo' | from "../bar/baz" | "internal/models/game"
+      const m =
+        imp.match(/from\s+['"]([^'"]+)['"]/i) ||
+        imp.match(/#include\s*[<"]([^>"]+)[>"]/i) ||
+        imp.match(/['"]([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)['"]/);
+      const raw = (m?.[1] || '').replace(/\\/g, '/');
+      if (!raw) continue;
+      const candidates = [
+        raw,
+        raw.replace(/^\.\//, ''),
+        `${raw}.ts`,
+        `${raw}.tsx`,
+        `${raw}.go`,
+        `${raw}.js`
+      ];
+      for (const c of candidates) {
+        const hit = byKey.get(normPathKey(c)) || byBase.get(basenameNoExt(c));
+        if (hit && normPathKey(hit) !== selfKey) declared.push(hit);
+      }
+    }
+    const uniq: string[] = [];
+    const seen = new Set<string>();
+    for (const d of declared) {
+      const key = normPathKey(d);
+      if (!key || key === selfKey || seen.has(key)) continue;
+      const resolved = byKey.get(key);
+      if (!resolved) continue; // only deps that are other tasks in this swarm
+      seen.add(key);
+      uniq.push(resolved);
+    }
+    return { ...task, dependsOn: uniq };
+  });
+}
+
+/**
+ * Partition tasks into sequential waves. Within a wave, files may run in parallel.
+ * Cycles / unsatisfiable deps fall into the last wave in listed order (best-effort).
+ */
+export function partitionSwarmTasksIntoWaves(tasks: SwarmTask[]): SwarmTask[][] {
+  if (!tasks.length) return [];
+  const remaining = new Map(tasks.map(t => [normPathKey(t.filePath), t]));
+  const done = new Set<string>();
+  const waves: SwarmTask[][] = [];
+  const maxWaves = tasks.length + 2;
+
+  while (remaining.size > 0 && waves.length < maxWaves) {
+    const ready: SwarmTask[] = [];
+    for (const task of remaining.values()) {
+      const deps = task.dependsOn || [];
+      const ok = deps.every(d => done.has(normPathKey(d)));
+      if (ok) ready.push(task);
+    }
+    if (!ready.length) {
+      // Cycle or bad deps — flush rest as one final wave to avoid deadlock
+      waves.push([...remaining.values()]);
+      break;
+    }
+    // Heavier files first within a wave (same as prior assigner preference)
+    ready.sort(
+      (a, b) => COMPLEXITY_WEIGHT[b.complexity] - COMPLEXITY_WEIGHT[a.complexity]
+    );
+    waves.push(ready);
+    for (const t of ready) {
+      const key = normPathKey(t.filePath);
+      remaining.delete(key);
+      done.add(key);
+    }
+  }
+  return waves;
 }
 
 /** Deterministic fallback when Pass 1 JSON fails — still produces a usable contract. */
@@ -330,6 +443,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
+          dependsOn: [],
           instructions: `C/C++ header: board state, piece types, move APIs, and window proc declarations for a Win32 checkers game (${brief}). Real #ifndef guards and prototypes only — no markdown.`,
           role: 'Headers'
         },
@@ -339,6 +453,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
+          dependsOn: [],
           instructions: `Win32 resource IDs only (#define IDC_*, IDM_*, IDI_*). No planner prose.`,
           role: 'Resources'
         },
@@ -348,6 +463,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
+          dependsOn: ['Checkers.h'],
           instructions: `Complete Win32 + GDI checkers implementation: window, board draw, clicks, turns, jumps, kings (${brief}). Valid C++ only.`,
           role: 'Main'
         },
@@ -357,6 +473,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
+          dependsOn: ['Resource.h'],
           instructions: `Valid .rc script including Resource.h (menu/icon/dialog stubs as needed).`,
           role: 'RC'
         },
@@ -366,6 +483,7 @@ export function fallbackSwarmManifest(userTask: string): SwarmManifest {
           preferredRole: '@coder',
           requiredExports: [],
           requiredImports: [],
+          dependsOn: ['Checkers.cpp', 'Checkers.rc'],
           instructions: `@echo off batch that compiles Checkers.cpp / Checkers.rc with cl.exe or g++ into Checkers.exe. Real commands only — never paste a plan.`,
           role: 'Build'
         }
@@ -646,7 +764,7 @@ The workspace, installs, and terminal live on the Dev PC where LocalAgents Studi
 `;
 
   return `You are the Lead Architect for LocalAgents Studio's Conductor Swarm.
-Decompose a multi-file coding request into a JSON manifest, then parallel GPU workers each write ONE file.
+Decompose a multi-file coding request into a JSON manifest. The shared contract is written first; then workers write ONE file each — **in dependency order** (waves). Independent files in the same wave may run in parallel.
 When an APPROVED PLAN is present, honor the chosen stack and scope — never invent React/TypeScript for native C++/Win32 or static HTML.
 ${hostBlock}
 ### WORKSPACE CONTEXT
@@ -669,8 +787,9 @@ Respond ONLY with a valid JSON object. Do NOT write full implementation bodies i
 2. \`contractFile\` + \`contractCode\`:
    - typescript: prefer \`src/types/swarm-contract.ts\` with real shared types that typecheck alone.
    - static-web / python / go / rust / node / native-win32: prefer \`SWARM.md\` with SHORT shared notes (names, APIs, rules). Markdown is fine — not TypeScript unless the stack is typescript.
-3. \`tasks\`: 2–4 distinct \`filePath\`s (never the contract file). Each needs SHORT \`instructions\` (1–3 sentences: what THAT file must contain). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`.
-4. \`verifyCommand\`: one shell check, or null when typescript (tsc is run separately). For native-win32, prefer verifying \`build.bat\` exists and is a real batch file.
+3. \`tasks\`: 2–4 distinct \`filePath\`s (never the contract file). List foundation files **before** files that import them. Each needs SHORT \`instructions\` (1–3 sentences). Never paste Intent Analysis, option lists, or the approved-plan essay into \`instructions\` or \`contractCode\`.
+4. \`dependsOn\` (REQUIRED when a file imports/uses another task file): array of those \`filePath\` strings. Example: logic that imports models → \`"dependsOn": ["internal/models/game.go"]\`. Omit or \`[]\` only when the file truly needs nothing else from this task list (contract is always written first).
+5. \`verifyCommand\`: one shell check, or null when typescript (tsc is run separately). For native-win32, prefer verifying \`build.bat\` exists and is a real batch file.
 
 Example (native Win32):
 {
@@ -679,12 +798,22 @@ Example (native Win32):
   "contractCode": "# Shared\\n8x8 checkers, Win32 UI\\n",
   "tasks": [
     {
+      "filePath": "Checkers.h",
+      "complexity": "medium",
+      "preferredRole": "@coder",
+      "requiredExports": [],
+      "requiredImports": [],
+      "dependsOn": [],
+      "instructions": "Header: board state, piece types, move APIs."
+    },
+    {
       "filePath": "Checkers.cpp",
       "complexity": "high",
       "preferredRole": "@coder",
       "requiredExports": [],
-      "requiredImports": [],
-      "instructions": "Win32 GDI checkers game: window, board, moves, jumps, kings. Valid C++ only."
+      "requiredImports": ["#include \\"Checkers.h\\""],
+      "dependsOn": ["Checkers.h"],
+      "instructions": "Win32 GDI checkers implementation using Checkers.h. Valid C++ only."
     }
   ],
   "verifyCommand": null
@@ -702,6 +831,7 @@ Example (TypeScript):
       "preferredRole": "@coder",
       "requiredExports": ["export function run(): void"],
       "requiredImports": ["import type { Example } from './types/swarm-contract';"],
+      "dependsOn": [],
       "instructions": "Implement run() using the shared contract."
     }
   ]
@@ -787,13 +917,19 @@ Write real contents for \`${task.filePath}\` only (${stack}).
 - If this is \`.cpp\` / \`.c\` / \`.cs\` / \`.rc\`: valid source for that language.
 - Do not invent React/TypeScript unless this path is \`.ts\`/\`.tsx\`.`;
 
+  const depNote =
+    task.dependsOn && task.dependsOn.length
+      ? `\nPrerequisite files already written (do not recreate them): ${task.dependsOn.join(', ')}.`
+      : '';
+
   return `You are an autonomous GPU Worker in a distributed Conductor Swarm.
 You are assigned to implement ONE specific file: \`${task.filePath}\` (stack: ${stack}).
-Other GPU nodes write sibling files in parallel.
+Independent siblings may run in parallel; files you depend on are already on disk.
+${depNote}
 ${hostBlock}
 ${contractBlock}
 
-### SIBLING FILES (written in parallel)
+### SIBLING / PREREQUISITE CONTEXT
 ${siblingSummary}
 
 ### CURRENT FILE CONTENT

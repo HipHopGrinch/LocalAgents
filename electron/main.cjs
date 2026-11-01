@@ -360,6 +360,9 @@ function stripNodeForExport(n) {
   if (typeof n.freeTierDailyCap === 'number' && n.freeTierDailyCap >= 1) {
     cfg.freeTierDailyCap = Math.min(500, Math.floor(n.freeTierDailyCap));
   }
+  if (typeof n.freeTierRpm === 'number' && n.freeTierRpm >= 1) {
+    cfg.freeTierRpm = Math.min(60, Math.floor(n.freeTierRpm));
+  }
   return cfg;
 }
 
@@ -1417,20 +1420,59 @@ async function streamOpenAI(requestId, url, apiKey, body, channel) {
     let payload = { ...body };
     let resp = await postCompletion(payload);
 
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
+    const readErrorMessage = async response => {
+      const text = await response.text().catch(() => '');
       let msg = text;
       try { msg = JSON.parse(text).error?.message || text; } catch {}
-      const capRejected = payload.max_tokens && /max_tokens|max_output_tokens|max_completion_tokens|output token|maximum tokens/i.test(String(msg));
-      if (!capRejected) throw new Error(`HTTP ${resp.status}: ${msg}`);
-      delete payload.max_tokens;
-      resp = await postCompletion(payload);
-      if (!resp.ok) {
-        const text2 = await resp.text().catch(() => '');
-        let msg2 = text2;
-        try { msg2 = JSON.parse(text2).error?.message || text2; } catch {}
-        throw new Error(`HTTP ${resp.status}: ${msg2}`);
+      return String(msg || text || response.statusText || '');
+    };
+
+    const isRateLimited = (status, msg) => {
+      if (status === 429) return true;
+      return /rate[- ]?limit|quota|resource.?exhausted|too many requests|rpm\b|requests per minute/i.test(
+        String(msg || '')
+      );
+    };
+
+    const retryAfterMs = (response, msg, attempt) => {
+      const header = response.headers?.get?.('retry-after');
+      if (header && /^\d+(\.\d+)?$/.test(header.trim())) {
+        return Math.min(120000, Math.max(1000, Math.ceil(Number(header) * 1000)));
       }
+      const m = String(msg || '').match(/retry-after[=:\s]+(\d+)/i)
+        || String(msg || '').match(/try again in\s+(\d+(?:\.\d+)?)\s*s/i);
+      if (m) return Math.min(120000, Math.max(1000, Math.ceil(Number(m[1]) * 1000)));
+      return Math.min(90000, 15000 * Math.pow(2, Math.max(0, attempt)));
+    };
+
+    // Rate-limit / max_tokens recovery before streaming.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (resp.ok) break;
+      const msg = await readErrorMessage(resp);
+      const capRejected =
+        payload.max_tokens &&
+        /max_tokens|max_output_tokens|max_completion_tokens|output token|maximum tokens/i.test(msg);
+      if (capRejected) {
+        delete payload.max_tokens;
+        resp = await postCompletion(payload);
+        continue;
+      }
+      if (isRateLimited(resp.status, msg) && attempt < 3) {
+        const waitMs = retryAfterMs(resp, msg, attempt);
+        appendLog(
+          'warn',
+          `frontier rate limit HTTP ${resp.status}; waiting ${Math.round(waitMs / 1000)}s then retry ${attempt + 1}/3`
+        );
+        await new Promise(r => setTimeout(r, waitMs));
+        if (controller.signal.aborted) throw new Error('Aborted');
+        resp = await postCompletion(payload);
+        continue;
+      }
+      throw new Error(`HTTP ${resp.status}: ${msg}`);
+    }
+    if (!resp.ok) {
+      const msg = await readErrorMessage(resp);
+      throw new Error(`HTTP ${resp.status}: ${msg}`);
     }
 
     const reader = resp.body.getReader();
