@@ -35,6 +35,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readLogTail: () => ipcRenderer.invoke('logs:readTail'),
   logsPath: () => ipcRenderer.invoke('logs:path'),
   openLogsFolder: () => ipcRenderer.invoke('logs:openFolder'),
+  /** Prefill a GitHub issue + save a redacted report file under the logs folder. */
+  reportLogsToGitHub: opts => ipcRenderer.invoke('logs:reportToGitHub', opts || {}),
   exportNodes: (nodes, passphrase) => ipcRenderer.invoke('settings:exportNodes', { nodes, passphrase }),
   importNodes: passphrase => ipcRenderer.invoke('settings:importNodes', { passphrase }),
 

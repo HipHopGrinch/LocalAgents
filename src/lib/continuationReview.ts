@@ -3,8 +3,9 @@ import { MODEL_CATALOG } from '../config/modelCatalog';
 import { DEFAULT_MODEL_NUM_CTX, resolveModelNumCtx } from './contextSize';
 import { parsePlanOptions } from './planOptions';
 import { normTag, parseParams } from './recommender';
-import { getEnabledModelsForNode, isFrontierNode } from './tools';
+import { getEnabledModelsForNode, isFrontierNode, nodeAllowsRole } from './tools';
 import { isDurableStep, isInspectionOnly } from './workLog';
+import type { NodeRole } from '../types';
 
 /** Extra coding steps the app may run without asking. Then it stops and shows choices. */
 export const MAX_AUTO_CONTINUATIONS = 4;
@@ -19,23 +20,16 @@ export interface NextStepDecision {
   options: PlanOption[];
 }
 
-export const CONTINUATION_REVIEW_SYSTEM = `You check a coding step that just finished. You may patch bugs in the files that were just written, then decide whether the app should keep implementing, or stop and ask the user.
+export const CONTINUATION_REVIEW_SYSTEM = `You decide the next coding step after work just finished. You do NOT patch files yourself — Coder applies changes from Planner contracts. Reviewer findings go to Planner, not to you as edits.
 
-You may use these tools:
+You may use these tools for inspection only:
 <list_dir path="."/>
 <read_file path="relative/path"/>
 <search query="text"/>
-<edit_file path="relative/path">
-<<<<<<< SEARCH
-exact existing lines
-=======
-replacement lines
->>>>>>> REPLACE
-</edit_file>
 
-Use <edit_file> only for a bug in work that just landed (broken controls, a script that does not load, a rule the page does not implement). Do not start a new feature. Do not rewrite a whole file when a search/replace will do.
+Do NOT use <write_file> or <edit_file>. Do not Apply changes. After at most one round of reads, emit exactly one <next_step> block.
 
-Reading is a tool inside this turn, never a <task>. Do not set <task> to "Read …", "Verify …", "Examine …", or "Check …". A <task> must change a file or run a command (fix, edit, wire, implement). If the user reported a bug, the <task> must fix that bug. After any reads, emit <edit_file> patches when needed, then exactly one <next_step> block.
+Reading is a tool inside this turn, never a <task>. Do not set <task> to "Read …", "Verify …", "Examine …", or "Check …". A <task> must name a file and a concrete change for Coder (fix, edit, wire, implement).
 
 <next_step>
 <decision>continue</decision>
@@ -72,8 +66,8 @@ Rules:
 - ask only when two real directions remain and picking the wrong one would waste work.
 - done when the chosen scope is in place. Still offer 2–3 optional next steps in <plan_options>.
 - Prefer continue over ask. Automate anything that does not need a product decision.
-- If an edit_file patch already fixes the bug, use done. Use continue only for work you did not just patch.
 - The work log is the source of truth. Never continue or ask a step listed under Done or Already asked.
+- Prefer one concrete Coder task over another inspection pass.
 - If Bug is set, that bug is the priority until a related file is edited or written.
 - If Next is set and durable, that is the step to run. Do not invent a different question.
 - If the latest turn already tried Next, say what is still missing in one sentence. Do not ask the same question again.
@@ -97,10 +91,16 @@ export interface ReviewTarget {
 /**
  * Strongest enabled local model for the after-step check.
  * Order: parameter size, then that model's num_ctx, then VRAM.
- * The node that just wrote may win. Frontier is only the pool when no local worker is online.
+ * Only nodes that allow `role` (default reviewer) are considered — Allowed Roles is hard.
+ * Frontier is only the pool when no local worker is online.
  */
-export function pickCapableReviewTarget(nodes: EndpointNode[]): ReviewTarget | undefined {
-  const usable = nodes.filter(n => n.online && getEnabledModelsForNode(n).length > 0);
+export function pickCapableReviewTarget(
+  nodes: EndpointNode[],
+  role: NodeRole = 'reviewer'
+): ReviewTarget | undefined {
+  const usable = nodes.filter(
+    n => n.online && getEnabledModelsForNode(n).length > 0 && nodeAllowsRole(n, role)
+  );
   const local = usable.filter(n => !isFrontierNode(n));
   const pool = local.length > 0 ? local : usable;
   let best: ReviewTarget | undefined;
@@ -127,8 +127,17 @@ export function pickCapableReviewTarget(nodes: EndpointNode[]): ReviewTarget | u
 }
 
 /** Largest enabled local model, then the card with the most VRAM. Used when a step is repeating. */
-export function pickLargestLocalTarget(nodes: EndpointNode[]): ReviewTarget | undefined {
-  const pool = nodes.filter(n => n.online && !isFrontierNode(n) && getEnabledModelsForNode(n).length > 0);
+export function pickLargestLocalTarget(
+  nodes: EndpointNode[],
+  role: NodeRole = 'coder'
+): ReviewTarget | undefined {
+  const pool = nodes.filter(
+    n =>
+      n.online &&
+      !isFrontierNode(n) &&
+      getEnabledModelsForNode(n).length > 0 &&
+      nodeAllowsRole(n, role)
+  );
   let best: ReviewTarget | undefined;
   let bestSize = -1;
   let bestVram = -1;
@@ -204,6 +213,58 @@ export function collectWrittenPaths(
   return paths;
 }
 
+/**
+ * Load recently touched files into the prompt so Reviewer/Planner do not need
+ * to spam read_file for content the Studio already has on disk.
+ */
+export async function buildTouchedFilesContext(
+  workspacePath: string | undefined,
+  paths: string[],
+  opts?: { maxFiles?: number; maxCharsPerFile?: number; maxTotalChars?: number }
+): Promise<string> {
+  if (!workspacePath || !paths.length || !window.electronAPI?.readFile) return '';
+  const maxFiles = opts?.maxFiles ?? 8;
+  const maxCharsPerFile = opts?.maxCharsPerFile ?? 6000;
+  const maxTotalChars = opts?.maxTotalChars ?? 24000;
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const p = (raw || '').replace(/\\/g, '/').trim();
+    if (!p) continue;
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(p);
+    if (unique.length >= maxFiles) break;
+  }
+  const chunks: string[] = [];
+  let total = 0;
+  for (const rel of unique) {
+    if (total >= maxTotalChars) break;
+    try {
+      const isAbs = /^[a-zA-Z]:[\\/]/.test(rel) || rel.startsWith('/');
+      const root = workspacePath.replace(/[\\/]+$/, '');
+      const abs = isAbs ? rel : `${root}/${rel}`;
+      const res = (await window.electronAPI.readFile(abs)) as {
+        content?: string;
+        error?: string;
+      };
+      if (!res?.content || res.error) continue;
+      const room = Math.min(maxCharsPerFile, maxTotalChars - total);
+      const body =
+        res.content.length > room
+          ? `${res.content.slice(0, room)}\n…(truncated)`
+          : res.content;
+      chunks.push(`### ${rel}\n\`\`\`\n${body}\n\`\`\``);
+      total += body.length;
+    } catch {
+      /* ignore missing files */
+    }
+  }
+  if (!chunks.length) return '';
+  return `## Files already on disk (do NOT re-read these with read_file unless you need a different path)\n${chunks.join('\n\n')}`;
+}
+
 function innerTag(block: string, name: string): string {
   const m = block.match(new RegExp(`<${name}>\\s*([\\s\\S]*?)\\s*</${name}>`, 'i'));
   return (m?.[1] || '').trim();
@@ -259,8 +320,8 @@ export function filterInspectionContinue(
       : [
           {
             id: '1',
-            title: 'Keep fixing',
-            description: fallback || 'Apply a concrete file fix for the reported bug.'
+            title: 'Apply a concrete file fix',
+            description: fallback || 'Edit or write a specific file to fix the reported bug.'
           }
         ]
   };

@@ -8,6 +8,8 @@ import {
   OpenTab,
   PipelineStep,
   ChatConversation,
+  ExecutionQueue,
+  PlannerPlan,
   PlanOption,
   WorkspaceFile
 } from '../types';
@@ -65,19 +67,27 @@ import {
   MAX_COMMAND_FIX_ATTEMPTS,
   autoApplyWritableTools,
   buildContinuationUserPrompt,
+  collapseDuplicateReadTools,
   collectFeedbackTools,
   executeTool,
   failedCommandSignatures,
   historyForModel,
+  isEmptyTerminalResult,
+  isReadOnlyToolBatch,
+  latestTerminalResult,
   runCommandTools,
   runAuxTools,
   runReadOnlyTools,
   shouldContinueFromTools,
+  terminalResultFingerprint,
   toolContinuationLimit
 } from '../lib/agentLoop';
 import { streamChat } from '../lib/ollamaClient';
 import { ToolActionCard } from './agent/ToolActionCard';
 import { PlanOptionsCard } from './agent/PlanOptionsCard';
+import { ReviewPlanCard } from './agent/ReviewPlanCard';
+import { PlannerPlanPanel } from './agent/PlannerPlanPanel';
+import { StepVerdictCard } from './agent/StepVerdictCard';
 import { HelpTip } from './agent/HelpTip';
 import { ActivityIndicator, streamingActivityLabel } from './agent/ActivityIndicator';
 import { modelSupportsThinking, resolveThinkOption, thinkingToggleLabel } from '../lib/thinking';
@@ -90,11 +100,17 @@ import {
   bumpFreeTierUsage,
   pickFreeTierAssist,
   pickPaidFrontier,
-  reviewNeedsAssist,
   tailForAssist,
   type FreeTierUsage
 } from '../lib/freeTierAssist';
-import { isRepeatStop, nextStuckStage, stuckKey, type StuckStage } from '../lib/stuckEscalation';
+import {
+  isRepeatStop,
+  nextStuckStage,
+  resolveStuckStage,
+  stripKeepFixingPrefix,
+  stuckKey,
+  type StuckStage
+} from '../lib/stuckEscalation';
 import { compactMessages, historyTokens, shouldCompact } from '../lib/compactChat';
 import {
   advanceNext,
@@ -118,12 +134,51 @@ import {
   formatApprovedPlanBrief,
   formatApprovedPlanContext,
   formatApprovedPlanForSwarm,
+  coerceDirtyReviewPlan,
+  extractFixContractBrief,
+  formatReviewPlanForCoder,
+  formatReviewPlanForPlanner,
   matchPlanOption,
+  parseExecutionPlan,
   parsePlanOptions,
-  stripPlanOptionMarkup
+  parseReviewDelta,
+  parseReviewPlan,
+  parseStepVerdict,
+  stripExecutionPlanMarkup,
+  stripFixContractMarkup,
+  stripPlanOptionMarkup,
+  stripReviewDeltaMarkup,
+  stripReviewPlanMarkup,
+  stripStepVerdictMarkup
 } from '../lib/planOptions';
 import {
+  applyReviewDelta,
+  createQueueFromReviewPlan,
+  formatActiveTaskForPlanner,
+  formatQueueForReviewer,
+  getActiveTask,
+  hasOpenTasks,
+  markInProgress,
+  pickNextPending,
+  queueToReviewPlan
+} from '../lib/executionQueue';
+import {
+  activateNextStep,
+  applyStepVerdict,
+  createPlanFromParsed,
+  formatStepForCoders,
+  formatStepForReviewer,
+  getActiveStep,
+  isPlanActive,
+  markAllStepTasks,
+  markStepInProgress,
+  parsePlannerPlanJson,
+  plannerPlanPath,
+  serializePlannerPlan
+} from '../lib/plannerPlan';
+import {
   buildContinuationReviewPrompt,
+  buildTouchedFilesContext,
   collectWrittenPaths,
   CONTINUATION_REVIEW_SYSTEM,
   filterInspectionContinue,
@@ -145,6 +200,9 @@ interface AgentChatProps {
   workspacePath: string;
   workspaceFiles?: WorkspaceFile[];
   width?: number;
+  /** Right orchestration column width inside the conductor */
+  controlWidth?: number;
+  onControlWidthChange?: (width: number) => void;
   onSelectNodeModel?: (nodeId: string, model: string) => void;
   onApplyFileWrite: (filePath: string, content: string) => Promise<boolean>;
   onExecuteToolCommand: (command: string) => Promise<string>;
@@ -156,7 +214,11 @@ interface AgentChatProps {
   conversation: ChatConversation | null;
   workspaceConversations: ChatConversation[];
   onMessagesChange: (messages: ChatMessage[]) => void;
-  onConversationPatch?: (patch: Partial<Pick<ChatConversation, 'approvedPlan' | 'agentId'>>) => void;
+  onConversationPatch?: (
+    patch: Partial<
+      Pick<ChatConversation, 'approvedPlan' | 'executionQueue' | 'plannerPlan' | 'agentId'>
+    >
+  ) => void;
   onNewChat: () => void;
   onSelectConversation: (id: string) => void;
   onDeleteConversation: (id: string) => void;
@@ -177,7 +239,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   activeTab,
   workspacePath,
   workspaceFiles,
-  width = 420,
+  width = 640,
+  controlWidth = 270,
+  onControlWidthChange,
   onSelectNodeModel,
   onApplyFileWrite,
   onExecuteToolCommand,
@@ -199,8 +263,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const toolStepLimit = toolContinuationLimit(maxAgentSteps);
   const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
   const coderAgent = agents.find(a => a.handle === 'coder' || a.id === 'coder') || agents[0];
+  const plannerAgent = agents.find(a => a.handle === 'planner' || a.id === 'planner') || agents[0];
+  const reviewerAgent = agents.find(a => a.handle === 'reviewer' || a.id === 'reviewer') || agents[0];
   const isPlannerSelected =
     currentAgent.handle === 'planner' || currentAgent.id === 'planner';
+  const isReviewerSelected =
+    currentAgent.handle === 'reviewer' || currentAgent.id === 'reviewer';
 
   // Routing states
   const [targetNodeId, setTargetNodeId] = useState<string>(currentAgent.endpointId);
@@ -210,6 +278,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const [isPipelineMode, setIsPipelineMode] = useState(false);
   const [autoApplyWrites, setAutoApplyWrites] = useState<boolean>(currentAgent.autoApproveWrites ?? true);
   const autoApplyWritesRef = useRef(currentAgent.autoApproveWrites ?? true);
+  /** After each coding step: Reviewer runs; ON = auto Send to Planner→Coder / continue, OFF = wait for user */
+  const [autoReview, setAutoReview] = useState(true);
+  const autoReviewRef = useRef(true);
+  /** Resume depth when user approval is required after a post-step review */
+  const pendingReviewResumeRef = useRef<{ depth: number; previousTask: string } | null>(null);
 
   const [input, setInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -232,7 +305,31 @@ export const AgentChat: React.FC<AgentChatProps> = ({
   const prevFailedCmdSigsRef = useRef<string[]>([]);
   const conversationIdRef = useRef<string | null>(conversation?.id ?? null);
   const approvedPlanRef = useRef<ApprovedPlan | null>(conversation?.approvedPlan ?? null);
+  const executionQueueRef = useRef<ExecutionQueue | null>(conversation?.executionQueue ?? null);
+  const plannerPlanRef = useRef<PlannerPlan | null>(conversation?.plannerPlan ?? null);
+  const [plannerPlanView, setPlannerPlanView] = useState<PlannerPlan | null>(
+    conversation?.plannerPlan ?? null
+  );
   const stopRequestedRef = useRef(false);
+
+  const commitExecutionQueue = (next: ExecutionQueue | null) => {
+    executionQueueRef.current = next;
+    onConversationPatch?.({ executionQueue: next });
+  };
+
+  const commitPlannerPlan = (next: PlannerPlan | null) => {
+    plannerPlanRef.current = next;
+    setPlannerPlanView(next);
+    onConversationPatch?.({ plannerPlan: next });
+    const id = conversationIdRef.current;
+    if (!workspacePath || !id || !window.electronAPI?.writeFile) return;
+    if (next) {
+      void window.electronAPI.writeFile(
+        plannerPlanPath(workspacePath, id),
+        serializePlannerPlan(next)
+      );
+    }
+  };
   const freeTierUsageRef = useRef<Record<string, FreeTierUsage>>({});
   const stuckRef = useRef<{ key: string; stage: StuckStage }>({ key: '', stage: 'none' });
 
@@ -241,20 +338,46 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     commandFixAttempts: number;
     prevFailedCmdSigs: string[];
     writeFixAttempts: number;
+    readOnlyContinues: number;
+    terminalFingerprint?: string;
   };
+
+  const readOnlyContinuesRef = useRef(0);
+  const terminalFingerprintRef = useRef<string | undefined>(undefined);
 
   const resetAgentLoopBudget = () => {
     continuationDepthRef.current = 0;
     commandFixAttemptsRef.current = 0;
     writeFixAttemptsRef.current = 0;
     prevFailedCmdSigsRef.current = [];
+    readOnlyContinuesRef.current = 0;
+    terminalFingerprintRef.current = undefined;
   };
 
-  const continueDecisionOpts = (budget?: LoopBudget) => ({
+  const continueDecisionOpts = (
+    budget?: LoopBudget,
+    extra?: { maxReadOnlyContinues?: number }
+  ) => ({
     commandFixAttempts: budget ? budget.commandFixAttempts : commandFixAttemptsRef.current,
     prevFailedCmdSigs: budget ? budget.prevFailedCmdSigs : prevFailedCmdSigsRef.current,
-    writeFixAttempts: budget ? budget.writeFixAttempts : writeFixAttemptsRef.current
+    writeFixAttempts: budget ? budget.writeFixAttempts : writeFixAttemptsRef.current,
+    readOnlyContinues: budget ? budget.readOnlyContinues : readOnlyContinuesRef.current,
+    terminalFingerprint: budget
+      ? budget.terminalFingerprint
+      : terminalFingerprintRef.current,
+    ...(extra?.maxReadOnlyContinues != null
+      ? { maxReadOnlyContinues: extra.maxReadOnlyContinues }
+      : {})
   });
+
+  const rememberTerminalFingerprint = (tools: ToolCall[], budget?: LoopBudget) => {
+    const result = latestTerminalResult(tools);
+    if (!result) return;
+    const fp = terminalResultFingerprint(result);
+    if (!fp) return;
+    if (budget) budget.terminalFingerprint = fp;
+    else terminalFingerprintRef.current = fp;
+  };
 
   const skipPersistRef = useRef(false);
 
@@ -272,11 +395,28 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setMessages(nextMsgs);
       messagesRef.current = nextMsgs;
       approvedPlanRef.current = conversation?.approvedPlan ?? null;
+      executionQueueRef.current = conversation?.executionQueue ?? null;
+      plannerPlanRef.current = conversation?.plannerPlan ?? null;
+      setPlannerPlanView(conversation?.plannerPlan ?? null);
       setExecutingPlanNotice(null);
       setInput('');
       setPendingImages([]);
       setHistoryOpen(false);
       stuckRef.current = { key: '', stage: 'none' };
+      // File-backed plan survives compaction
+      const root = workspacePath;
+      const cid = nextId;
+      if (root && cid && window.electronAPI?.readFile) {
+        void window.electronAPI.readFile(plannerPlanPath(root, cid)).then(res => {
+          if (conversationIdRef.current !== cid) return;
+          const fromDisk = res.content ? parsePlannerPlanJson(res.content) : null;
+          if (fromDisk && (!conversation?.plannerPlan || fromDisk.updatedAt >= (conversation.plannerPlan.updatedAt || 0))) {
+            plannerPlanRef.current = fromDisk;
+            setPlannerPlanView(fromDisk);
+            onConversationPatch?.({ plannerPlan: fromDisk });
+          }
+        });
+      }
     }
   }, [conversation?.id]);
 
@@ -285,6 +425,19 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       approvedPlanRef.current = conversation?.approvedPlan ?? null;
     }
   }, [conversation?.approvedPlan, conversation?.id]);
+
+  useEffect(() => {
+    if (conversation?.id === conversationIdRef.current) {
+      executionQueueRef.current = conversation?.executionQueue ?? null;
+    }
+  }, [conversation?.executionQueue, conversation?.id]);
+
+  useEffect(() => {
+    if (conversation?.id === conversationIdRef.current && conversation?.plannerPlan) {
+      plannerPlanRef.current = conversation.plannerPlan;
+      setPlannerPlanView(conversation.plannerPlan);
+    }
+  }, [conversation?.plannerPlan, conversation?.id]);
 
   const progressRef = useRef<WorkLog>(emptyWorkLog());
   const progressRev = useRef(0);
@@ -638,6 +791,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       node?: EndpointNode;
       model?: string;
       budget?: LoopBudget;
+      /** Explicit role for this continue — never infer from stale UI currentAgent. */
+      role?: 'planner' | 'reviewer' | 'coder' | 'docs';
+      stepVerdictMode?: boolean;
+      lockPlanMode?: boolean;
+      reviewMode?: boolean;
     }
   ) => {
     const budget = opts?.budget;
@@ -646,7 +804,34 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
     const feedbackTools = collectFeedbackTools(originMsg.toolCalls || []);
     if (feedbackTools.length === 0) return;
-    if (!shouldContinueFromTools(originMsg.toolCalls || [], continueDecisionOpts(budget))) return;
+
+    // Role from the originating turn only. currentAgent is often still Planner after
+    // onSelectAgent(coder) because React state has not re-rendered yet — that wrongly
+    // re-opened <plan_options> mid-execution in Webtest.
+    const originRole = (
+      opts?.role ||
+      originMsg.personaHandle ||
+      'coder'
+    ).toLowerCase();
+    const planLocked = isPlanActive(plannerPlanRef.current);
+    const reviewModeContinue =
+      !!opts?.reviewMode || originRole === 'reviewer' || !!opts?.stepVerdictMode;
+    // Architecture <plan_options> only before a plan is locked — never mid-execution.
+    const planModeContinue =
+      originRole === 'planner' &&
+      !planLocked &&
+      !opts?.lockPlanMode &&
+      !reviewModeContinue;
+    const lockPlanContinue = !!opts?.lockPlanMode || (originRole === 'planner' && planLocked);
+    const reviewModeGate = reviewModeContinue;
+    const continueOpts = continueDecisionOpts(budget, {
+      maxReadOnlyContinues: reviewModeGate ? 1 : undefined
+    });
+    const prevTerminalFp = continueOpts.terminalFingerprint;
+    if (!shouldContinueFromTools(originMsg.toolCalls || [], continueOpts)) {
+      rememberTerminalFingerprint(originMsg.toolCalls || [], budget);
+      return;
+    }
 
     const cmdFailed = feedbackTools.some(t => t.name === 'run_command' && t.status === 'error');
     const writeFailed = feedbackTools.some(
@@ -669,28 +854,46 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       if (budget) budget.writeFixAttempts += 1;
       else writeFixAttemptsRef.current += 1;
     }
+    if (isReadOnlyToolBatch(originMsg.toolCalls || [])) {
+      if (budget) budget.readOnlyContinues += 1;
+      else readOnlyContinuesRef.current += 1;
+    }
 
     if (budget) budget.depth += 1;
     else continuationDepthRef.current += 1;
+
+    const currentTerminalFp = (() => {
+      const result = latestTerminalResult(originMsg.toolCalls || []);
+      return result ? terminalResultFingerprint(result) : undefined;
+    })();
+    const sameTerminalFingerprint = Boolean(
+      prevTerminalFp && currentTerminalFp && prevTerminalFp === currentTerminalFp
+    );
+    rememberTerminalFingerprint(originMsg.toolCalls || [], budget);
     const routeNode = opts?.node || selectedNode;
     if (!routeNode) return;
     const routeModel = opts?.model || activeTargetModel;
     const followUpId = `followup-${Date.now()}`;
-    const planModeContinueEarly =
-      currentAgent.handle === 'planner' ||
-      currentAgent.id === 'planner' ||
-      originMsg.personaHandle === 'planner';
+    const continueAgent = reviewModeContinue
+      ? reviewerAgent
+      : planModeContinue || lockPlanContinue
+        ? plannerAgent
+        : coderAgent;
     const followUpMsg: ChatMessage = {
       id: followUpId,
       role: 'assistant',
       raw: '',
       display: cmdFailed
         ? 'Command failed — one fix attempt from terminal output...'
-        : planModeContinueEarly
+        : planModeContinue
           ? 'Explored the workspace. Drafting the plan and options...'
-          : 'Analyzed project files. Now generating implementation...',
-      agentId: currentAgent.id,
-      personaHandle: originMsg.personaHandle || currentAgent.handle,
+          : lockPlanContinue
+            ? 'Explored the workspace. Locking execution steps...'
+          : reviewModeContinue
+            ? 'Explored the workspace. Drafting the review fix plan...'
+            : 'Analyzed project files. Now generating implementation...',
+      agentId: continueAgent.id,
+      personaHandle: continueAgent.handle || originRole,
       endpointId: routeNode.id,
       endpointName: routeNode.name,
       model: routeModel,
@@ -702,18 +905,34 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setIsStreaming(true);
 
     try {
-      const continuationPrompt = buildContinuationUserPrompt(feedbackTools, {
+      let continuationPrompt = buildContinuationUserPrompt(feedbackTools, {
         // True only on a 2nd+ command-fix continue (when MAX_COMMAND_FIX_ATTEMPTS > 1)
         finalCommandAttempt: priorFixAttempts > 0
       });
-      const planModeContinue =
-        currentAgent.handle === 'planner' ||
-        currentAgent.id === 'planner' ||
-        originMsg.personaHandle === 'planner';
+      const emptyTerminalNoFail =
+        feedbackTools.some(
+          t => t.name === 'read_terminal' && t.status === 'done' && isEmptyTerminalResult(t.result)
+        ) && !feedbackTools.some(t => t.name === 'run_command' && t.status === 'error');
+      if (emptyTerminalNoFail) {
+        continuationPrompt +=
+          '\n\n[DIRECTIVE: Terminal buffer is empty. Do NOT call <read_terminal> again.]';
+      } else if (sameTerminalFingerprint) {
+        continuationPrompt +=
+          '\n\n[DIRECTIVE: Do NOT call read_terminal again; terminal output is unchanged.]';
+      }
+      const readOnlyContinue =
+        planModeContinue || reviewModeContinue || lockPlanContinue;
+      const stepVerdictContinue = !!opts?.stepVerdictMode || originMsg.stepVerdict != null;
       fitContext(chatNumCtx(routeNode, routeModel));
-      const systemPrompt = buildSystemPrompt(currentAgent, workspacePath, workspaceOverview, {
+      const systemPrompt = buildSystemPrompt(continueAgent, workspacePath, workspaceOverview, {
         planMode: planModeContinue,
-        approvedPlan: planModeContinue ? null : approvedPlanRef.current,
+        reviewMode: reviewModeContinue,
+        lockPlanMode: lockPlanContinue && !reviewModeContinue,
+        stepVerdictMode: stepVerdictContinue || (planLocked && reviewModeContinue),
+        approvedPlan:
+          planModeContinue || reviewModeContinue || lockPlanContinue
+            ? null
+            : approvedPlanRef.current,
         progressLog: progressForPrompt(),
         nodes,
         inferenceNodeId: routeNode.id
@@ -730,7 +949,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           role: 'user',
           content: planModeContinue
             ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: After using exploration results, produce the plan and end with a <plan_options> block. Do NOT write deliverable files.]`
-            : continuationPrompt
+            : lockPlanContinue && !reviewModeContinue
+              ? `${continuationPrompt}\n\n[PLANNER DIRECTIVE: Finish the <execution_plan> steps/tasks for the chosen option. Do NOT emit <plan_options>. Do NOT write deliverable files.]`
+            : reviewModeContinue
+              ? stepVerdictContinue || planLocked
+                ? `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading. Emit <step_verdict> yay or nay for the active step only. Do NOT emit <plan_options> or <review_plan>. Do NOT write files.]`
+                : `${continuationPrompt}\n\n[REVIEWER DIRECTIVE: STOP reading more files. Report findings and end with a <review_plan> that has <task> items for Planner→Coder. Do NOT write/edit/Apply files yourself.]`
+              : continuationPrompt
         }
       ];
 
@@ -738,7 +963,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         model: routeModel,
         messages: conversationPayload,
         options: {
-          temperature: currentAgent.temperature,
+          temperature: continueAgent.temperature,
           num_ctx: chatNumCtx(routeNode, routeModel)
         }
       }, routeNode, routeModel);
@@ -751,25 +976,37 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             expectedFilePath: opts?.expectedFilePath,
             createIntent: opts?.createIntent
           });
-          const liveOptions = planModeContinue ? parsePlanOptions(content) : [];
+          const liveOptions =
+            planModeContinue && !isPlanActive(plannerPlanRef.current)
+              ? parsePlanOptions(content)
+              : [];
+          const liveReview = reviewModeContinue ? parseReviewPlan(content) : null;
+          const displayLive = reviewModeContinue
+            ? stripReviewDeltaMarkup(
+                stripReviewPlanMarkup(stripPlanOptionMarkup(parsed.display || content))
+              )
+            : stripPlanOptionMarkup(parsed.display || content);
           setMessages(prev => prev.map(m => {
             if (m.id === followUpId) {
               return {
                 ...m,
                 raw: content,
-                display: stripPlanOptionMarkup(parsed.display || content),
+                display: displayLive,
                 thinking: parsed.thinking || thinking,
-                toolCalls: planModeContinue
-                  ? parsed.toolCalls.filter(t =>
-                      ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
-                    )
-                  : parsed.toolCalls,
+                toolCalls: collapseDuplicateReadTools(
+                  readOnlyContinue
+                    ? parsed.toolCalls.filter(t =>
+                        ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
+                      )
+                    : parsed.toolCalls
+                ),
                 ...(liveOptions.length >= 2
                   ? {
                       planOptions: liveOptions,
                       planSummary: buildPlanSummary(content, liveOptions)
                     }
-                  : {})
+                  : {}),
+                ...(liveReview ? { reviewPlan: liveReview } : {})
               };
             }
             return m;
@@ -781,16 +1018,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       activeAbortsRef.current = [handle.abort];
       const result = await handle.done;
-      const finished = planModeContinue
+      const finished = readOnlyContinue
         ? result.content
         : await finishTruncatedWrites(routeNode, routeModel, result.content, result.stats?.doneReason);
       let finalParsed = parseResponse(finished, followUpId, false, {
         expectedFilePath: opts?.expectedFilePath,
-        createIntent: planModeContinue ? false : (opts?.createIntent ?? true)
+        createIntent: readOnlyContinue ? false : (opts?.createIntent ?? true)
       });
 
-      let tools = finalParsed.toolCalls;
-      if (planModeContinue) {
+      let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
+      if (readOnlyContinue) {
         tools = tools.filter(t =>
           ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
         );
@@ -798,7 +1035,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readPass = await runReadOnlyTools(tools, toolDeps);
       tools = readPass.tools;
 
-      if (!planModeContinue && autoApplyWritesRef.current) {
+      if (!readOnlyContinue && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDeps);
         tools = await runAuxTools(tools, toolDeps);
         const cmdPass = await runCommandTools(tools, toolDeps);
@@ -809,8 +1046,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const stillFailing =
         failedCommandSignatures(tools).length > 0 &&
         !shouldContinueFromTools(tools, continueDecisionOpts(budget));
-      const planOptions = planModeContinue ? parsePlanOptions(finished) : [];
-      const displayBase = stripPlanOptionMarkup(finalParsed.display || finished);
+      const planOptions =
+        planModeContinue && !isPlanActive(plannerPlanRef.current)
+          ? parsePlanOptions(finished)
+          : [];
+      const reviewPlan = reviewModeContinue ? parseReviewPlan(finished) : null;
+      const displayBase = reviewModeContinue
+        ? stripReviewDeltaMarkup(
+            stripReviewPlanMarkup(stripPlanOptionMarkup(finalParsed.display || finished))
+          )
+        : stripPlanOptionMarkup(finalParsed.display || finished);
       const followUpMsgFinal: ChatMessage = {
         ...followUpMsg,
         raw: finished,
@@ -824,7 +1069,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               planOptions,
               planSummary: buildPlanSummary(finished, planOptions)
             }
-          : {})
+          : {}),
+        ...(reviewPlan ? { reviewPlan } : {})
       };
 
       setMessages(prev => prev.map(m => (m.id === followUpId ? followUpMsgFinal : m)));
@@ -1023,7 +1269,9 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           depth: 0,
           commandFixAttempts: 0,
           prevFailedCmdSigs: [],
-          writeFixAttempts: 0
+          writeFixAttempts: 0,
+          readOnlyContinues: 0,
+          terminalFingerprint: undefined
         };
         if (shouldContinueFromTools(tools, continueDecisionOpts(workerBudget))) {
           const origin: ChatMessage = {
@@ -1032,6 +1280,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             raw: finished,
             display: '',
             toolCalls: tools,
+            personaHandle: 'coder',
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           };
           await continueWithToolResults(origin, {
@@ -1039,7 +1288,8 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             createIntent: true,
             node,
             model,
-            budget: workerBudget
+            budget: workerBudget,
+            role: 'coder'
           });
         }
 
@@ -1582,32 +1832,44 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return { routedNode, routedModel, routedIsFrontier: routedNode.type === 'openai' || !!routedNode.apiKey };
   };
 
-  /** Single-node chat turn with optional plan mode or locked approved plan. */
+  /** Single-node chat turn with optional plan/review/contract mode or locked approved plan. */
   const runSingleNodeTurn = async (opts: {
     userText: string;
     fullPrompt: string;
     attachedImages?: string[];
     agent: AgentPersona;
     planMode?: boolean;
+    reviewMode?: boolean;
+    /** Planner locks fix contract after review (writes OK; no plan_options) */
+    contractMode?: boolean;
+    /** Planner emits <execution_plan> after option pick */
+    lockPlanMode?: boolean;
+    /** Reviewer Yay/Nay on active Planner step */
+    stepVerdictMode?: boolean;
     approvedPlan?: ApprovedPlan | null;
     userMsgExtra?: Partial<ChatMessage>;
     skipUserAppend?: boolean;
     notice?: string;
     /** Keep a fix on the review model instead of the worker that wrote the files. */
     pinRoute?: { node: EndpointNode; model: string };
-  }) => {
+  }): Promise<ChatMessage | undefined> => {
     const {
       userText,
       fullPrompt,
       attachedImages = [],
       agent,
       planMode,
+      reviewMode,
+      contractMode,
+      lockPlanMode,
+      stepVerdictMode,
       approvedPlan,
       userMsgExtra,
       skipUserAppend,
       notice,
       pinRoute
     } = opts;
+    const readOnlyMode = !!planMode || !!reviewMode || !!lockPlanMode || !!stepVerdictMode;
 
     const route = pinRoute
       ? {
@@ -1649,7 +1911,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     if (routedNode.id !== targetNodeId) setTargetNodeId(routedNode.id);
     if (routedModel !== targetModel) setTargetModel(routedModel);
 
-    const createIntent = !planMode && looksLikeCreateIntent(userText);
+    const createIntent = !readOnlyMode && looksLikeCreateIntent(userText);
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
@@ -1679,20 +1941,33 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     setMessages(prev => (skipUserAppend ? [...prev, initialAgentMsg] : [...prev, userMsg, initialAgentMsg]));
     setIsStreaming(true);
 
+    let originOut: ChatMessage | undefined;
     try {
       fitContext(chatNumCtx(routedNode, routedModel));
       const systemPrompt = buildSystemPrompt(agent, workspacePath, workspaceOverview, {
         planMode: !!planMode,
-        approvedPlan: planMode ? null : approvedPlan,
+        reviewMode: !!reviewMode,
+        contractMode: !!contractMode,
+        lockPlanMode: !!lockPlanMode,
+        stepVerdictMode: !!stepVerdictMode,
+        approvedPlan: readOnlyMode || contractMode || lockPlanMode ? null : approvedPlan,
         progressLog: progressForPrompt(),
         nodes,
         inferenceNodeId: routedNode.id
       });
-      const actionableUserPrompt = planMode
-        ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
-        : pinRoute
-          ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
-          : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
+      const actionableUserPrompt = lockPlanMode
+        ? `${fullPrompt}\n\n[PLANNER LOCK DIRECTIVE: Break the chosen option into ordered steps with coder tasks. End with <execution_plan>. Do NOT write deliverable files. Do NOT emit <plan_options>.]`
+        : stepVerdictMode
+          ? `${fullPrompt}\n\n[REVIEWER STEP DIRECTIVE: Verify ONLY the active plan step. End with <step_verdict> yay or nay. Do NOT write files or invent a new plan.]`
+          : planMode
+            ? `${fullPrompt}\n\n[PLANNER DIRECTIVE: Analyze intent, propose a concrete plan, and end with 2–4 options in a <plan_options> block. Do NOT write deliverable files yet.]`
+            : reviewMode
+              ? `${fullPrompt}\n\n[REVIEWER DIRECTIVE: Report findings and end with a <review_plan> block (tasks if fixes are needed, summary-only if clean). Do NOT write or edit files.]`
+              : contractMode
+                ? `${fullPrompt}\n\n[PLANNER CONTRACT DIRECTIVE: Lock a fix contract for the review tasks. You may write a shared contract file. End with <fix_contract>. Do NOT emit <plan_options>. Do not implement the full fix list — Coder runs next.]`
+                : pinRoute
+                  ? `${fullPrompt}\n\n[EXECUTION DIRECTIVE: Fix the existing files with <edit_file path="..."> search/replace blocks. Do not rewrite a whole file when a search/replace will do. Do not add a new feature.]`
+                  : `${fullPrompt}\n\n[EXECUTION DIRECTIVE: If this request asks to create, build, or modify an application, script, or file, you MUST emit <write_file path="filename.ext">...complete code...</write_file> tags so the files are written directly to the user's computer. Do NOT just reply with conversational instructions.]`;
       const ollamaImages = attachedImages.map(toOllamaBase64);
 
       const history = historyForModel(messagesRef.current, stripThinking);
@@ -1716,7 +1991,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           window.electronAPI?.writeLog?.('warn', `free-tier assist: ${err?.message || err}`);
         }
       }
-      if (stopRequestedRef.current) return;
+      if (stopRequestedRef.current) return undefined;
 
       const conversationPayload = [
         { role: 'system', content: systemPrompt },
@@ -1746,8 +2021,28 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         body,
         (content, thinking) => {
           const parsed = parseResponse(content, agentMsgId, true, { createIntent });
-          const displayBase = stripPlanOptionMarkup(parsed.display || content);
-          const liveOptions = planMode ? parsePlanOptions(content) : [];
+          let displayBase = stripPlanOptionMarkup(parsed.display || content);
+          if (reviewMode || stepVerdictMode) {
+            displayBase = stripStepVerdictMarkup(
+              stripReviewDeltaMarkup(stripReviewPlanMarkup(displayBase))
+            );
+          }
+          if (lockPlanMode) displayBase = stripExecutionPlanMarkup(displayBase);
+          if (contractMode) displayBase = stripFixContractMarkup(displayBase);
+          // Never surface architecture options once an execution plan is locked/running.
+          const liveOptions =
+            planMode && !lockPlanMode && !isPlanActive(plannerPlanRef.current)
+              ? parsePlanOptions(content)
+              : [];
+          const liveReview = reviewMode && !stepVerdictMode ? parseReviewPlan(content) : null;
+          const liveVerdict = stepVerdictMode ? parseStepVerdict(content) : null;
+          const liveTools = collapseDuplicateReadTools(
+            readOnlyMode
+              ? parsed.toolCalls.filter(t =>
+                  ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
+                )
+              : parsed.toolCalls
+          );
           setMessages(prev =>
             prev.map(m => {
               if (m.id !== agentMsgId) return m;
@@ -1756,13 +2051,20 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                 raw: content,
                 display: displayBase,
                 thinking: parsed.thinking || thinking,
-                toolCalls: planMode
-                  ? parsed.toolCalls.filter(t =>
-                      ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
-                    )
-                  : parsed.toolCalls,
+                toolCalls: liveTools,
                 ...(liveOptions.length >= 2
                   ? { planOptions: liveOptions, planSummary: buildPlanSummary(content, liveOptions) }
+                  : {}),
+                ...(liveReview ? { reviewPlan: liveReview } : {}),
+                ...(liveVerdict
+                  ? {
+                      stepVerdict: {
+                        stepId: liveVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
+                        stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                        result: liveVerdict.result,
+                        notes: liveVerdict.notes
+                      }
+                    }
                   : {})
               };
             })
@@ -1774,14 +2076,14 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
       activeAbortsRef.current = [handle.abort];
       const result = await handle.done;
-      const finished = planMode
+      const finished = readOnlyMode
         ? result.content
         : await finishTruncatedWrites(routedNode, routedModel, result.content, result.stats?.doneReason);
       const finalParsed = parseResponse(finished, agentMsgId, false, { createIntent });
 
-      let tools = finalParsed.toolCalls;
-      if (planMode) {
-        // Planner: explore only — drop accidental write/edit/run tools
+      let tools = collapseDuplicateReadTools(finalParsed.toolCalls);
+      if (readOnlyMode) {
+        // Planner / Reviewer: explore only — drop accidental write/edit/run tools
         tools = tools.filter(t =>
           ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
         );
@@ -1790,7 +2092,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       const readPass = await runReadOnlyTools(tools, toolDeps);
       tools = readPass.tools;
 
-      if (!planMode && autoApplyWritesRef.current) {
+      if (!readOnlyMode && autoApplyWritesRef.current) {
         tools = await autoApplyWritableTools(tools, toolDeps);
         tools = await runAuxTools(tools, toolDeps);
         const cmdPass = await runCommandTools(tools, toolDeps);
@@ -1814,8 +2116,27 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
-      const options = planMode ? parsePlanOptions(finished) : [];
-      const displayText = stripPlanOptionMarkup(finalParsed.display || finished);
+      const options =
+        planMode && !lockPlanMode && !isPlanActive(plannerPlanRef.current)
+          ? parsePlanOptions(finished)
+          : [];
+      const reviewPlan =
+        reviewMode && !stepVerdictMode
+          ? parseReviewPlan(finished) ||
+            ({
+              summary: 'No structured issues found.',
+              tasks: []
+            } as const)
+          : null;
+      const parsedVerdict = stepVerdictMode ? parseStepVerdict(finished) : null;
+      let displayText = stripPlanOptionMarkup(finalParsed.display || finished);
+      if (reviewMode || stepVerdictMode) {
+        displayText = stripStepVerdictMarkup(
+          stripReviewDeltaMarkup(stripReviewPlanMarkup(displayText))
+        );
+      }
+      if (lockPlanMode) displayText = stripExecutionPlanMarkup(displayText);
+      if (contractMode) displayText = stripFixContractMarkup(displayText);
 
       const origin: ChatMessage = {
         id: agentMsgId,
@@ -1837,16 +2158,71 @@ export const AgentChat: React.FC<AgentChatProps> = ({
               planSummary: buildPlanSummary(finished, options)
             }
           : {}),
+        ...(reviewPlan ? { reviewPlan } : {}),
+        ...(parsedVerdict
+          ? {
+              stepVerdict: {
+                stepId: parsedVerdict.stepId || getActiveStep(plannerPlanRef.current)?.id || '',
+                stepTitle: getActiveStep(plannerPlanRef.current)?.title || 'Step',
+                result: parsedVerdict.result,
+                notes: parsedVerdict.notes
+              }
+            }
+          : {}),
         ...(notice ? { notice } : {})
       };
 
       setMessages(prev => prev.map(m => (m.id === agentMsgId ? origin : m)));
+      originOut = origin;
 
-      if (!planMode && shouldContinueFromTools(tools, continueDecisionOpts())) {
-        await continueWithToolResults(origin, { createIntent, node: routedNode, model: routedModel });
-      } else if (planMode && shouldContinueFromTools(tools, continueDecisionOpts())) {
-        // Allow planner read-tool continuations (still in plan mode via currentAgent)
-        await continueWithToolResults(origin, { createIntent: false, node: routedNode, model: routedModel });
+      const turnContinueOpts = continueDecisionOpts(undefined, {
+        maxReadOnlyContinues:
+          reviewMode || stepVerdictMode ? 1 : planMode || lockPlanMode ? 2 : undefined
+      });
+      const continueRole =
+        (agent.handle as 'planner' | 'reviewer' | 'coder' | 'docs') ||
+        (planMode || lockPlanMode
+          ? 'planner'
+          : reviewMode || stepVerdictMode
+            ? 'reviewer'
+            : 'coder');
+      if (!readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
+        await continueWithToolResults(origin, {
+          createIntent,
+          node: routedNode,
+          model: routedModel,
+          role: continueRole,
+          lockPlanMode: !!lockPlanMode,
+          reviewMode: !!reviewMode || !!stepVerdictMode,
+          stepVerdictMode: !!stepVerdictMode
+        });
+      } else if (readOnlyMode && shouldContinueFromTools(tools, turnContinueOpts)) {
+        // Planner/Reviewer: bounded explore continues, then they must emit the plan
+        await continueWithToolResults(origin, {
+          createIntent: false,
+          node: routedNode,
+          model: routedModel,
+          role: continueRole,
+          lockPlanMode: !!lockPlanMode,
+          reviewMode: !!reviewMode || !!stepVerdictMode,
+          stepVerdictMode: !!stepVerdictMode
+        });
+        // After tool continuations, refresh reviewPlan from latest follow-up if reviewer
+        if (reviewMode && !stepVerdictMode) {
+          const latest = [...messagesRef.current].reverse().find(
+            m => m.personaHandle === 'reviewer' && m.role === 'assistant'
+          );
+          if (latest) {
+            const rp = coerceDirtyReviewPlan(
+              latest.reviewPlan || parseReviewPlan(latest.raw || ''),
+              `${latest.display || ''}\n${latest.raw || ''}`
+            );
+            originOut = { ...latest, reviewPlan: rp };
+            setMessages(prev =>
+              prev.map(m => (m.id === latest.id ? { ...m, reviewPlan: rp } : m))
+            );
+          }
+        }
       }
     } catch (err: any) {
       window.electronAPI?.writeLog?.('error', `single-node ${routedNode?.name || ''}: ${err?.message || err}`);
@@ -1865,39 +2241,195 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       setIsStreaming(false);
       activeAbortsRef.current = [];
     }
+    return originOut;
   };
 
   /**
-   * After a coding step, the largest enabled local model checks the workspace.
-   * It may patch bugs in the files just written. A fix to those files stays on
-   * this model. A new feature goes through the normal local route.
+   * Planner orchestrates ONE active queue task → fix contract → Coder, then Reviewer verifies that task.
+   * Seeds the durable queue from planMsg when needed; never drops the list.
    */
-  const reviewAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
+  const sendReviewPlanToPlanner = async (
+    planMsg?: ChatMessage | null,
+    resumeDepth?: number,
+    reviewNotes?: string
+  ) => {
+    if (planMsg?.reviewSentToCoder && !executionQueueRef.current) return;
+
+    const depth =
+      resumeDepth ?? pendingReviewResumeRef.current?.depth ?? 0;
+    pendingReviewResumeRef.current = null;
+
+    let queue = executionQueueRef.current;
+    if ((!queue || !queue.tasks.length) && planMsg?.reviewPlan?.tasks.length) {
+      queue = createQueueFromReviewPlan(planMsg.reviewPlan, planMsg.id);
+      commitExecutionQueue(queue);
+    }
+    if (!queue?.tasks.length) return;
+
+    let task = getActiveTask(queue);
+    if (!task || task.status === 'completed') {
+      const next = pickNextPending(queue);
+      if (!next) {
+        if (autoReviewRef.current) await decideNextStepAndAdvance(depth, '');
+        return;
+      }
+      queue = markInProgress(queue, next.id);
+      commitExecutionQueue(queue);
+      task = getActiveTask(queue)!;
+    } else if (task.status === 'pending' || task.status === 'failed') {
+      queue = markInProgress(queue, task.id);
+      commitExecutionQueue(queue);
+      task = getActiveTask(queue)!;
+    }
+
+    if (planMsg) {
+      setMessages(prev => {
+        const snap = queueToReviewPlan(queue!);
+        const next = prev.map(m =>
+          m.id === planMsg.id
+            ? { ...m, reviewSentToCoder: true, reviewPlan: snap }
+            : m
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    }
+
+    const singlePlan = formatActiveTaskForPlanner(queue, task, reviewNotes);
+    const openLeft = queue.tasks.filter(
+      t => t.status === 'pending' || t.status === 'failed'
+    ).length;
+
+    onSelectAgent(plannerAgent.id);
+    resetAgentLoopBudget();
+    stopRequestedRef.current = false;
+
+    const plannerPrompt = formatReviewPlanForPlanner(
+      singlePlan,
+      reviewNotes || planMsg?.display
+    );
+    setExecutingPlanNotice(
+      `Planner contract for task #${task.id}${openLeft ? ` (${openLeft} remaining after)` : ''}…`
+    );
+
+    if (isPipelineMode) {
+      const syntheticPlan: ApprovedPlan = {
+        summary: singlePlan.summary,
+        chosenOptionId: 'review-fix',
+        chosenOptionTitle: `Fix task #${task.id}: ${task.title}`,
+        chosenOptionDescription: task.description,
+        allOptions: [],
+        originalUserRequest: `Review fix task #${task.id}: ${task.title}`,
+        approvedAt: Date.now(),
+        planMarkdown: plannerPrompt
+      };
+      approvedPlanRef.current = syntheticPlan;
+      onConversationPatch?.({ approvedPlan: syntheticPlan, agentId: plannerAgent.id });
+      await handleSendPipelineMessage(
+        `Review fix task #${task.id}: ${task.title}`,
+        plannerPrompt,
+        { approvedPlan: syntheticPlan, skipUserAppend: true }
+      );
+      if (!stopRequestedRef.current) {
+        await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+      }
+      return;
+    }
+
+    const plannerMsg = await runSingleNodeTurn({
+      userText: `Planner: fix contract for task #${task.id}`,
+      fullPrompt: plannerPrompt,
+      agent: plannerAgent,
+      planMode: false,
+      reviewMode: false,
+      contractMode: true,
+      skipUserAppend: true,
+      notice: `Planner locking fix contract — task #${task.id}`
+    });
+
     if (stopRequestedRef.current) return;
 
-    const recent = messagesRef.current;
-    let userIdx = recent.length - 1;
-    while (userIdx >= 0 && recent[userIdx].role !== 'user') userIdx -= 1;
-    const sinceUser = recent.slice(Math.max(0, userIdx));
-    const didWork =
-      !!approvedPlanRef.current ||
-      sinceUser.some(m =>
-        (m.pipelineSteps && m.pipelineSteps.length > 0) ||
-        (m.toolCalls || []).some(t =>
-          t.name === 'write_file' ||
-          t.name === 'edit_file' ||
-          t.name === 'run_command' ||
-          t.name === 'generate_image'
-        )
-      );
-    if (depth === 0 && !didWork) return;
+    const plannerBrief = extractFixContractBrief(
+      plannerMsg?.raw || '',
+      plannerMsg?.display || ''
+    );
 
+    onSelectAgent(coderAgent.id);
+    onConversationPatch?.({ agentId: coderAgent.id });
+    if (coderAgent.autoApproveWrites !== undefined) {
+      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
+      setAutoApplyWrites(coderAgent.autoApproveWrites);
+    }
+
+    const coderPrompt = formatReviewPlanForCoder(
+      singlePlan,
+      reviewNotes || planMsg?.display,
+      plannerBrief
+    );
+    setExecutingPlanNotice(`Coder applying task #${task.id}: ${task.title}…`);
+
+    await runSingleNodeTurn({
+      userText: `Implement review task #${task.id}: ${task.title}`,
+      fullPrompt: coderPrompt,
+      agent: coderAgent,
+      planMode: false,
+      reviewMode: false,
+      contractMode: false,
+      approvedPlan: approvedPlanRef.current,
+      notice: `Coder implementing task #${task.id}`
+    });
+    if (!stopRequestedRef.current) {
+      await reviewAndAdvance(depth + 1, `Task #${task.id}: ${task.title}`);
+    }
+  };
+
+  /** User approved a clean review — resume next-step continuation. */
+  const continueAfterCleanReview = async (planMsg: ChatMessage) => {
+    if (!planMsg.reviewNeedsContinue) return;
+    const resume = pendingReviewResumeRef.current;
+    pendingReviewResumeRef.current = null;
+    setMessages(prev => {
+      const next = prev.map(m =>
+        m.id === planMsg.id
+          ? { ...m, reviewSentToCoder: true, reviewNeedsContinue: false }
+          : m
+      );
+      messagesRef.current = next;
+      return next;
+    });
+    setExecutingPlanNotice('Continuing after clean review…');
+    await decideNextStepAndAdvance(resume?.depth ?? 0, resume?.previousTask ?? '');
+  };
+
+  /**
+   * After a clean Reviewer pass (or user Continue), decide continue / ask / done.
+   * Does not write files — Reviewer → Planner → Coder owns fixes.
+   */
+  const decideNextStepAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
+    if (stopRequestedRef.current) return;
+
+    // Planner-owned plan is the sole controller — never invent next steps while active.
+    if (isPlanActive(plannerPlanRef.current)) {
+      const step = getActiveStep(plannerPlanRef.current);
+      if (step && (step.status === 'in_progress' || step.status === 'failed')) {
+        await dispatchActiveStep();
+      } else if (plannerPlanRef.current?.status === 'completed') {
+        setExecutingPlanNotice('Planner plan complete — ask Planner for the next feature if needed.');
+      }
+      return;
+    }
+
+    // Legacy flat queue still has work — Planner dispatches; do not invent a new feature step.
+    if (hasOpenTasks(executionQueueRef.current)) {
+      await sendReviewPlanToPlanner(null, depth);
+      return;
+    }
+
+    const recent = messagesRef.current;
     const target = pickCapableReviewTarget(nodes);
     if (!target) return;
     const { node, model } = target;
     const touchedPaths = collectWrittenPaths(recent);
-
-    const reviewer = agents.find(a => a.handle === 'reviewer' || a.id === 'reviewer') || agents[0];
     const capped = depth >= MAX_AUTO_CONTINUATIONS;
     const transcript = recent
       .slice(-8)
@@ -1911,7 +2443,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const planText = approvedPlanRef.current
       ? formatApprovedPlanContext(approvedPlanRef.current)
       : '';
-    let userContent = buildContinuationReviewPrompt({
+    const userContent = buildContinuationReviewPrompt({
       approvedPlanText: planText,
       recentTranscript: transcript,
       workspaceOverview,
@@ -1920,7 +2452,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       capped
     });
 
-    const agentMsgId = `review-${Date.now()}`;
+    const agentMsgId = `next-${Date.now()}`;
     const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     setExecutingPlanNotice(capped ? 'Out of automatic steps — asking what to do next' : 'Checking what is left…');
     setMessages(prev => [
@@ -1930,13 +2462,13 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         role: 'assistant',
         raw: '',
         display: '',
-        agentId: reviewer.id,
-        personaHandle: reviewer.handle,
+        agentId: coderAgent.id,
+        personaHandle: coderAgent.handle,
         endpointId: node.id,
         endpointName: node.name,
         model,
         timestamp: stamp,
-        notice: `Checking the work on ${node.name}`,
+        notice: `Planning next step on ${node.name}`,
         toolCalls: []
       }
     ]);
@@ -1953,7 +2485,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           {
             model,
             messages: [
-              { role: 'system', content: CONTINUATION_REVIEW_SYSTEM },
+              {
+                role: 'system',
+                content:
+                  CONTINUATION_REVIEW_SYSTEM +
+                  '\n\nDo NOT use <edit_file> or <write_file>. Reviewer already checked the files; only emit <next_step>.'
+              },
               ...prior,
               { role: 'user', content }
             ],
@@ -1982,39 +2519,10 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         return handle.done;
       };
 
-      if (touchedPaths.length > 0 && window.electronAPI?.execTool) {
-        const chunks: string[] = [];
-        let chars = 0;
-        for (const path of touchedPaths.slice(0, 8)) {
-          if (chars > 160000) break;
-          try {
-            const res = await window.electronAPI.execTool(workspacePath, 'read_file', { path });
-            const body = (res.content || '').slice(0, 40000);
-            if (!body) continue;
-            chunks.push(`FILE ${path}\n${body}`);
-            chars += body.length;
-          } catch {
-            /* a missing file stays a local review */
-          }
-        }
-        const bundle = chunks.join('\n\n');
-        if (bundle && reviewNeedsAssist(chunks.length, bundle.length, chatNumCtx(node, model))) {
-          try {
-            const brief = await requestFreeTierBrief(
-              'Review these files for bugs the local model should patch. List only real defects.',
-              bundle
-            );
-            if (brief) {
-              userContent += `\n\nFree-tier review brief (patch these if they match the files):\n${brief}`;
-              setExecutingPlanNotice(`Asked the free-tier key for a short review of ${chunks.length} files.`);
-            }
-          } catch (err: any) {
-            window.electronAPI?.writeLog?.('warn', `free-tier review: ${err?.message || err}`);
-          }
-        }
-      }
-
-      const first = await askModel(userContent, []);
+      const first = await askModel(
+        `${userContent}\n\nReviewer already cleared this step (no open fix tasks). Decide <next_step> only — do not edit files.`,
+        []
+      );
       if (first.aborted || stopRequestedRef.current) return;
       if (first.stats?.evalCount) {
         const tokens = first.stats.evalCount + (first.stats.promptEvalCount || 0);
@@ -2035,7 +2543,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         );
         const follow = `Tool results:\n${ran.tools
           .map(t => `${t.name} ${t.args.path || t.args.query || ''}: ${(t.result || '').slice(0, 1200)}`)
-          .join('\n\n')}\n\nYou may emit <edit_file> patches for bugs in the files you just read. Do not start a new feature. Do not rewrite a whole file when a search/replace will do. Then end with exactly one <next_step> block.`;
+          .join('\n\n')}\n\nDo not edit files. End with exactly one <next_step> block.`;
         const second = await askModel(follow, [
           { role: 'user', content: userContent },
           { role: 'assistant', content: content }
@@ -2049,18 +2557,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         }
       }
 
-      let editTools = parseResponse(content, agentMsgId, false).toolCalls.filter(t => t.name === 'edit_file');
-      if (editTools.length) {
-        if (autoApplyWritesRef.current) {
-          editTools = await autoApplyWritableTools(editTools, toolDeps);
-          updateProgress(log => noteSavedFiles(log, editTools));
-        }
-        for (const tool of editTools) {
-          if (tool.args?.path) touchedPaths.push(tool.args.path);
-        }
-      }
-      const reviewTools = [...readTools, ...editTools];
-
+      const reviewTools = readTools;
       const parsedDecision = parseNextStep(content);
       const durableFallback = (progressRef.current.bug || progressRef.current.next || '').trim();
       const filteredDecision = parsedDecision
@@ -2092,11 +2589,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         tasksTooSimilar(previousTask, decision.task)
           ? decision.task
           : '';
-      const loopTask = (repeatTask || similarTask).trim();
+      const loopTask = stripKeepFixingPrefix(repeatTask || similarTask).trim();
       if (loopTask) {
         handledLoop = true;
         const key = stuckKey(loopTask);
-        const stage: StuckStage = stuckRef.current.stage;
+        const stage: StuckStage = resolveStuckStage(stuckRef.current, key);
         let step = nextStuckStage(stage);
         stuckRef.current = { key, stage };
         const stuckPayload = `${progressForPrompt()}\n\nStuck step:\n${loopTask}`;
@@ -2110,7 +2607,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             pinStuck = big;
             runTask = loopTask;
             options = [];
-            display = `Stuck repeating. Retrying on ${big.node.name} · ${big.model} (${big.node.hardware?.vramGB || 0} GB).`;
+            display = `Stuck repeating. Retrying on ${big.node.name} · ${big.model} (${big.node.hardware?.vramGB || 0} GB) with a different approach.`;
           } else {
             step = 'free';
           }
@@ -2144,17 +2641,66 @@ export const AgentChat: React.FC<AgentChatProps> = ({
         if (step === 'paid') {
           stuckRef.current.stage = 'paid';
           const paid = pickPaidFrontier(nodes);
+          const big = pickLargestLocalTarget(nodes);
           handoff = false;
           runTask = '';
           nextTask = '';
           pinStuck = undefined;
           pinFix = false;
           if (paid) {
-            display = `Still stuck after the largest local model and the free tier. Confirm before a paid call to ${paid.node.name} · ${paid.model}.`;
-            options = [{ id: 'use-paid-api', title: `Use paid API · ${paid.model}`, description: loopTask, action: 'paid' }];
+            display = `Still stuck after the largest local model and the free tier. Confirm before a paid call to ${paid.node.name} · ${paid.model}, or retry locally with a different approach.`;
+            options = [
+              ...(big
+                ? [
+                    {
+                      id: 'retry-local',
+                      title: `Retry differently · ${big.model}`,
+                      description: loopTask,
+                      action: 'retry-local' as const
+                    }
+                  ]
+                : []),
+              {
+                id: 'use-paid-api',
+                title: `Use paid API · ${paid.model}`,
+                description: loopTask,
+                action: 'paid' as const
+              },
+              {
+                id: 'stop-stuck',
+                title: 'Stop — I will give a new instruction',
+                description: loopTask,
+                action: 'stop' as const
+              }
+            ];
           } else {
-            display = 'Still stuck. No paid API node is available. Leave Free tier unchecked on a frontier key to use it as the paid step.';
-            options = [];
+            // No paid node: do not dead-end — offer local retry + stop. Local planning never required frontier.
+            display = big
+              ? `Still stuck after local retries (free-tier assist unavailable or empty). No paid API is required — retry on ${big.node.name} · ${big.model} with a different approach, or send a concrete new instruction.`
+              : 'Still stuck after local retries. No paid API is required. Send a concrete new instruction (file + what to change).';
+            options = big
+              ? [
+                  {
+                    id: 'retry-local',
+                    title: `Retry differently · ${big.model}`,
+                    description: loopTask,
+                    action: 'retry-local' as const
+                  },
+                  {
+                    id: 'stop-stuck',
+                    title: 'Stop — I will give a new instruction',
+                    description: loopTask,
+                    action: 'stop' as const
+                  }
+                ]
+              : [
+                  {
+                    id: 'stop-stuck',
+                    title: 'Stop — I will give a new instruction',
+                    description: loopTask,
+                    action: 'stop' as const
+                  }
+                ];
           }
         }
       }
@@ -2249,9 +2795,11 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       : '';
     await runSingleNodeTurn({
       userText: `Continue: ${nextTask}`,
-      fullPrompt: pinFix || stuckTarget
-        ? `${planPrefix}NEXT STEP — fix the existing files with <edit_file>. Do not rewrite a file from scratch when a search/replace will do. Do not add a new feature.\n\n${nextTask}`
-        : `${planPrefix}NEXT STEP — do this now, then stop. Do not expand into unrelated features.\n\n${nextTask}`,
+      fullPrompt: stuckTarget
+        ? `${planPrefix}STUCK RETRY — you already repeated this step. Do NOT repeat the same approach. Use a different concrete <edit_file>/<write_file> fix, or stop and state the blocker in one sentence.\n\n${nextTask}`
+        : pinFix
+          ? `${planPrefix}NEXT STEP — fix the existing files with <edit_file>. Do not rewrite a file from scratch when a search/replace will do. Do not add a new feature.\n\n${nextTask}`
+          : `${planPrefix}NEXT STEP — do this now, then stop. Do not expand into unrelated features.\n\n${nextTask}`,
       agent: coderAgent,
       planMode: false,
       approvedPlan: approvedPlanRef.current,
@@ -2266,7 +2814,552 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     await reviewAndAdvance(depth + 1, nextTask);
   };
 
-  /** After the user picks a plan option — lock plan, switch to Coder, execute. */
+  /**
+   * After a coding step: Reviewer checks work.
+   * - Active PlannerPlan → step Yay/Nay (reviewActiveStep).
+   * - Legacy flat queue → review_delta / seed review_plan.
+   */
+  const reviewAndAdvance = async (depth: number, previousTask = ''): Promise<void> => {
+    if (stopRequestedRef.current) return;
+
+    if (isPlanActive(plannerPlanRef.current)) {
+      await reviewActiveStep();
+      return;
+    }
+
+    const recent = messagesRef.current;
+    let userIdx = recent.length - 1;
+    while (userIdx >= 0 && recent[userIdx].role !== 'user') userIdx -= 1;
+    const sinceUser = recent.slice(Math.max(0, userIdx));
+    const didWork =
+      !!approvedPlanRef.current ||
+      !!executionQueueRef.current ||
+      sinceUser.some(m =>
+        (m.pipelineSteps && m.pipelineSteps.length > 0) ||
+        (m.toolCalls || []).some(t =>
+          t.name === 'write_file' ||
+          t.name === 'edit_file' ||
+          t.name === 'run_command' ||
+          t.name === 'generate_image'
+        )
+      );
+    if (depth === 0 && !didWork) return;
+
+    const target = pickCapableReviewTarget(nodes);
+    if (!target) {
+      if (autoReviewRef.current) await decideNextStepAndAdvance(depth, previousTask);
+      return;
+    }
+
+    const touchedPaths = collectWrittenPaths(recent);
+    const planText = approvedPlanRef.current
+      ? formatApprovedPlanContext(approvedPlanRef.current)
+      : '';
+    const transcript = recent
+      .slice(-6)
+      .map(m => {
+        const who = m.role === 'user' ? 'User' : m.personaHandle || 'Assistant';
+        const text = (m.display || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+        return text ? `${who}: ${text}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+    const filesHint = touchedPaths.length
+      ? `Files just written/edited:\n${touchedPaths.slice(0, 12).join('\n')}`
+      : 'No write/edit paths recorded — review the latest coding step from chat context.';
+    const filesBody = await buildTouchedFilesContext(workspacePath, touchedPaths, {
+      maxFiles: 8,
+      maxCharsPerFile: 5000,
+      maxTotalChars: 20000
+    });
+
+    const existingQueue = executionQueueRef.current;
+    const activeTask = getActiveTask(existingQueue);
+    const deltaMode =
+      !!existingQueue &&
+      !!activeTask &&
+      (activeTask.status === 'in_progress' || activeTask.status === 'failed');
+
+    const reviewPrompt = deltaMode
+      ? `${planText ? `${planText}\n\n` : ''}${formatQueueForReviewer(existingQueue!, activeTask!)}
+
+${filesHint}
+
+${filesBody || '(No file bodies loaded — at most two read_file calls, then verdict.)'}
+
+Recent chat:
+${transcript || '(none)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}
+
+Verify ONLY active task #${activeTask!.id}. End with <review_delta task_id="${activeTask!.id}">.
+Do NOT emit a new <review_plan>. Do NOT write or edit files. Do not re-read files already shown above.`
+      : `${planText ? `${planText}\n\n` : ''}## Post-step review (seed durable task list)
+Check the work that just finished for bugs, broken wiring, and missing behavior.
+${filesHint}
+
+${filesBody || '(No file bodies loaded — at most two read_file calls, then emit <review_plan>.)'}
+
+Recent chat:
+${transcript || '(none)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}
+
+Prefer the file contents above. At most two extra reads, then end with a <review_plan> (tasks if fixes needed; summary-only if clean).
+This list will be kept by Planner — do not expect to replace it later. Do NOT write or edit files.`;
+
+    setExecutingPlanNotice(
+      autoReviewRef.current
+        ? deltaMode
+          ? `Reviewer verifying task #${activeTask!.id}…`
+          : 'Reviewer checking the work…'
+        : 'Reviewer checking — waiting for your approval after'
+    );
+
+    const reviewMsg = await runSingleNodeTurn({
+      userText: deltaMode
+        ? `Verify task #${activeTask!.id}: ${activeTask!.title}`
+        : 'Review the latest coding step',
+      fullPrompt: reviewPrompt,
+      agent: reviewerAgent,
+      reviewMode: true,
+      skipUserAppend: true,
+      notice: `Reviewer checking on ${target.node.name}`,
+      pinRoute: target
+    });
+
+    if (stopRequestedRef.current) return;
+
+    const latestReview =
+      reviewMsg ||
+      [...messagesRef.current].reverse().find(
+        m => m.role === 'assistant' && (m.personaHandle === 'reviewer' || m.reviewPlan)
+      );
+    const rawBlob = `${latestReview?.display || ''}\n${latestReview?.raw || ''}`;
+
+    // —— Delta path: update durable queue status; never reseed from a new full plan ——
+    if (deltaMode && existingQueue && activeTask) {
+      let delta = parseReviewDelta(latestReview?.raw || '');
+      if (!delta) {
+        const parsedPlan =
+          latestReview?.reviewPlan ||
+          (latestReview ? parseReviewPlan(latestReview.raw || '') : null) ||
+          ({ summary: 'No structured issues found.', tasks: [] } as const);
+        const coerced = coerceDirtyReviewPlan(parsedPlan, rawBlob);
+        if (coerced.tasks.length === 0) {
+          delta = {
+            taskId: activeTask.id,
+            verdict: 'completed',
+            notes: coerced.summary || 'Looks good.'
+          };
+        } else {
+          delta = {
+            taskId: activeTask.id,
+            verdict: 'failed',
+            notes:
+              coerced.tasks.map(t => t.description).join(' ') ||
+              coerced.summary ||
+              'Active task not completed correctly.'
+          };
+        }
+      }
+
+      const updated = applyReviewDelta(existingQueue, {
+        ...delta,
+        taskId: delta.taskId || activeTask.id
+      });
+      commitExecutionQueue(updated);
+      const snap = queueToReviewPlan(updated);
+
+      if (latestReview) {
+        setMessages(prev => {
+          const next = prev.map(m =>
+            m.id === latestReview.id
+              ? {
+                  ...m,
+                  reviewPlan: snap,
+                  reviewSentToCoder: false,
+                  reviewNeedsContinue: !autoReviewRef.current
+                }
+              : m
+          );
+          messagesRef.current = next;
+          return next;
+        });
+      }
+
+      const after = getActiveTask(updated) || updated.tasks.find(t => t.id === activeTask.id);
+      const failed = after?.status === 'failed';
+      const completed = after?.status === 'completed';
+
+      if (failed) {
+        if (autoReviewRef.current) {
+          await sendReviewPlanToPlanner(
+            latestReview ? { ...latestReview, reviewPlan: snap } : null,
+            depth,
+            after?.failureNote
+          );
+          return;
+        }
+        pendingReviewResumeRef.current = { depth, previousTask };
+        setExecutingPlanNotice(
+          `Task #${activeTask.id} failed review — Send to Planner when ready`
+        );
+        return;
+      }
+
+      if (completed) {
+        if (hasOpenTasks(updated)) {
+          if (autoReviewRef.current) {
+            await sendReviewPlanToPlanner(null, depth);
+            return;
+          }
+          pendingReviewResumeRef.current = { depth, previousTask };
+          setExecutingPlanNotice('Task done — Send to Planner for the next queued task');
+          return;
+        }
+        // Queue finished
+        if (!autoReviewRef.current) {
+          if (latestReview) {
+            setMessages(prev => {
+              const next = prev.map(m =>
+                m.id === latestReview.id
+                  ? { ...m, reviewPlan: snap, reviewNeedsContinue: true }
+                  : m
+              );
+              messagesRef.current = next;
+              return next;
+            });
+          }
+          pendingReviewResumeRef.current = { depth, previousTask };
+          setExecutingPlanNotice('All review tasks done — click Looks good / Continue');
+          return;
+        }
+        await decideNextStepAndAdvance(depth, previousTask);
+        return;
+      }
+    }
+
+    // —— Seed path: first review creates the durable list once ——
+    const parsedPlan =
+      latestReview?.reviewPlan ||
+      (latestReview ? parseReviewPlan(latestReview.raw || '') : null) ||
+      ({ summary: 'No structured issues found.', tasks: [] } as const);
+    const plan = coerceDirtyReviewPlan(parsedPlan, rawBlob);
+
+    if (plan.tasks.length > 0) {
+      // Keep an existing unfinished queue; only seed when empty
+      if (!hasOpenTasks(executionQueueRef.current)) {
+        const seeded = createQueueFromReviewPlan(plan, latestReview?.id);
+        commitExecutionQueue(seeded);
+      }
+      const snap = queueToReviewPlan(executionQueueRef.current!);
+      if (latestReview) {
+        setMessages(prev => {
+          const next = prev.map(m =>
+            m.id === latestReview.id ? { ...m, reviewPlan: snap } : m
+          );
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      const planMsg = latestReview
+        ? { ...latestReview, reviewPlan: snap }
+        : null;
+
+      if (autoReviewRef.current) {
+        await sendReviewPlanToPlanner(planMsg, depth);
+        return;
+      }
+      pendingReviewResumeRef.current = { depth, previousTask };
+      setExecutingPlanNotice('Review found issues — Send to Planner when ready');
+      return;
+    }
+
+    if (latestReview && (!latestReview.reviewPlan || latestReview.reviewPlan.tasks.length !== plan.tasks.length)) {
+      setMessages(prev => {
+        const next = prev.map(m => (m.id === latestReview.id ? { ...m, reviewPlan: plan } : m));
+        messagesRef.current = next;
+        return next;
+      });
+    }
+
+    const planMsg = latestReview ? { ...latestReview, reviewPlan: plan } : null;
+
+    if (!autoReviewRef.current) {
+      if (planMsg) {
+        setMessages(prev => {
+          const next = prev.map(m =>
+            m.id === planMsg.id
+              ? { ...m, reviewPlan: plan, reviewNeedsContinue: true }
+              : m
+          );
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      pendingReviewResumeRef.current = { depth, previousTask };
+      setExecutingPlanNotice('Review looks clean — click Looks good / Continue');
+      return;
+    }
+
+    await decideNextStepAndAdvance(depth, previousTask);
+  };
+
+  /** Dispatch the active Planner step to Coders (sequential single-node or Swarm for the step). */
+  const dispatchActiveStep = async (): Promise<void> => {
+    if (stopRequestedRef.current) return;
+    let plan = plannerPlanRef.current;
+    if (!plan || plan.status !== 'active') return;
+
+    let step = getActiveStep(plan);
+    if (!step || step.status === 'completed') {
+      plan = activateNextStep(plan);
+      commitPlannerPlan(plan);
+      if (plan.status === 'completed') {
+        setExecutingPlanNotice('Planner plan complete.');
+        return;
+      }
+      step = getActiveStep(plan);
+    }
+    if (!step) return;
+
+    plan = markStepInProgress(plan, step.id);
+    commitPlannerPlan(plan);
+    step = getActiveStep(plan)!;
+
+    onSelectAgent(coderAgent.id);
+    onConversationPatch?.({ agentId: coderAgent.id });
+    if (coderAgent.autoApproveWrites !== undefined) {
+      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
+      setAutoApplyWrites(coderAgent.autoApproveWrites);
+    }
+
+    resetAgentLoopBudget();
+    stopRequestedRef.current = false;
+
+    const coderPrompt = formatStepForCoders(plan, step);
+    setExecutingPlanNotice(`Coder(s) on step #${step.id}: ${step.title}…`);
+
+    if (isPipelineMode) {
+      const synthetic: ApprovedPlan = {
+        summary: `${plan.summary} — step ${step.id}`,
+        chosenOptionId: plan.chosenOptionId || 'plan-step',
+        chosenOptionTitle: step.title,
+        chosenOptionDescription: step.tasks.map(t => `${t.id}. ${t.title}: ${t.description}`).join('\n'),
+        allOptions: [],
+        originalUserRequest: `Plan step #${step.id}: ${step.title}`,
+        approvedAt: Date.now(),
+        planMarkdown: coderPrompt
+      };
+      approvedPlanRef.current = synthetic;
+      onConversationPatch?.({ approvedPlan: synthetic });
+      await handleSendPipelineMessage(`Plan step #${step.id}: ${step.title}`, coderPrompt, {
+        approvedPlan: synthetic,
+        skipUserAppend: true
+      });
+    } else {
+      await runSingleNodeTurn({
+        userText: `Implement plan step #${step.id}: ${step.title}`,
+        fullPrompt: coderPrompt,
+        agent: coderAgent,
+        planMode: false,
+        approvedPlan: approvedPlanRef.current,
+        skipUserAppend: true,
+        notice: `Coder implementing step #${step.id}`
+      });
+    }
+
+    if (stopRequestedRef.current) return;
+
+    // Mark step tasks done for coder pass; Reviewer Yay/Nay is the real gate.
+    plan = plannerPlanRef.current;
+    if (plan && step) {
+      plan = markAllStepTasks(plan, step.id, 'completed');
+      commitPlannerPlan(plan);
+    }
+    await reviewActiveStep();
+  };
+
+  /** Reviewer Yay/Nay on the active Planner step. */
+  const reviewActiveStep = async (): Promise<void> => {
+    if (stopRequestedRef.current) return;
+    const plan = plannerPlanRef.current;
+    const step = getActiveStep(plan);
+    if (!plan || !step) {
+      if (plan?.status === 'completed') {
+        setExecutingPlanNotice('Planner plan complete.');
+      }
+      return;
+    }
+
+    const target = pickCapableReviewTarget(nodes);
+    if (!target) {
+      setExecutingPlanNotice('No reviewer-capable node online for step verdict.');
+      return;
+    }
+
+    const touchedPaths = collectWrittenPaths(messagesRef.current);
+    const filesHint = touchedPaths.length
+      ? `Files just written/edited:\n${touchedPaths.slice(0, 16).join('\n')}`
+      : 'Review from chat context and the step task list.';
+    const filesBody = await buildTouchedFilesContext(workspacePath, touchedPaths, {
+      maxFiles: 8,
+      maxCharsPerFile: 5000,
+      maxTotalChars: 20000
+    });
+
+    const reviewPrompt = `${formatStepForReviewer(plan, step)}
+
+${filesHint}
+
+${filesBody || '(No file bodies loaded — use at most two read_file calls, then verdict.)'}
+
+Work log:
+${progressForPrompt() || '(empty)'}
+
+After reviewing the files above, emit <step_verdict> immediately. Do not re-read the same paths.`;
+
+    setExecutingPlanNotice(
+      autoReviewRef.current
+        ? `Reviewer Yay/Nay on step #${step.id}…`
+        : `Reviewer checking step #${step.id} — waiting for your approval`
+    );
+
+    const reviewMsg = await runSingleNodeTurn({
+      userText: `Verify plan step #${step.id}: ${step.title}`,
+      fullPrompt: reviewPrompt,
+      agent: reviewerAgent,
+      reviewMode: true,
+      stepVerdictMode: true,
+      skipUserAppend: true,
+      notice: `Reviewer on ${target.node.name} — step #${step.id}`,
+      pinRoute: target
+    });
+
+    if (stopRequestedRef.current) return;
+
+    const latest =
+      reviewMsg ||
+      [...messagesRef.current].reverse().find(
+        m => m.role === 'assistant' && (m.stepVerdict || m.personaHandle === 'reviewer')
+      );
+
+    let verdict = latest?.stepVerdict
+      ? {
+          stepId: latest.stepVerdict.stepId,
+          result: latest.stepVerdict.result,
+          notes: latest.stepVerdict.notes
+        }
+      : parseStepVerdict(latest?.raw || '');
+
+    if (!verdict) {
+      // Infer from prose when markup missing
+      const blob = `${latest?.display || ''}\n${latest?.raw || ''}`;
+      const dirty =
+        /\b(bug|issue|missing|broken|incorrect|fail|wrong|incomplete)\b/i.test(blob) &&
+        !/\b(no (blocking )?issues|looks correct|all good)\b/i.test(blob);
+      verdict = {
+        stepId: step.id,
+        result: dirty ? 'nay' : 'yay',
+        notes: (latest?.display || '').slice(0, 400) || (dirty ? 'Needs refining.' : 'Looks good.')
+      };
+    }
+
+    const packed = {
+      stepId: verdict.stepId || step.id,
+      stepTitle: step.title,
+      result: verdict.result,
+      notes: verdict.notes
+    };
+
+    if (latest) {
+      setMessages(prev => {
+        const next = prev.map(m =>
+          m.id === latest.id
+            ? {
+                ...m,
+                stepVerdict: packed,
+                stepVerdictNeedsConfirm: !autoReviewRef.current,
+                stepVerdictApplied: false
+              }
+            : m
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    }
+
+    if (!autoReviewRef.current) {
+      setExecutingPlanNotice(
+        packed.result === 'yay'
+          ? `Step #${step.id} Yay — click Accept to continue`
+          : `Step #${step.id} Nay — click Accept to send fixes to Coder`
+      );
+      return;
+    }
+
+    await applyStepVerdictAndContinue(
+      latest ? { ...latest, stepVerdict: packed } : null,
+      packed
+    );
+  };
+
+  /** Apply Yay/Nay to durable plan, then next step or rework. */
+  const applyStepVerdictAndContinue = async (
+    verdictMsg: ChatMessage | null,
+    packed?: { stepId: string; stepTitle: string; result: 'yay' | 'nay'; notes: string }
+  ): Promise<void> => {
+    const v = packed || verdictMsg?.stepVerdict;
+    if (!v) return;
+    if (verdictMsg?.stepVerdictApplied) return;
+
+    let plan = plannerPlanRef.current;
+    if (!plan) return;
+
+    plan = applyStepVerdict(plan, {
+      stepId: v.stepId,
+      result: v.result,
+      notes: v.notes
+    });
+    commitPlannerPlan(plan);
+
+    if (verdictMsg) {
+      setMessages(prev => {
+        const next = prev.map(m =>
+          m.id === verdictMsg.id
+            ? { ...m, stepVerdictApplied: true, stepVerdictNeedsConfirm: false }
+            : m
+        );
+        messagesRef.current = next;
+        return next;
+      });
+    }
+
+    if (plan.status === 'completed') {
+      setExecutingPlanNotice('All plan steps complete.');
+      return;
+    }
+
+    if (v.result === 'nay') {
+      setExecutingPlanNotice(`Reworking step #${v.stepId} from Reviewer Nay…`);
+      await dispatchActiveStep();
+      return;
+    }
+
+    // Yay — next step already activated by applyStepVerdict
+    const next = getActiveStep(plan);
+    if (next) {
+      setExecutingPlanNotice(`Step Yay — starting step #${next.id}: ${next.title}`);
+      await dispatchActiveStep();
+    } else {
+      setExecutingPlanNotice('Planner plan complete.');
+    }
+  };
+
+  /** After the user picks a plan option — Planner locks steps/tasks, then Coders run step 1. */
   const executeChosenPlan = async (
     option: PlanOption,
     planMsg: ChatMessage,
@@ -2276,16 +3369,16 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     const original = findPlanOriginalRequest(messagesRef.current, planMsg);
     const approved = buildApprovedPlan(planMsg, option, original);
     approvedPlanRef.current = approved;
+    executionQueueRef.current = null;
+    commitPlannerPlan(null);
 
-    onSelectAgent(coderAgent.id);
-    onConversationPatch?.({ approvedPlan: approved, agentId: coderAgent.id });
-    if (coderAgent.autoApproveWrites !== undefined) {
-      autoApplyWritesRef.current = coderAgent.autoApproveWrites;
-      setAutoApplyWrites(coderAgent.autoApproveWrites);
-    }
-
-    const notice = `Executing plan as Coder — Option ${option.id}: ${option.title}`;
-    setExecutingPlanNotice(notice);
+    onSelectAgent(plannerAgent.id);
+    onConversationPatch?.({
+      approvedPlan: approved,
+      executionQueue: null,
+      plannerPlan: null,
+      agentId: plannerAgent.id
+    });
 
     const confirmDisplay = confirmationText.trim() || `Option ${option.id}: ${option.title}`;
     updateProgress(log => noteUserTurn(log, `${option.title}. ${option.description}`));
@@ -2297,7 +3390,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       display: confirmDisplay,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       chosenPlanOptionId: option.id,
-      personaHandle: 'coder',
+      personaHandle: 'planner',
       ...(attachedImages.length ? { images: attachedImages } : {})
     };
     setMessages(prev => {
@@ -2309,34 +3402,90 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       return next;
     });
 
-    const execPrompt = `${formatApprovedPlanForSwarm(approved)}\n\nImplement the chosen option now.`;
-    let fullPrompt = execPrompt;
-    if (includeActiveFile && activeTab) {
-      fullPrompt = `[Active File: ${activeTab.name}]\n\`\`\`${activeTab.language}\n${activeTab.content}\n\`\`\`\n\n${execPrompt}`;
-    }
-
     resetAgentLoopBudget();
     stopRequestedRef.current = false;
 
-    // Swarm path: Pass 1 Lead Architect gets the approved plan text
-    if (isPipelineMode && attachedImages.length === 0) {
-      await handleSendPipelineMessage(confirmDisplay, fullPrompt, {
-        approvedPlan: approved,
-        skipUserAppend: true
-      });
-    } else {
-      await runSingleNodeTurn({
-        userText: confirmDisplay,
-        fullPrompt,
-        attachedImages,
-        agent: coderAgent,
-        planMode: false,
-        approvedPlan: approved,
-        skipUserAppend: true,
-        notice
-      });
+    const lockPrompt = `${formatApprovedPlanContext(approved)}
+
+## Chosen option
+${option.id}. ${option.title}
+${option.description}
+
+Break this into ordered <execution_plan> steps with concrete coder tasks. Do not implement code.`;
+
+    setExecutingPlanNotice(`Planner locking execution plan for Option ${option.id}…`);
+
+    const lockMsg = await runSingleNodeTurn({
+      userText: `Lock execution plan for option ${option.id}`,
+      fullPrompt: lockPrompt,
+      attachedImages,
+      agent: plannerAgent,
+      lockPlanMode: true,
+      skipUserAppend: true,
+      notice: `Planner writing steps for Option ${option.id}`
+    });
+
+    if (stopRequestedRef.current) return;
+
+    const raw = lockMsg?.raw || '';
+    let parsed = parseExecutionPlan(raw);
+    if (!parsed?.steps.length) {
+      // Fallback: one step from the chosen option so orchestration can still run
+      parsed = {
+        summary: option.title,
+        steps: [
+          {
+            id: '1',
+            title: option.title,
+            description: option.description,
+            tasks: [
+              {
+                id: '1a',
+                title: option.title,
+                description: option.description || approved.originalUserRequest
+              }
+            ]
+          }
+        ]
+      };
     }
-    if (!stopRequestedRef.current) await reviewAndAdvance(0);
+
+    let plan = createPlanFromParsed(parsed, {
+      conversationId: conversationIdRef.current || undefined,
+      chosenOptionId: option.id,
+      chosenOptionTitle: option.title
+    });
+    plan = activateNextStep(plan);
+    commitPlannerPlan(plan);
+    setExecutingPlanNotice(`Plan locked (${plan.steps.length} steps) — dispatching step 1…`);
+
+    await dispatchActiveStep();
+  };
+
+  /** User chose "Retry differently" after the stuck ladder — one more local attempt, new approach. */
+  const retryStuckLocally = async (task: string) => {
+    const cleaned = stripKeepFixingPrefix(task).trim();
+    if (!cleaned) return;
+    const big = pickLargestLocalTarget(nodes);
+    if (!big) {
+      setExecutingPlanNotice('No local model online to retry.');
+      return;
+    }
+    stuckRef.current = { key: stuckKey(cleaned), stage: 'big' };
+    setExecutingPlanNotice(`Retrying differently on ${big.node.name} · ${big.model}`);
+    resetAgentLoopBudget();
+    stopRequestedRef.current = false;
+    await runSingleNodeTurn({
+      userText: `Retry differently: ${cleaned}`,
+      fullPrompt: `You already repeated this step without finishing it. Do NOT repeat the same approach.\n\nEither:\n1) Implement a concrete different fix with <edit_file> / <write_file>, or\n2) Stop and state what is blocking in one short sentence.\n\nStuck step:\n${cleaned}`,
+      agent: coderAgent,
+      planMode: false,
+      reviewMode: false,
+      approvedPlan: approvedPlanRef.current,
+      notice: `Stuck retry (different approach) on ${big.node.name} · ${big.model}`,
+      pinRoute: big
+    });
+    if (!stopRequestedRef.current) await reviewAndAdvance(0, cleaned);
   };
 
   const confirmPaidAssist = async (task: string) => {
@@ -2409,10 +3558,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       void confirmPaidAssist(option.description);
       return;
     }
+    if (option.action === 'retry-local') {
+      setMessages(prev =>
+        prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
+      );
+      void retryStuckLocally(option.description);
+      return;
+    }
     if (option.action === 'stop') {
       setMessages(prev =>
         prev.map(m => (m.id === planMsg.id ? { ...m, selectedPlanOptionId: option.id } : m))
       );
+      stuckRef.current = { key: '', stage: 'none' };
       setExecutingPlanNotice(null);
       return;
     }
@@ -2452,10 +3609,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       }
     }
 
-    // New request clears a prior locked plan unless we're mid-option-match
+    // New request clears a prior locked plan / review queue unless we're mid-option-match
     if (approvedPlanRef.current && isPlannerSelected) {
       approvedPlanRef.current = null;
-      onConversationPatch?.({ approvedPlan: null });
+      executionQueueRef.current = null;
+      commitPlannerPlan(null);
+      onConversationPatch?.({ approvedPlan: null, executionQueue: null, plannerPlan: null });
       setExecutingPlanNotice(null);
     }
 
@@ -2481,6 +3640,18 @@ export const AgentChat: React.FC<AgentChatProps> = ({
       });
     }
 
+    // Reviewer selected → findings + review_plan only (Send to Planner → Coder)
+    if (isReviewerSelected) {
+      setExecutingPlanNotice(null);
+      return runSingleNodeTurn({
+        userText,
+        fullPrompt,
+        attachedImages,
+        agent: currentAgent,
+        reviewMode: true
+      });
+    }
+
     // Image paste skips parallel pipeline — vision needs a single multimodal turn
     if (isPipelineMode && !hasImages) {
       await handleSendPipelineMessage(userText, fullPrompt, {
@@ -2501,6 +3672,7 @@ export const AgentChat: React.FC<AgentChatProps> = ({
 
   const handleStop = () => {
     stopRequestedRef.current = true;
+    pendingReviewResumeRef.current = null;
     activeAbortsRef.current.forEach(abort => abort());
     activeAbortsRef.current = [];
     setIsStreaming(false);
@@ -2569,18 +3741,49 @@ export const AgentChat: React.FC<AgentChatProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   });
 
+  const [controlColWidth, setControlColWidth] = useState(controlWidth);
+  const controlColWidthRef = useRef(controlWidth);
+  const [resizingControl, setResizingControl] = useState(false);
+  useEffect(() => {
+    setControlColWidth(controlWidth);
+    controlColWidthRef.current = controlWidth;
+  }, [controlWidth]);
+  useEffect(() => {
+    if (!resizingControl) return;
+    const onMove = (e: MouseEvent) => {
+      const el = document.getElementById('agent-conductor-root');
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const next = Math.max(220, Math.min(420, rect.right - e.clientX));
+      controlColWidthRef.current = next;
+      setControlColWidth(next);
+    };
+    const onUp = () => {
+      setResizingControl(false);
+      onControlWidthChange?.(controlColWidthRef.current);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [resizingControl, onControlWidthChange]);
+
   return (
     <div
+      id="agent-conductor-root"
       style={{ width }}
-      className="h-full bg-[#161619] border-l border-[#27272a] flex flex-col select-none shrink-0"
+      className="h-full bg-[#161619] border-l border-[#27272a] flex flex-row select-none shrink-0 min-w-0"
     >
-      {/* Conductor & Mode Selector Header */}
-      <div className="p-3 border-b border-[#27272a] bg-[#121215] flex flex-col space-y-2.5">
+      {/* Left — Conversation */}
+      <div className="flex-1 min-w-[240px] flex flex-col min-h-0 overflow-hidden">
+      <div className="p-3 border-b border-[#27272a] bg-[#121215] flex flex-col space-y-2 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center space-x-1.5 text-xs font-bold text-zinc-200 min-w-0">
             <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-            <span className="truncate" title={conversation?.title || 'Agent Conductor'}>
-              {conversation?.title || 'Agent Conductor'}
+            <span className="truncate" title={conversation?.title || 'Conversation'}>
+              {conversation?.title || 'Conversation'}
             </span>
           </div>
 
@@ -2661,225 +3864,6 @@ export const AgentChat: React.FC<AgentChatProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center space-x-1 min-w-0">
-            {agents.map(a => (
-              <button
-                key={a.id}
-                onClick={() => onSelectAgent(a.id)}
-                title={`${a.name}: ${a.role}`}
-                className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
-                  selectedAgentId === a.id
-                    ? 'bg-indigo-600 text-white shadow-sm'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#202026]'
-                }`}
-              >
-                {a.handle}
-              </button>
-            ))}
-          </div>
-          <HelpTip title="Agent personas" align="right">
-            <p>Each handle is a different system prompt and default routing preference:</p>
-            <ul className="list-disc pl-3.5 space-y-1">
-              <li><b className="text-zinc-300">coder</b> — build & edit files; auto-applies writes</li>
-              <li><b className="text-zinc-300">planner</b> — proposes a plan with 2–4 options; picking one auto-runs as Coder</li>
-              <li><b className="text-zinc-300">reviewer</b> — bugs/security review; prefers the laptop node</li>
-              <li><b className="text-zinc-300">docs</b> — explanations, tests, docs; prefers the server</li>
-            </ul>
-            <p>On Planner, click an option button or type <span className="font-mono text-zinc-300">option 1</span>. The next turn executes as Coder. After each coding step the largest enabled local model checks the work, may patch a bug in those files, and keeps going or stops with the next choices.</p>
-            <p>Compact folds older messages when the chat gets large. Finished steps and the next step stay in the project work log and are sent with every turn, so the Conductor does not ask the same question again.</p>
-          </HelpTip>
-        </div>
-
-        {(progressLog.next || progressLog.done.length > 0) && (
-          <div className="text-[10px] text-zinc-400 truncate" title={renderWorkLog(progressLog)}>
-            <span className="text-emerald-300/90 font-medium">Next:</span> {progressLog.next || '—'}
-            <span className="text-zinc-500"> · {progressLog.done.length} done</span>
-          </div>
-        )}
-
-        {executingPlanNotice && (
-          <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
-            <span className="font-medium truncate">{executingPlanNotice}</span>
-            <button
-              type="button"
-              className="shrink-0 text-zinc-400 hover:text-zinc-200"
-              onClick={() => setExecutingPlanNotice(null)}
-              title="Dismiss"
-            >
-              <X className="w-3 h-3" />
-            </button>
-          </div>
-        )}
-
-        {/* Dynamic Hardware Dispatcher */}
-        <div className="grid grid-cols-2 gap-2 text-[10px]">
-          <div className="flex flex-col space-y-1">
-            <span className="text-zinc-500 font-medium flex items-center justify-between gap-1">
-              <span className="flex items-center space-x-1 min-w-0">
-                {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
-                <span className="truncate">Hardware Target</span>
-                <HelpTip title="Hardware Target">
-                  <p>Which PC / API endpoint runs this chat turn.</p>
-                  <p><b className="text-zinc-300">Local nodes</b> (Main Rig, Linux Server, Laptop) use your Ollama GPUs for free.</p>
-                  <p><b className="text-zinc-300">Frontier</b> (e.g. Grok) uses a cloud API key when you need stronger reasoning.</p>
-                  <p>Picking a target manually turns off Auto-Node for this session.</p>
-                </HelpTip>
-              </span>
-            </span>
-            <select
-              value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
-              onChange={(e) => {
-                const newNodeId = e.target.value;
-                setTargetNodeId(newNodeId);
-                setAutoSelectEndpoint(false);
-                const nextNode = nodes.find(n => n.id === newNodeId);
-                if (nextNode) {
-                  setTargetModel(getPreferredModelForNode(nextNode));
-                }
-              }}
-              disabled={nodes.length === 0}
-              className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-            >
-              {nodes.length === 0 ? (
-                <option value="">No endpoints — open Hardware Settings</option>
-              ) : (
-                nodes.map(n => (
-                  <option key={n.id} value={n.id} disabled={!n.online}>
-                    {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
-
-          <div className="flex flex-col space-y-1">
-            <span className="text-zinc-500 font-medium flex items-center justify-between gap-1">
-              <span className="flex items-center space-x-1 min-w-0">
-                <span className="truncate">Node Model</span>
-                <HelpTip title="Node Model" align="right">
-                  <p>Which Ollama (or frontier) model runs on the selected hardware.</p>
-                  <p>Only models toggled <b className="text-zinc-300">ON</b> in Hardware Settings appear here. Embedding models are filtered out.</p>
-                  <p>Setting a model here becomes that node’s default for Conductor jobs too.</p>
-                </HelpTip>
-              </span>
-              {benchmarkStat && (
-                <span className="text-amber-400 font-mono text-[9px] flex items-center space-x-0.5 shrink-0">
-                  <Zap className="w-2.5 h-2.5" />
-                  <span>{benchmarkStat.evalTokPerSec} t/s</span>
-                </span>
-              )}
-            </span>
-            <select
-              value={activeTargetModel}
-              onChange={(e) => {
-                const newModel = e.target.value;
-                if (!newModel) return;
-                setTargetModel(newModel);
-                if (selectedNode) {
-                  onSelectNodeModel?.(selectedNode.id, newModel);
-                }
-              }}
-              disabled={effectiveModels.length === 0}
-              className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
-            >
-              {effectiveModels.length === 0 ? (
-                <option value="">
-                  {!selectedNode
-                    ? 'Add an endpoint in Hardware Settings'
-                    : selectedNode.online
-                      ? 'No models installed — pull in Hardware Settings'
-                      : 'Node offline / no models'}
-                </option>
-              ) : (
-                effectiveModels.map(m => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))
-              )}
-            </select>
-            {selectedSupportsThink && onToggleModelThinking && selectedNode && activeTargetModel && (
-              <button
-                type="button"
-                onClick={() => onToggleModelThinking(selectedNode.id, activeTargetModel, !selectedThinkOn)}
-                className={`mt-1 w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border text-[10px] font-medium transition ${
-                  selectedThinkOn
-                    ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
-                    : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
-                }`}
-                title="Qwen3-style thinking: ON = deeper/slower, OFF = faster direct answers"
-              >
-                <Brain className={`w-3 h-3 ${selectedThinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
-                <span>{thinkingToggleLabel(!!selectedThinkOn)}</span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Conductor Swarm & Routing Controls */}
-        <div className="flex items-center justify-between pt-1 border-t border-[#22222a] text-[10px] gap-2">
-          <div className="flex items-center space-x-1 min-w-0">
-            <button
-              onClick={() => setIsPipelineMode(!isPipelineMode)}
-              className={`flex items-center space-x-1.5 px-2 py-1 rounded border transition ${
-                isPipelineMode
-                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
-                  : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
-              }`}
-              title={isPipelineMode ? 'Conductor Swarm is ON — click to use single-node chat' : 'Click to enable multi-GPU file distribution'}
-            >
-              <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
-              <span className="truncate">
-                Conductor Swarm ({onlineLocalNodes.length} local
-                {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
-                  ? ` + frontier`
-                  : ''}
-                )
-              </span>
-            </button>
-            <HelpTip title="Conductor Swarm mode">
-              <p><b className="text-zinc-300">Off (default):</b> one message → one node/model. Best for questions, edits, and single-file work.</p>
-              <p><b className="text-zinc-300">On (contract-first):</b> Pass 1 locks a shared TypeScript contract on the Lead Architect GPU, verifies it with <code className="text-indigo-300">tsc</code>, then Pass 2 fans file workers across online GPUs with that contract injected read-only.</p>
-              <p><b className="text-zinc-300">Local-first:</b> uses enabled models on online Ollama GPUs (high-VRAM @coder preferred for Pass 1). Frontier APIs only when no local workers are available.</p>
-              <p>Each GPU runs one file at a time on one model, so a 16GB card is not asked to hold two models. Different PCs still run together. After workers finish, workspace <code className="text-indigo-300">tsc</code> routes errors back to the GPU that owns the broken file.</p>
-            </HelpTip>
-          </div>
-
-          <div className="flex items-center space-x-2.5 shrink-0">
-            <label className="flex items-center space-x-1 text-zinc-400 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoSelectEndpoint}
-                onChange={(e) => setAutoSelectEndpoint(e.target.checked)}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-Node</span>
-              <HelpTip title="Auto-Node" align="right">
-                <p>When on, each send picks a hardware node from the task (e.g. review → laptop, docs → server, coding → main rig).</p>
-                <p><b className="text-zinc-300">Local-first:</b> prefers online Ollama nodes; frontier APIs only if no local workers are up.</p>
-                <p>Ignored while Conductor Swarm is on (Swarm assigns files + models itself).</p>
-              </HelpTip>
-            </label>
-
-            <label className="flex items-center space-x-1 text-zinc-400 cursor-pointer hover:text-zinc-200">
-              <input
-                type="checkbox"
-                checked={autoApplyWrites}
-                onChange={(e) => {
-                  autoApplyWritesRef.current = e.target.checked;
-                  setAutoApplyWrites(e.target.checked);
-                }}
-                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
-              />
-              <span>Auto-apply</span>
-              <HelpTip title="Auto-apply" align="right">
-                <p>When on, file writes/edits apply immediately, PowerShell <code className="text-indigo-300">run_command</code> tools execute, and failed commands feed back so the agent can self-correct from terminal output.</p>
-                <p>When off, you review each card and click Apply / Run yourself.</p>
-              </HelpTip>
-            </label>
-          </div>
-        </div>
       </div>
 
       {/* Messages Stream */}
@@ -3023,8 +4007,12 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                   <div className="mb-2 text-[10px] text-emerald-300/90 font-medium">{msg.notice}</div>
                 )}
 
-                {/* Planner option buttons */}
-                {msg.planOptions && msg.planOptions.length > 0 && (
+                {/* Planner option buttons — never while a plan/task list is still running */}
+                {msg.planOptions &&
+                  msg.planOptions.length > 0 &&
+                  !isPlanActive(plannerPlanView) &&
+                  !hasOpenTasks(executionQueueRef.current) &&
+                  !msg.selectedPlanOptionId && (
                   <PlanOptionsCard
                     options={msg.planOptions}
                     selectedId={msg.selectedPlanOptionId}
@@ -3033,37 +4021,81 @@ export const AgentChat: React.FC<AgentChatProps> = ({
                   />
                 )}
 
-                {/* Tool Invocations */}
-                {msg.toolCalls && msg.toolCalls.length > 0 && (
-                  <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
-                    <div className="flex items-center justify-between">
-                      <div className="text-[10px] uppercase font-bold text-indigo-300 tracking-wider">
-                        Workspace Actions ({msg.toolCalls.length}):
-                      </div>
-                      {msg.toolCalls.some(t => t.status !== 'done') && (
-                        <button
-                          onClick={() => handleApplyAllTools(msg)}
-                          className="flex items-center space-x-1 text-[10px] font-sans font-medium px-2 py-0.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white border border-indigo-500/40 rounded transition"
-                          title="Apply all proposed changes to workspace"
-                        >
-                          <Sparkles className="w-2.5 h-2.5 text-indigo-300" />
-                          <span>Apply All</span>
-                        </button>
-                      )}
-                    </div>
-                    {msg.toolCalls.map(tool => (
-                      <ToolActionCard
-                        key={tool.id}
-                        tool={tool}
-                        workspacePath={workspacePath}
-                        onApplyFileWrite={onApplyFileWrite}
-                        onExecuteToolCommand={onExecuteToolCommand}
-                        onOpenFileInEditor={onOpenFileInEditor}
-                        onRunSingleTool={runSingleTool}
-                      />
-                    ))}
-                  </div>
+                {/* Reviewer fix plan — never Apply writes from reviewer */}
+                {msg.reviewPlan && !msg.stepVerdict && (
+                  <ReviewPlanCard
+                    plan={msg.reviewPlan}
+                    sent={!!msg.reviewSentToCoder}
+                    disabled={isStreaming}
+                    onSendToPlanner={() => sendReviewPlanToPlanner(msg)}
+                    onContinue={
+                      msg.reviewNeedsContinue
+                        ? () => continueAfterCleanReview(msg)
+                        : undefined
+                    }
+                  />
                 )}
+
+                {/* Planner step Yay/Nay */}
+                {msg.stepVerdict && (
+                  <StepVerdictCard
+                    stepId={msg.stepVerdict.stepId}
+                    stepTitle={msg.stepVerdict.stepTitle}
+                    result={msg.stepVerdict.result}
+                    notes={msg.stepVerdict.notes}
+                    sent={!!msg.stepVerdictApplied}
+                    disabled={isStreaming}
+                    needsConfirm={!!msg.stepVerdictNeedsConfirm}
+                    onApply={() => applyStepVerdictAndContinue(msg)}
+                  />
+                )}
+
+                {/* Tool Invocations (hide write/edit Apply UI for reviewer messages) */}
+                {(() => {
+                  const isReviewerMsg =
+                    msg.personaHandle === 'reviewer' || !!msg.reviewPlan || !!msg.stepVerdict;
+                  const tools = isReviewerMsg
+                    ? (msg.toolCalls || []).filter(t =>
+                        ['read_file', 'list_dir', 'search', 'read_terminal'].includes(t.name)
+                      )
+                    : msg.toolCalls || [];
+                  if (!tools.length) return null;
+                  const showApply =
+                    !isReviewerMsg && tools.some(t => t.status !== 'done');
+                  return (
+                    <div className="mt-3 space-y-2 pt-2 border-t border-[#31313e]">
+                      <div className="flex items-center justify-between">
+                        <div className="text-[10px] uppercase font-bold text-indigo-300 tracking-wider">
+                          {isReviewerMsg
+                            ? `Exploration (${tools.length}):`
+                            : `Workspace Actions (${tools.length}):`}
+                        </div>
+                        {showApply && (
+                          <button
+                            onClick={() => handleApplyAllTools(msg)}
+                            className="flex items-center space-x-1 text-[10px] font-sans font-medium px-2 py-0.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white border border-indigo-500/40 rounded transition"
+                            title="Apply all proposed changes to workspace"
+                          >
+                            <Sparkles className="w-2.5 h-2.5 text-indigo-300" />
+                            <span>Apply All</span>
+                          </button>
+                        )}
+                      </div>
+                      {tools.map(tool => (
+                        <ToolActionCard
+                          key={tool.id}
+                          tool={tool}
+                          workspacePath={workspacePath}
+                          onApplyFileWrite={onApplyFileWrite}
+                          onExecuteToolCommand={onExecuteToolCommand}
+                          onOpenFileInEditor={onOpenFileInEditor}
+                          onRunSingleTool={runSingleTool}
+                          hideApply={isReviewerMsg}
+                        />
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           ))
@@ -3192,6 +4224,229 @@ export const AgentChat: React.FC<AgentChatProps> = ({
             </div>
           </div>
         </form>
+      </div>
+      </div>
+
+      {/* Inner split resize */}
+      <div
+        onMouseDown={() => setResizingControl(true)}
+        title="Drag to resize Conductor column"
+        className={`w-1 cursor-col-resize transition-colors shrink-0 ${
+          resizingControl ? 'bg-indigo-500' : 'bg-[#22222a] hover:bg-indigo-500/60'
+        }`}
+      />
+
+      {/* Right — Orchestration */}
+      <div
+        style={{ width: controlColWidth }}
+        className="shrink-0 flex flex-col min-h-0 min-w-[220px] bg-[#121215] border-l border-[#27272a]"
+      >
+        <div className="p-2.5 border-b border-[#27272a] shrink-0 space-y-2">
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-zinc-300">
+              <Cpu className="w-3 h-3 text-indigo-400" />
+              <span>Conductor</span>
+            </div>
+            <HelpTip title="Agent personas" align="right">
+              <p>Left column is the conversation. This column is personas, the durable plan/task list, and routing.</p>
+              <ul className="list-disc pl-3.5 space-y-1">
+                <li><b className="text-zinc-300">coder</b> — build & edit files</li>
+                <li><b className="text-zinc-300">planner</b> — options then locks steps/tasks</li>
+                <li><b className="text-zinc-300">reviewer</b> — Yay/Nay per plan step</li>
+                <li><b className="text-zinc-300">docs</b> — explanations / docs</li>
+              </ul>
+            </HelpTip>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {agents.map(a => (
+              <button
+                key={a.id}
+                onClick={() => onSelectAgent(a.id)}
+                title={`${a.name}: ${a.role}`}
+                className={`px-2 py-0.5 text-[11px] font-medium rounded transition ${
+                  selectedAgentId === a.id
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-[#202026]'
+                }`}
+              >
+                {a.handle}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="px-2.5 pt-2 space-y-1.5 shrink-0">
+          {(progressLog.next || progressLog.done.length > 0) && (
+            <div className="text-[10px] text-zinc-400 truncate" title={renderWorkLog(progressLog)}>
+              <span className="text-emerald-300/90 font-medium">Next:</span> {progressLog.next || '—'}
+              <span className="text-zinc-500"> · {progressLog.done.length} done</span>
+            </div>
+          )}
+          {executingPlanNotice && (
+            <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md bg-emerald-600/15 border border-emerald-500/30 text-[10px] text-emerald-200">
+              <span className="font-medium truncate">{executingPlanNotice}</span>
+              <button
+                type="button"
+                className="shrink-0 text-zinc-400 hover:text-zinc-200"
+                onClick={() => setExecutingPlanNotice(null)}
+                title="Dismiss"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 min-h-0 flex flex-col px-2.5 py-2">
+          {plannerPlanView && plannerPlanView.steps.length > 0 ? (
+            <PlannerPlanPanel plan={plannerPlanView} />
+          ) : (
+            <div className="rounded-md border border-dashed border-[#2a2a36] bg-[#0e0e12] px-2.5 py-3 text-[10px] text-zinc-500 leading-relaxed">
+              No active plan — pick a Planner option to lock steps and tasks here.
+            </div>
+          )}
+        </div>
+
+        <div className="p-2.5 border-t border-[#27272a] space-y-2 shrink-0 text-[10px]">
+          <div className="grid grid-cols-1 gap-2">
+            <div className="flex flex-col space-y-1">
+              <span className="text-zinc-500 font-medium flex items-center space-x-1">
+                {isFrontier ? <Cloud className="w-3 h-3 text-sky-400 shrink-0" /> : <Cpu className="w-3 h-3 text-emerald-400 shrink-0" />}
+                <span>Hardware Target</span>
+              </span>
+              <select
+                value={nodes.some(n => n.id === targetNodeId) ? targetNodeId : ''}
+                onChange={(e) => {
+                  const newNodeId = e.target.value;
+                  setTargetNodeId(newNodeId);
+                  setAutoSelectEndpoint(false);
+                  const nextNode = nodes.find(n => n.id === newNodeId);
+                  if (nextNode) setTargetModel(getPreferredModelForNode(nextNode));
+                }}
+                disabled={nodes.length === 0}
+                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
+              >
+                {nodes.length === 0 ? (
+                  <option value="">No endpoints — open Hardware Settings</option>
+                ) : (
+                  nodes.map(n => (
+                    <option key={n.id} value={n.id} disabled={!n.online}>
+                      {n.name} {n.online ? `(${n.latency}ms)` : '(Offline)'}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="flex flex-col space-y-1">
+              <span className="text-zinc-500 font-medium flex items-center justify-between">
+                <span>Node Model</span>
+                {benchmarkStat && (
+                  <span className="text-amber-400 font-mono text-[9px] flex items-center space-x-0.5">
+                    <Zap className="w-2.5 h-2.5" />
+                    <span>{benchmarkStat.evalTokPerSec} t/s</span>
+                  </span>
+                )}
+              </span>
+              <select
+                value={activeTargetModel}
+                onChange={(e) => {
+                  const newModel = e.target.value;
+                  if (!newModel) return;
+                  setTargetModel(newModel);
+                  if (selectedNode) onSelectNodeModel?.(selectedNode.id, newModel);
+                }}
+                disabled={effectiveModels.length === 0}
+                className="bg-[#1c1c24] border border-[#2a2a36] text-zinc-200 rounded px-2 py-1 outline-none text-[11px] truncate disabled:opacity-50"
+              >
+                {effectiveModels.length === 0 ? (
+                  <option value="">
+                    {!selectedNode
+                      ? 'Add an endpoint in Hardware Settings'
+                      : selectedNode.online
+                        ? 'No models installed — pull in Hardware Settings'
+                        : 'Node offline / no models'}
+                  </option>
+                ) : (
+                  effectiveModels.map(m => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))
+                )}
+              </select>
+              {selectedSupportsThink && onToggleModelThinking && selectedNode && activeTargetModel && (
+                <button
+                  type="button"
+                  onClick={() => onToggleModelThinking(selectedNode.id, activeTargetModel, !selectedThinkOn)}
+                  className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border text-[10px] font-medium transition ${
+                    selectedThinkOn
+                      ? 'bg-violet-600/25 border-violet-500/40 text-violet-200'
+                      : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
+                  }`}
+                  title="Qwen3-style thinking: ON = deeper/slower, OFF = faster direct answers"
+                >
+                  <Brain className={`w-3 h-3 ${selectedThinkOn ? 'text-violet-300' : 'text-zinc-500'}`} />
+                  <span>{thinkingToggleLabel(!!selectedThinkOn)}</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <button
+            onClick={() => setIsPipelineMode(!isPipelineMode)}
+            className={`w-full flex items-center justify-center space-x-1.5 px-2 py-1 rounded border transition ${
+              isPipelineMode
+                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold'
+                : 'bg-[#18181d] border-[#2a2a34] text-zinc-400 hover:text-zinc-200'
+            }`}
+            title={isPipelineMode ? 'Conductor Swarm is ON' : 'Enable multi-GPU file distribution'}
+          >
+            <Share2 className="w-3 h-3 text-amber-400 shrink-0" />
+            <span className="truncate">
+              Swarm ({onlineLocalNodes.length} local
+              {nodes.filter(n => n.online && isFrontierNode(n) && getEnabledModelsForNode(n).length > 0).length
+                ? ' + frontier'
+                : ''}
+              )
+            </span>
+          </button>
+
+          <div className="flex flex-col gap-1.5 text-zinc-400">
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoSelectEndpoint}
+                onChange={(e) => setAutoSelectEndpoint(e.target.checked)}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-Node</span>
+            </label>
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoApplyWrites}
+                onChange={(e) => {
+                  autoApplyWritesRef.current = e.target.checked;
+                  setAutoApplyWrites(e.target.checked);
+                }}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-apply</span>
+            </label>
+            <label className="flex items-center space-x-1.5 cursor-pointer hover:text-zinc-200">
+              <input
+                type="checkbox"
+                checked={autoReview}
+                onChange={(e) => {
+                  autoReviewRef.current = e.target.checked;
+                  setAutoReview(e.target.checked);
+                }}
+                className="rounded border-[#31313e] bg-[#1e1e24] text-indigo-500"
+              />
+              <span>Auto-review</span>
+            </label>
+          </div>
+        </div>
       </div>
     </div>
   );

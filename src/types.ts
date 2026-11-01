@@ -87,15 +87,16 @@ export interface NodeConfig {
   apiKey?: string;
   dnsAlias?: string;
   /**
-   * Preferred role for Auto-Node / Swarm routing (store at most one).
-   * Empty/omit = Auto (soft name/id heuristics + local-first).
-   * Explicit value forces this node as a candidate for that role (frontier allowed).
+   * Allowed roles for Auto-Node / Swarm routing.
+   * Empty/omit = Auto (all roles; soft name/id heuristics + local-first).
+   * Non-empty = only those roles; tagged nodes are preferred (frontier allowed).
+   * Multiple nodes may allow the same role.
    */
   roles?: NodeRole[];
   /**
    * Dev node: workspace, installs, package managers, and run_command live here
    * (the PC where LocalAgents Studio is open). At most one node; independent of
-   * Preferred Role / where inference runs.
+   * Allowed Roles / where inference runs.
    */
   isDevNode?: boolean;
   hardware: HardwareProfile;
@@ -152,8 +153,8 @@ export interface PlanOption {
   id: string;
   title: string;
   description: string;
-  /** stop = record the choice and do not start the coder. copy = clipboard. paid = confirm a paid API call. */
-  action?: 'run' | 'stop' | 'copy' | 'paid';
+  /** stop = record the choice and do not start the coder. copy = clipboard. paid = confirm a paid API call. retry-local = different approach on largest local. */
+  action?: 'run' | 'stop' | 'copy' | 'paid' | 'retry-local';
 }
 
 /** Locked plan after the user picks an option — drives Coder / Swarm execution. */
@@ -169,6 +170,42 @@ export interface ApprovedPlan {
   planMarkdown?: string;
 }
 
+/** Planner-owned execution plan: steps contain coder tasks; Reviewer Yay/Nay per step. */
+export type PlannerPlanStatus = 'draft' | 'active' | 'completed' | 'abandoned';
+export type PlannerStepStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export interface PlannerTask {
+  id: string;
+  title: string;
+  description: string;
+  file?: string;
+  status: ExecutionTaskStatus;
+  failureNote?: string;
+}
+
+export interface PlannerStep {
+  id: string;
+  title: string;
+  description?: string;
+  status: PlannerStepStatus;
+  tasks: PlannerTask[];
+  /** Last Nay notes from Reviewer for this step */
+  reviewNote?: string;
+}
+
+export interface PlannerPlan {
+  id: string;
+  summary: string;
+  status: PlannerPlanStatus;
+  steps: PlannerStep[];
+  activeStepId?: string | null;
+  updatedAt: number;
+  conversationId?: string;
+  /** Architecture option that produced this plan */
+  chosenOptionId?: string;
+  chosenOptionTitle?: string;
+}
+
 /** One agent chat thread (Cursor/VS Code-style conversation). */
 export interface ChatConversation {
   id: string;
@@ -178,6 +215,14 @@ export interface ChatConversation {
   messages: ChatMessage[];
   /** Set when user confirms a Planner option; cleared on new chat / new plan request */
   approvedPlan?: ApprovedPlan | null;
+  /**
+   * Durable Reviewer→Planner→Coder task list for this chat.
+   * Seeded once from the first review_plan; subsequent reviews only update task status.
+   * @deprecated Prefer plannerPlan for Planner-owned orchestration.
+   */
+  executionQueue?: ExecutionQueue | null;
+  /** Planner-owned durable plan (steps → tasks); file-backed under .localagents/plans */
+  plannerPlan?: PlannerPlan | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -195,7 +240,10 @@ export interface AppSettings {
   localTokensGenerated: number;
   frontierTokensUsed: number;
   explorerWidth?: number;
+  /** Outer Agent Conductor pane (conversation + orchestration columns) */
   chatWidth?: number;
+  /** Right orchestration column inside Agent Conductor */
+  agentControlWidth?: number;
   /** UI & Text scaling factor (0.75 to 2.0, default 1.0) */
   uiScale?: number;
   /** SearXNG base URL for the web_search tool. Empty = search unavailable. */
@@ -304,6 +352,56 @@ export interface ChatMessage {
   chosenPlanOptionId?: string;
   /** Which persona drove this turn (survives agent auto-switch Planner → Coder) */
   personaHandle?: string;
+  /** Reviewer fix plan — Send to Planner → Coder (no Apply / write tools) */
+  reviewPlan?: ReviewFixPlan;
+  /** Set when the user already sent this review plan to Coder */
+  reviewSentToCoder?: boolean;
+  /** Clean post-step review waiting for Looks good / Continue (Auto-review off) */
+  reviewNeedsContinue?: boolean;
+  /** Reviewer Yay/Nay for the active Planner step */
+  stepVerdict?: {
+    stepId: string;
+    stepTitle: string;
+    result: 'yay' | 'nay';
+    notes: string;
+  };
+  /** User/auto already applied this step verdict to the durable plan */
+  stepVerdictApplied?: boolean;
+  /** Auto-review off — waiting for user to accept Yay/Nay */
+  stepVerdictNeedsConfirm?: boolean;
+}
+
+/** Structured fix tasks from Reviewer mode (handed to Planner → Coder). */
+export type ExecutionTaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export interface ReviewFixTask {
+  id: string;
+  title: string;
+  description: string;
+  file?: string;
+  /** Present on durable queue snapshots / UI */
+  status?: ExecutionTaskStatus;
+  failureNote?: string;
+}
+
+export interface ReviewFixPlan {
+  summary: string;
+  tasks: ReviewFixTask[];
+}
+
+/** Conversation-level durable task list — Planner orchestrates; Reviewer never replaces it. */
+export interface ExecutionTask extends ReviewFixTask {
+  status: ExecutionTaskStatus;
+  failureNote?: string;
+}
+
+export interface ExecutionQueue {
+  id: string;
+  summary: string;
+  tasks: ExecutionTask[];
+  activeTaskId?: string | null;
+  updatedAt: number;
+  seededFromMessageId?: string;
 }
 
 // ==========================================
@@ -366,6 +464,19 @@ export interface ElectronAPI {
   readLogTail: () => Promise<{ success?: boolean; text?: string; path?: string; error?: string }>;
   logsPath: () => Promise<string>;
   openLogsFolder: () => Promise<{ success?: boolean; path?: string; error?: string }>;
+  /** Open a prefilled GitHub issue and save a redacted bug-report file locally. */
+  reportLogsToGitHub: (opts?: {
+    note?: string;
+    title?: string;
+  }) => Promise<{
+    success?: boolean;
+    url?: string;
+    reportPath?: string;
+    reportName?: string;
+    logText?: string;
+    version?: string;
+    error?: string;
+  }>;
   /** Encrypt node configs to a passphrase-protected .enc file (AES-256-GCM + scrypt). */
   exportNodes: (
     nodes: NodeConfig[],

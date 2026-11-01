@@ -1,5 +1,5 @@
 import React from 'react';
-import { Brain, Download, Gauge, RefreshCw, Trash2, Zap } from 'lucide-react';
+import { AlertTriangle, Brain, Download, Gauge, RefreshCw, Trash2, Zap } from 'lucide-react';
 import { EndpointNode } from '../../types';
 import { modelSupportsThinking, thinkingToggleLabel } from '../../lib/thinking';
 import { HelpTip } from '../agent/HelpTip';
@@ -13,6 +13,11 @@ import {
   resolveModelNumCtx,
   snapNumCtxToOption
 } from '../../lib/contextSize';
+import {
+  estimateInstalledModelFit,
+  fitSpillsToSystemRam,
+  formatGB
+} from '../../lib/recommender';
 
 interface InstalledModelsPanelProps {
   currentNode: EndpointNode;
@@ -261,7 +266,13 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                 const currentCtx = snapNumCtxToOption(storedCtx, maxCtx);
                 const options = ctxSizeOptions(maxCtx, currentCtx);
                 const fit = estimateContextFit(currentCtx);
+                const vramFit = estimateInstalledModelFit(m, currentNode.hardware, currentCtx);
+                const spills = fitSpillsToSystemRam(vramFit.kind);
                 const overMax = maxCtx != null && currentCtx > maxCtx;
+                const spillTitle =
+                  vramFit.kind === 'none'
+                    ? "Won't fit in VRAM + system RAM at this context size"
+                    : 'May spill into system RAM (slower)';
                 return (
                   <div className="pt-1.5 border-t border-[#252530] space-y-1.5">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -272,6 +283,11 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                           <p>
                             How many tokens Ollama keeps in the prompt window for this model on this node.
                             Larger context uses more VRAM.
+                          </p>
+                          <p>
+                            VRAM totals are approximate: model weights + KV cache for this context size
+                            (scaled by this node&apos;s KV cache type). Spill warnings use usable VRAM after
+                            reserved VRAM.
                           </p>
                           <p>
                             Rough estimates for English text; code and images differ:
@@ -317,6 +333,17 @@ export const InstalledModelsPanel: React.FC<InstalledModelsPanelProps> = ({
                       {fit.label}
                       {overMax ? ' · exceeds model max' : ''}
                       {!maxCtx ? ' · max unknown — large ctx burns VRAM' : ''}
+                    </p>
+                    <p className="text-[10px] font-mono leading-snug text-zinc-400 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
+                      <span>
+                        Model ~{formatGB(vramFit.weightsGB)} · Context ~{formatGB(vramFit.kvGB)} · Total ~
+                        {formatGB(vramFit.totalGB)}
+                      </span>
+                      {spills && (
+                        <span title={spillTitle} className="inline-flex" aria-label={spillTitle}>
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        </span>
+                      )}
                     </p>
                   </div>
                 );

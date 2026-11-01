@@ -1,4 +1,5 @@
 import { PlanOption } from '../types';
+import { stripKeepFixingPrefix } from './stuckEscalation';
 
 /** Steps already taken, the one next step, and questions already asked. */
 export interface WorkLog {
@@ -20,7 +21,7 @@ const FIX_VERB =
 const BUG_REPORT =
   /\b(fix|broken|doesn't work|does not work|not work|bug|error|failing|fails|wrong|missing|can't|cannot|spacebar|hard\s*drop|toggle)\b/i;
 const VAGUE_USER =
-  /^(option\s*\d+|keep going|continue|review(?:\s+the)?(?:\s+code)?|check(?:\s+it)?|look(?:\s+at\s+it)?)\b/i;
+  /^(option\s*\d+|keep going|keep fixing|continue|review(?:\s+the)?(?:\s+code)?|check(?:\s+it)?|look(?:\s+at\s+it)?)\b/i;
 
 export function emptyWorkLog(): WorkLog {
   return { request: '', bug: '', done: [], next: '', asked: [] };
@@ -33,7 +34,7 @@ export function workLogPath(root: string, conversationId: string): string {
 }
 
 function oneLine(text: string, max = 220): string {
-  return text.replace(/\s+/g, ' ').trim().slice(0, max);
+  return stripKeepFixingPrefix(text).slice(0, max);
 }
 
 function fileNames(text: string): string[] {
@@ -243,6 +244,10 @@ export function advanceNext(log: WorkLog, task: string): WorkLog {
   const next = oneLine(task, 240);
   if (!next) return log;
   if (!isDurableStep(next)) {
+    return { ...log, asked: pushUnique(log.asked, next, MAX_ASKED) };
+  }
+  // Same durable step again — do not grow "Keep fixing. Keep fixing. …" in Next.
+  if (log.next && stepsTooSimilar(log.next, next)) {
     return { ...log, asked: pushUnique(log.asked, next, MAX_ASKED) };
   }
   let done = log.done;

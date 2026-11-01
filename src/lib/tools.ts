@@ -1,5 +1,12 @@
 import { AgentPersona, ApprovedPlan, EndpointNode, NodeRole, ToolCall, ToolName } from '../types';
-import { PLANNER_PROTOCOL, formatApprovedPlanContext } from './planOptions';
+import {
+  PLANNER_PROTOCOL,
+  REVIEWER_PROTOCOL,
+  REVIEW_FIX_CONTRACT_PROTOCOL,
+  EXECUTION_PLAN_LOCK_PROTOCOL,
+  STEP_VERDICT_PROTOCOL,
+  formatApprovedPlanContext
+} from './planOptions';
 import { DELIVERY_POLICY, TOOLCHAIN_PLAYBOOK } from './deliveryIntent';
 
 const NODE_ROLES: NodeRole[] = ['coder', 'reviewer', 'docs', 'planner'];
@@ -547,6 +554,14 @@ When a command fails (non-zero exit), diagnose from the output, fix with <edit_f
 export interface BuildSystemPromptOptions {
   /** Planner turn: force plan+options protocol; skip write-heavy pressure */
   planMode?: boolean;
+  /** Reviewer turn: findings + review_plan only; no workspace writes */
+  reviewMode?: boolean;
+  /** After review: Planner locks fix contract (writes allowed; no plan_options) */
+  contractMode?: boolean;
+  /** After option pick: Planner emits <execution_plan> steps+tasks */
+  lockPlanMode?: boolean;
+  /** Reviewer Yay/Nay on active Planner step */
+  stepVerdictMode?: boolean;
   /** Locked plan after user picked an option */
   approvedPlan?: ApprovedPlan | null;
   /** Done steps and the next step. Survives a compacted chat. */
@@ -563,7 +578,17 @@ export function buildSystemPrompt(
   overview: string,
   opts?: BuildSystemPromptOptions
 ): string {
-  const planMode = opts?.planMode ?? (agent.handle === 'planner' || agent.id === 'planner');
+  const contractMode = !!opts?.contractMode;
+  const lockPlanMode = !!opts?.lockPlanMode;
+  const stepVerdictMode = !!opts?.stepVerdictMode;
+  const planMode =
+    contractMode || lockPlanMode
+      ? false
+      : (opts?.planMode ?? (agent.handle === 'planner' || agent.id === 'planner'));
+  const reviewMode =
+    contractMode || lockPlanMode || stepVerdictMode
+      ? stepVerdictMode
+      : (opts?.reviewMode ?? (agent.handle === 'reviewer' || agent.id === 'reviewer'));
   const parts = [
     agent.systemPrompt.trim(),
     `## Environment
@@ -574,13 +599,46 @@ export function buildSystemPrompt(
   if (opts?.nodes?.length) {
     parts.push(buildDevHostPromptSection(opts.nodes, opts.inferenceNodeId));
   }
-  if (planMode) {
+  if (lockPlanMode) {
+    parts.push(EXECUTION_PLAN_LOCK_PROTOCOL);
+    if (agent.toolsEnabled) {
+      parts.push(
+        TOOL_PROTOCOL +
+          '\n\n### Lock-plan restriction\nDo NOT use <write_file> or <edit_file> for deliverables. Emit <execution_plan> only.'
+      );
+    }
+  } else if (stepVerdictMode) {
+    parts.push(STEP_VERDICT_PROTOCOL);
+    if (agent.toolsEnabled) {
+      parts.push(
+        TOOL_PROTOCOL +
+          '\n\n### Step-verdict restriction\nDo NOT use <write_file> or <edit_file>. Emit <step_verdict> yay/nay only.'
+      );
+    }
+  } else if (contractMode) {
+    parts.push(REVIEW_FIX_CONTRACT_PROTOCOL);
+    if (agent.toolsEnabled) {
+      parts.push(
+        TOOL_PROTOCOL +
+          '\n\n### Contract-from-review\nYou may write/edit a shared contract file. Do not implement the full review fix list — Coder does that next. No <plan_options>.'
+      );
+      parts.push(DELIVERY_POLICY);
+    }
+  } else if (planMode) {
     parts.push(PLANNER_PROTOCOL);
     // Read tools only in plan mode — still document protocol but remind not to write deliverables
     if (agent.toolsEnabled) {
       parts.push(
         TOOL_PROTOCOL +
           '\n\n### Planner restriction\nDo NOT use <write_file> or <edit_file> for the deliverable. Exploration tools only until the user picks an option.'
+      );
+    }
+  } else if (reviewMode) {
+    parts.push(REVIEWER_PROTOCOL);
+    if (agent.toolsEnabled) {
+      parts.push(
+        TOOL_PROTOCOL +
+          '\n\n### Reviewer restriction\nDo NOT use <write_file> or <edit_file>. Exploration tools only. Produce a <review_plan> for Send to Planner.'
       );
     }
   } else {
@@ -725,14 +783,46 @@ function byCapacity(a: EndpointNode, b: EndpointNode): number {
 
 type RoleBearing = { id?: string; name?: string; roles?: NodeRole[] };
 
-/** Preferred role from Hardware Settings (first entry only; empty = Auto). */
-export function getPreferredRole(n: RoleBearing): NodeRole | undefined {
-  const first = n.roles?.[0];
-  return first && NODE_ROLES.includes(first) ? first : undefined;
+export const ALL_NODE_ROLES: NodeRole[] = [...NODE_ROLES];
+
+/** True when the node has no allow-list (Auto — all roles). */
+export function isRoleAuto(n: RoleBearing): boolean {
+  return !n.roles?.length;
 }
 
+/** Sanitize + dedupe a roles array; empty → undefined (Auto). */
+export function sanitizeAllowedRoles(roles?: NodeRole[] | null): NodeRole[] | undefined {
+  if (!roles?.length) return undefined;
+  const seen = new Set<NodeRole>();
+  const out: NodeRole[] = [];
+  for (const r of roles) {
+    if (!NODE_ROLES.includes(r) || seen.has(r)) continue;
+    seen.add(r);
+    out.push(r);
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * First allowed role when restricted; undefined = Auto.
+ * Prefer nodeAllowsRole / nodeHasExplicitRole for routing.
+ */
+export function getPreferredRole(n: RoleBearing): NodeRole | undefined {
+  const cleaned = sanitizeAllowedRoles(n.roles);
+  return cleaned?.[0];
+}
+
+/** Node is Auto or its allow-list includes this role. */
+export function nodeAllowsRole(n: RoleBearing, role: string): boolean {
+  if (!NODE_ROLES.includes(role as NodeRole)) return false;
+  if (isRoleAuto(n)) return true;
+  return n.roles!.includes(role as NodeRole);
+}
+
+/** Restricted allow-list that includes this role (not Auto). */
 export function nodeHasExplicitRole(n: RoleBearing, role: string): boolean {
-  return getPreferredRole(n) === role;
+  if (isRoleAuto(n)) return false;
+  return n.roles!.includes(role as NodeRole);
 }
 
 function clearRoles<T extends RoleBearing>(n: T): T {
@@ -741,49 +831,55 @@ function clearRoles<T extends RoleBearing>(n: T): T {
   return rest as T;
 }
 
-/**
- * Each explicit role may belong to at most one node (first wins; later → Auto).
- * Also clamps multi-role legacy data to a single preferred role.
- */
+/** Dedupe/clamp invalid role entries; empty → Auto. No exclusivity across nodes. */
 export function normalizePreferredRoles<T extends RoleBearing>(nodes: T[]): T[] {
-  const seen = new Set<NodeRole>();
   return nodes.map(n => {
-    const role = getPreferredRole(n);
-    if (!role) return clearRoles(n);
-    if (seen.has(role)) return clearRoles(n);
-    seen.add(role);
-    if (n.roles?.length === 1 && n.roles[0] === role) return n;
-    return { ...n, roles: [role] };
+    const cleaned = sanitizeAllowedRoles(n.roles);
+    if (!cleaned) return clearRoles(n);
+    if (
+      n.roles?.length === cleaned.length &&
+      n.roles.every((r, i) => r === cleaned[i])
+    ) {
+      return n;
+    }
+    return { ...n, roles: cleaned };
   });
 }
 
-/** Assign Preferred Role on one node; clear the same role from every other node. */
+/** Set allowed roles on one node. Empty/null → Auto. Other nodes unchanged. */
+export function assignAllowedRoles<T extends RoleBearing>(
+  nodes: T[],
+  nodeId: string,
+  roles: NodeRole[] | null | ''
+): T[] {
+  const cleaned =
+    roles === '' || roles === null ? undefined : sanitizeAllowedRoles(roles);
+  return nodes.map(n => {
+    if (n.id !== nodeId) return n;
+    if (!cleaned) return clearRoles(n);
+    return { ...n, roles: cleaned };
+  });
+}
+
+/**
+ * @deprecated Use assignAllowedRoles. Kept for single-role callers.
+ * Assign one preferred role (or Auto); does not clear the role from other nodes.
+ */
 export function assignPreferredRole<T extends RoleBearing>(
   nodes: T[],
   nodeId: string,
   role: NodeRole | ''
 ): T[] {
-  return nodes.map(n => {
-    if (n.id === nodeId) {
-      if (!role) return clearRoles(n);
-      return { ...n, roles: [role] };
-    }
-    if (role && getPreferredRole(n) === role) return clearRoles(n);
-    return n;
-  });
+  return assignAllowedRoles(nodes, nodeId, role ? [role] : null);
 }
 
-/** Node that currently holds an explicit role (optionally excluding one id). */
+/** @deprecated Roles are no longer exclusive across nodes. */
 export function findNodeHoldingRole(
-  nodes: RoleBearing[],
-  role: NodeRole,
-  exceptNodeId?: string
+  _nodes: RoleBearing[],
+  _role: NodeRole,
+  _exceptNodeId?: string
 ): { id: string; name: string } | undefined {
-  const hit = nodes.find(
-    n => n.id && n.id !== exceptNodeId && getPreferredRole(n) === role
-  );
-  if (!hit?.id) return undefined;
-  return { id: hit.id, name: hit.name || hit.id };
+  return undefined;
 }
 
 // ==========================================
@@ -874,7 +970,7 @@ export function ensureDevNode<T extends DevBearing>(nodes: T[]): T[] {
   return assignDevNode(normalized, local.id, true);
 }
 
-/** Preferred Role + Dev node interlocking in one pass (load/import/save). */
+/** Allowed Roles sanitize + Dev node interlocking in one pass (load/import/save). */
 export function normalizeClusterNodes<T extends DevBearing & RoleBearing>(nodes: T[]): T[] {
   return ensureDevNode(normalizePreferredRoles(nodes));
 }
@@ -913,22 +1009,25 @@ You may be generating on a different GPU/API host. That does **not** limit your 
 You are currently inferring on **${inferName}**, which is not the Dev node. Keep generating code, reviews, docs, and vision analysis for the Dev workspace; filesystem and terminal side effects still land on **${devName}**.`;
 }
 
-/** Soft Auto routing: name/id heuristics (and legacy multi-role tags). */
+/**
+ * Soft Auto routing: name/id heuristics.
+ * Restricted nodes only match listed roles; Auto nodes use heuristics.
+ */
 function nodeHasRole(n: EndpointNode, role: string): boolean {
-  if (n.roles?.includes(role as NodeRole)) return true;
+  if (!isRoleAuto(n)) return nodeHasExplicitRole(n, role);
   const id = (n.id || '').toLowerCase();
   const name = (n.name || '').toLowerCase();
   if (role === 'reviewer') return id.includes('laptop') || name.includes('laptop') || name.includes('review');
   if (role === 'docs') return id.includes('linux') || id.includes('server') || name.includes('docs') || name.includes('server');
   if (role === 'coder' || role === 'planner') {
-    return id.includes('main') || id.includes('rig') || name.includes('main') || (n.roles?.includes('coder') ?? false);
+    return id.includes('main') || id.includes('rig') || name.includes('main');
   }
   return false;
 }
 
 /**
- * Prefer nodes with an explicit Preferred Role tag (frontier allowed, no local-first).
- * Otherwise soft-match on the local-first pool.
+ * Prefer nodes that explicitly allow this role (frontier allowed, no local-first).
+ * Otherwise soft-match Auto nodes on the local-first pool.
  */
 function pickEndpointForRole(
   role: string,
@@ -962,38 +1061,34 @@ export function selectBestEndpointForTask(
   const lower = taskText.toLowerCase();
   const byRole = (role: string) => pickEndpointForRole(role, onlineUsable, pool);
 
-  // Explicit agent persona routing (Preferred Role tags first, then soft heuristics)
-  if (agentHandle === 'planner') {
-    const hit = byRole('planner');
+  /** Persona-locked: never fall through to a node that does not allow this role. */
+  const pickForPersona = (role: NodeRole): EndpointNode | undefined => {
+    const hit = byRole(role);
     if (hit) return hit;
-  }
-  if (agentHandle === 'reviewer') {
-    const hit = byRole('reviewer');
-    if (hit) return hit;
-  }
-  if (agentHandle === 'docs') {
-    const hit = byRole('docs');
-    if (hit) return hit;
-  }
-  if (agentHandle === 'coder') {
-    const hit = byRole('coder');
-    if (hit) return hit;
-  }
+    const allowed = pool.filter(n => nodeAllowsRole(n, role)).sort(byCapacity);
+    return allowed[0];
+  };
+
+  // Explicit agent persona routing — hard stop on Allowed Roles (no coder fallthrough)
+  if (agentHandle === 'planner') return pickForPersona('planner');
+  if (agentHandle === 'reviewer') return pickForPersona('reviewer');
+  if (agentHandle === 'docs') return pickForPersona('docs');
+  if (agentHandle === 'coder') return pickForPersona('coder');
 
   // Task content routing when in auto-endpoint mode
   if (/\b(test|unit test|readme|document|docstring|comment)\b/.test(lower)) {
-    const hit = byRole('docs');
+    const hit = pickForPersona('docs');
     if (hit) return hit;
   }
   if (/\b(review|lint|typo|css|style|color|format|quick)\b/.test(lower)) {
-    const hit = byRole('reviewer');
+    const hit = pickForPersona('reviewer');
     if (hit) return hit;
   }
 
-  const coderHit = byRole('coder');
+  const coderHit = pickForPersona('coder');
   if (coderHit) return coderHit;
 
-  // Fallback to node with highest capacity
+  // Fallback to node with highest capacity among Auto / unrestricted
   return [...pool].sort(byCapacity)[0];
 }
 
@@ -1072,7 +1167,7 @@ export function pickBestModelForComplexity(
 
 /**
  * Finds the best Conductor (planner) model.
- * Explicit Preferred Role = Planner wins (frontier allowed). Otherwise local-first Auto.
+ * Explicit allowed role = Planner wins (frontier allowed). Otherwise local-first Auto.
  */
 export function findFastestConductor(
   nodes: EndpointNode[]

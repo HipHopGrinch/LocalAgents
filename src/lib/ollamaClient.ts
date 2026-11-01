@@ -1,4 +1,5 @@
 import { ChatEvent, PullEvent } from '../types';
+import { detectRepeatedToolTagSpam } from './agentLoop';
 
 type ChatHandler = (e: ChatEvent) => void;
 type PullHandler = (e: PullEvent) => void;
@@ -21,6 +22,8 @@ export interface ChatResult {
   thinking: string;
   aborted: boolean;
   stats: ChatEvent['stats'];
+  /** Stream stopped because the model repeated the same tool tag. */
+  toolSpamAborted?: boolean;
 }
 
 export interface ChatHandle {
@@ -42,12 +45,31 @@ export function streamChat(
   let content = '';
   let thinking = '';
   let frame = 0;
+  let spamAborted = false;
+  let settled = false;
 
   const done = new Promise<ChatResult>((resolve, reject) => {
+    const settle = (result: ChatResult) => {
+      if (settled) return;
+      settled = true;
+      chatHandlers.delete(requestId);
+      resolve(result);
+    };
     chatHandlers.set(requestId, e => {
       if (e.type === 'chunk') {
+        if (spamAborted || settled) return;
         content += e.content || '';
         thinking += e.thinking || '';
+        // Local models sometimes collapse into repeating the same <read_file/> — cut it off.
+        if (detectRepeatedToolTagSpam(content)) {
+          spamAborted = true;
+          if (frame) cancelAnimationFrame(frame);
+          frame = 0;
+          onDelta(content, thinking);
+          window.electronAPI.abortStream(requestId);
+          settle({ content, thinking, aborted: true, toolSpamAborted: true, stats: {} });
+          return;
+        }
         // Coalesce UI updates to one per animation frame - streaming 100+ tok/s would otherwise re-render per token
         if (!frame) {
           frame = requestAnimationFrame(() => {
@@ -56,12 +78,16 @@ export function streamChat(
           });
         }
       } else {
+        if (spamAborted || settled) return;
         if (frame) cancelAnimationFrame(frame);
-        chatHandlers.delete(requestId);
         onDelta(content, thinking);
-        if (e.type === 'done') resolve({ content, thinking, aborted: false, stats: e.stats });
-        else if (e.type === 'aborted') resolve({ content, thinking, aborted: true, stats: {} });
-        else reject(new Error(e.error || 'Unknown error'));
+        if (e.type === 'done') settle({ content, thinking, aborted: false, stats: e.stats });
+        else if (e.type === 'aborted') settle({ content, thinking, aborted: true, stats: {} });
+        else {
+          settled = true;
+          chatHandlers.delete(requestId);
+          reject(new Error(e.error || 'Unknown error'));
+        }
       }
     });
   });

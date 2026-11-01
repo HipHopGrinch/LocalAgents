@@ -75,12 +75,41 @@ export const App: React.FC = () => {
 
   // Resizable Sidebar Widths
   const [explorerWidth, setExplorerWidth] = useState<number>(DEFAULT_SETTINGS.explorerWidth || 240);
-  const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth || 420);
+  const [chatWidth, setChatWidth] = useState<number>(DEFAULT_SETTINGS.chatWidth || 640);
+  const [agentControlWidth, setAgentControlWidth] = useState<number>(
+    DEFAULT_SETTINGS.agentControlWidth || 270
+  );
   const [resizingSide, setResizingSide] = useState<'explorer' | 'chat' | null>(null);
 
   // UI & Text Scaling (Discord-style zoom factor: 0.75 to 2.0)
   const [uiScale, setUiScale] = useState<number>(DEFAULT_SETTINGS.uiScale || 1.0);
   const [appVersion, setAppVersion] = useState<string>('');
+
+  // Forward renderer crashes into studio.log so "Submit logs to GitHub" includes them.
+  useEffect(() => {
+    const onError = (event: ErrorEvent) => {
+      void window.electronAPI?.writeLog?.(
+        'error',
+        `renderer: ${event.message}${event.filename ? ` @ ${event.filename}:${event.lineno}` : ''}`
+      );
+    };
+    const onRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason;
+      const text =
+        reason instanceof Error
+          ? reason.stack || reason.message
+          : typeof reason === 'string'
+            ? reason
+            : JSON.stringify(reason);
+      void window.electronAPI?.writeLog?.('error', `renderer unhandledRejection: ${text}`);
+    };
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onRejection);
+    };
+  }, []);
 
   // 1. Initial Load: Settings & Workspace
   useEffect(() => {
@@ -108,6 +137,7 @@ export const App: React.FC = () => {
       setSettings(merged);
       if (merged.explorerWidth) setExplorerWidth(merged.explorerWidth);
       if (merged.chatWidth) setChatWidth(merged.chatWidth);
+      if (merged.agentControlWidth) setAgentControlWidth(merged.agentControlWidth);
       if (merged.activeConversationId) setActiveConversationId(merged.activeConversationId);
       
       const initialScale = merged.uiScale || 1.0;
@@ -248,14 +278,14 @@ export const App: React.FC = () => {
         const nextWidth = Math.max(160, Math.min(540, e.clientX));
         setExplorerWidth(nextWidth);
       } else if (resizingSide === 'chat') {
-        const nextWidth = Math.max(300, Math.min(820, window.innerWidth - e.clientX));
+        const nextWidth = Math.max(480, Math.min(1100, window.innerWidth - e.clientX));
         setChatWidth(nextWidth);
       }
     };
 
     const handleMouseUp = () => {
       setResizingSide(null);
-      updateSettings({ explorerWidth, chatWidth });
+      updateSettings({ explorerWidth, chatWidth, agentControlWidth });
     };
 
     window.addEventListener('mousemove', handleMouseMove);
@@ -264,7 +294,7 @@ export const App: React.FC = () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [resizingSide, explorerWidth, chatWidth, updateSettings]);
+  }, [resizingSide, explorerWidth, chatWidth, agentControlWidth, updateSettings]);
 
   // 3. Cluster Polling — preserve user toggles/benchmarks; only merge live status fields
   const nodesRef = React.useRef(nodes);
@@ -485,7 +515,9 @@ export const App: React.FC = () => {
 
   /** Persist approved plan / agent switch without rewriting the full message list. */
   const handleConversationPatch = (
-    patch: Partial<Pick<ChatConversation, 'approvedPlan' | 'agentId'>>
+    patch: Partial<
+      Pick<ChatConversation, 'approvedPlan' | 'executionQueue' | 'plannerPlan' | 'agentId'>
+    >
   ) => {
     if (!activeConversationId) return;
     if (patch.agentId) setSelectedAgentId(patch.agentId);
@@ -819,6 +851,11 @@ export const App: React.FC = () => {
           workspacePath={workspacePath}
           workspaceFiles={files}
           width={chatWidth}
+          controlWidth={agentControlWidth}
+          onControlWidthChange={w => {
+            setAgentControlWidth(w);
+            updateSettings({ agentControlWidth: w });
+          }}
           onSelectNodeModel={handleSelectNodeModel}
           onApplyFileWrite={handleApplyFileWrite}
           onExecuteToolCommand={handleExecuteToolCommand}

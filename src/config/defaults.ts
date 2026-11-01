@@ -101,7 +101,7 @@ Bend over backwards to match the user's delivery goal (e.g. "open in browser" â†
     toolsEnabled: true,
     autoApproveWrites: false,
     autoApproveCommands: false,
-    systemPrompt: `You are a meticulous code reviewer. Look for correctness bugs, unhandled edge cases, security problems, race conditions and performance pitfalls. Provide actionable diffs using <edit_file> or concise findings with line numbers.`
+    systemPrompt: `You are a meticulous code reviewer. Look for correctness bugs, unhandled edge cases, security problems, race conditions and performance pitfalls. Report findings with file/line references when possible, then produce a concrete fix action plan. Do NOT edit or write project files yourself â€” end with a <review_plan> block the user can Send to Planner (then Coder).`
   },
   {
     id: 'docs',
@@ -131,7 +131,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   localTokensGenerated: 0,
   frontierTokensUsed: 0,
   explorerWidth: 240,
-  chatWidth: 420,
+  chatWidth: 640,
+  agentControlWidth: 270,
   uiScale: 1.0,
   recentWorkspaces: [],
   conversations: [],

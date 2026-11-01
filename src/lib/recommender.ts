@@ -1,5 +1,6 @@
-import { HardwareProfile, EndpointNode } from '../types';
+import { HardwareProfile, EndpointNode, OllamaModel } from '../types';
 import { CatalogModel, MODEL_CATALOG, TASKS, TaskId } from '../config/modelCatalog';
+import { resolveModelMaxContext } from './contextSize';
 
 export type FitKind = 'gpu' | 'partial' | 'cpu' | 'none';
 
@@ -128,3 +129,53 @@ export const FIT_LABEL: Record<FitKind, string> = {
   cpu: 'CPU only',
   none: "Won't fit"
 };
+
+/** Match an installed Ollama tag to a catalog row (exact tag, then family prefix). */
+export function findCatalogModel(modelName: string): CatalogModel | undefined {
+  const want = normTag(modelName);
+  const exact = MODEL_CATALOG.find(m => normTag(m.tag) === want);
+  if (exact) return exact;
+  const lower = modelName.toLowerCase();
+  return MODEL_CATALOG.find(m => {
+    const tag = m.tag.toLowerCase();
+    const base = tag.split(':')[0];
+    const nameBase = lower.split(':')[0];
+    return lower.startsWith(base + ':') || tag.startsWith(nameBase + ':') || lower === base;
+  });
+}
+
+/**
+ * VRAM estimate for an installed Ollama model at a chosen num_ctx.
+ * Uses on-disk size as weightsGB; catalog/heuristics for KV params.
+ */
+export function estimateInstalledModelFit(
+  model: Pick<OllamaModel, 'name' | 'size' | 'details'>,
+  hw: HardwareProfile,
+  ctx: number
+): FitEstimate {
+  const catalog = findCatalogModel(model.name);
+  const sizeGB =
+    model.size > 0 ? model.size / 1e9 : catalog?.sizeGB ?? 4;
+  const paramsB =
+    catalog?.paramsB ??
+    parseParams(model.details?.parameter_size) ??
+    parseParams(model.name) ??
+    7;
+  const contextMax =
+    resolveModelMaxContext(model.name, model) ??
+    catalog?.contextMax ??
+    Math.max(ctx, 8192);
+  const pick: Pick<CatalogModel, 'sizeGB' | 'paramsB' | 'activeB' | 'kvKB' | 'contextMax'> = {
+    sizeGB,
+    paramsB,
+    contextMax,
+    ...(catalog?.activeB != null ? { activeB: catalog.activeB } : {}),
+    ...(catalog?.kvKB != null ? { kvKB: catalog.kvKB } : {})
+  };
+  return estimateFit(pick, hw, ctx);
+}
+
+/** True when the estimate does not fit fully in usable GPU VRAM. */
+export function fitSpillsToSystemRam(kind: FitKind): boolean {
+  return kind === 'partial' || kind === 'cpu' || kind === 'none';
+}

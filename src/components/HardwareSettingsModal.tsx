@@ -10,18 +10,21 @@ import {
   FolderOpen,
   Download,
   Upload,
-  Lock
+  Lock,
+  Bug,
+  ExternalLink
 } from 'lucide-react';
 import { EndpointNode, NodeConfig, HardwareProfile, ModelMeta, NodeRole } from '../types';
 import { GPU_PRESETS, RAM_PRESETS } from '../config/defaults';
 import { TaskId } from '../config/modelCatalog';
 import { pullModel } from '../lib/ollamaClient';
 import {
+  ALL_NODE_ROLES,
+  assignAllowedRoles,
   assignDevNode,
-  assignPreferredRole,
   findNodeHoldingDev,
-  findNodeHoldingRole,
   isEmbeddingModelName,
+  isRoleAuto,
   normalizeClusterNodes
 } from '../lib/tools';
 import { modelSupportsThinking, normalizeThinkingInfo } from '../lib/thinking';
@@ -65,6 +68,8 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
   const [settingsFilePath, setSettingsFilePath] = useState('');
   const [logsFilePath, setLogsFilePath] = useState('');
   const [logCopyNote, setLogCopyNote] = useState('');
+  const [bugReportNote, setBugReportNote] = useState('');
+  const [bugReportBusy, setBugReportBusy] = useState(false);
   
   // Benchmark state
   const [benchmarkingModel, setBenchmarkingModel] = useState<string | null>(null);
@@ -212,9 +217,26 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(updated);
   };
 
-  const handleUpdatePreferredRole = (value: '' | NodeRole) => {
+  const handleSetRoleAuto = (auto: boolean) => {
     if (!currentNode) return;
-    onUpdateNodes(assignPreferredRole(nodes, currentNode.id, value));
+    if (auto) {
+      onUpdateNodes(assignAllowedRoles(nodes, currentNode.id, null));
+      return;
+    }
+    // Leaving Auto: start with all roles allowed so the node stays usable until trimmed.
+    onUpdateNodes(assignAllowedRoles(nodes, currentNode.id, [...ALL_NODE_ROLES]));
+  };
+
+  const handleToggleAllowedRole = (role: NodeRole, checked: boolean) => {
+    if (!currentNode || isRoleAuto(currentNode)) return;
+    const current = currentNode.roles || [];
+    const next = checked
+      ? [...current.filter(r => r !== role), role]
+      : current.filter(r => r !== role);
+    // Unchecking the last role returns to Auto.
+    onUpdateNodes(
+      assignAllowedRoles(nodes, currentNode.id, next.length ? next : null)
+    );
   };
 
   const handleUpdateDevNode = (enabled: boolean) => {
@@ -222,12 +244,11 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
     onUpdateNodes(assignDevNode(nodes, currentNode.id, enabled));
   };
 
-  const preferredRoleOptions: { value: '' | NodeRole; label: string }[] = [
-    { value: '', label: 'Auto — soft name/id preference, local-first' },
-    { value: 'coder', label: 'Coder — force for coding / Auto-Node coder picks' },
-    { value: 'planner', label: 'Planner — force for Planner persona & Swarm Pass-1' },
-    { value: 'reviewer', label: 'Reviewer — force for reviewer persona & review tasks' },
-    { value: 'docs', label: 'Docs — force for docs persona & README/test tasks' }
+  const allowedRoleOptions: { value: NodeRole; label: string; hint: string }[] = [
+    { value: 'coder', label: 'Coder', hint: 'coding / Auto-Node coder picks' },
+    { value: 'planner', label: 'Planner', hint: 'Planner persona & Swarm Pass-1' },
+    { value: 'reviewer', label: 'Reviewer', hint: 'reviewer persona & review tasks' },
+    { value: 'docs', label: 'Docs', hint: 'docs persona & README/test tasks' }
   ];
 
   const handleUpdateFreeTier = (enabled: boolean, dailyCap?: number) => {
@@ -850,38 +871,64 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                         />
                       </div>
                       <div className="col-span-2">
-                        <label className="text-[11px] text-zinc-400 font-medium">Preferred Role</label>
-                        <select
-                          value={currentNode.roles?.[0] || ''}
-                          onChange={(e) =>
-                            handleUpdatePreferredRole((e.target.value || '') as '' | NodeRole)
-                          }
-                          className="w-full mt-1 bg-[#1a1a20] border border-[#2a2a36] text-zinc-200 rounded px-2.5 py-1.5 outline-none font-sans"
-                        >
-                          {preferredRoleOptions.map(opt => {
-                            if (!opt.value) {
+                        <label className="text-[11px] text-zinc-400 font-medium">Allowed Roles</label>
+                        <div className="mt-1.5 space-y-1.5 rounded border border-[#2a2a36] bg-[#1a1a20] px-2.5 py-2">
+                          <label className="flex items-start gap-2 text-[11px] text-zinc-200 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={isRoleAuto(currentNode)}
+                              onChange={(e) => handleSetRoleAuto(e.target.checked)}
+                              className="mt-0.5 accent-emerald-500"
+                            />
+                            <span>
+                              <span className="font-medium">Auto</span>
+                              <span className="text-zinc-500">
+                                {' '}
+                                — all roles; soft name/id preference, local-first
+                              </span>
+                            </span>
+                          </label>
+                          <div
+                            className={`grid grid-cols-2 gap-x-3 gap-y-1 pl-0.5 ${
+                              isRoleAuto(currentNode) ? 'opacity-45 pointer-events-none' : ''
+                            }`}
+                          >
+                            {allowedRoleOptions.map(opt => {
+                              // Auto: show all checked + greyed (every role allowed).
+                              const checked =
+                                isRoleAuto(currentNode) ||
+                                (currentNode.roles?.includes(opt.value) ?? false);
                               return (
-                                <option key="auto" value="">
-                                  {opt.label}
-                                </option>
+                                <label
+                                  key={opt.value}
+                                  className={`flex items-start gap-2 text-[11px] ${
+                                    isRoleAuto(currentNode)
+                                      ? 'text-zinc-500 cursor-not-allowed'
+                                      : 'text-zinc-200 cursor-pointer'
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    disabled={isRoleAuto(currentNode)}
+                                    onChange={(e) =>
+                                      handleToggleAllowedRole(opt.value, e.target.checked)
+                                    }
+                                    className="mt-0.5 accent-emerald-500 disabled:opacity-50"
+                                  />
+                                  <span>
+                                    <span className="font-medium">{opt.label}</span>
+                                    <span className="text-zinc-500"> — {opt.hint}</span>
+                                  </span>
+                                </label>
                               );
-                            }
-                            const holder = findNodeHoldingRole(nodes, opt.value, currentNode.id);
-                            const taken = !!holder;
-                            const holderLabel = holder?.name || holder?.id || 'another node';
-                            return (
-                              <option key={opt.value} value={opt.value} disabled={taken}>
-                                {taken
-                                  ? `${opt.value[0].toUpperCase()}${opt.value.slice(1)} (used by ${holderLabel})`
-                                  : opt.label}
-                              </option>
-                            );
-                          })}
-                        </select>
+                            })}
+                          </div>
+                        </div>
                         <p className="text-[10px] text-zinc-500 mt-1">
-                          Auto can be on any number of nodes. Each of Coder / Planner / Reviewer / Docs
-                          may be assigned to at most one node. An explicit role forces that job
-                          (including Frontier); if nobody is tagged, routing falls back to Auto / local-first.
+                          Auto allows every role. Uncheck Auto to limit this node to selected roles —
+                          multiple nodes may share the same role. Tagged nodes are preferred for those
+                          jobs (including Frontier); otherwise routing falls back to Auto / local-first.
                         </p>
                       </div>
                       <div className="col-span-2">
@@ -1333,6 +1380,66 @@ export const HardwareSettingsModal: React.FC<HardwareSettingsModalProps> = ({
                   <span>Open logs folder</span>
                 </button>
                 {logCopyNote && <span className="text-[10px] text-emerald-300">{logCopyNote}</span>}
+              </div>
+
+              <div className="mt-3 pt-3 border-t border-[#272730] space-y-2">
+                <h4 className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
+                  <Bug className="w-3.5 h-3.5 text-rose-400" />
+                  Report error on GitHub
+                </h4>
+                <p className="text-[11px] text-zinc-500 leading-relaxed">
+                  Opens a new GitHub issue with redacted Studio logs (API keys stripped). Sign in to GitHub in your browser to submit. Attach the saved{' '}
+                  <code className="text-zinc-400">bug-report-*.txt</code> from the logs folder if needed.
+                </p>
+                <textarea
+                  value={bugReportNote}
+                  onChange={e => setBugReportNote(e.target.value)}
+                  rows={3}
+                  placeholder="What went wrong? (optional but helpful)"
+                  className="w-full text-xs bg-[#0e0e11] border border-[#2a2a34] rounded-lg px-2.5 py-2 text-zinc-200 placeholder:text-zinc-600 resize-y min-h-[64px]"
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={bugReportBusy}
+                    onClick={async () => {
+                      if (!window.electronAPI?.reportLogsToGitHub) {
+                        setLogCopyNote('Update required for GitHub report');
+                        return;
+                      }
+                      setBugReportBusy(true);
+                      setLogCopyNote('');
+                      try {
+                        const res = await window.electronAPI.reportLogsToGitHub({
+                          note: bugReportNote.trim()
+                        });
+                        if (res?.error) {
+                          setLogCopyNote(res.error);
+                          return;
+                        }
+                        if (res?.logText) {
+                          try {
+                            await navigator.clipboard.writeText(res.logText);
+                          } catch {
+                            /* ignore */
+                          }
+                        }
+                        setLogCopyNote(
+                          res?.reportName
+                            ? `Issue draft opened · ${res.reportName} saved & copied`
+                            : 'Issue draft opened'
+                        );
+                        setTimeout(() => setLogCopyNote(''), 4000);
+                      } finally {
+                        setBugReportBusy(false);
+                      }
+                    }}
+                    className="inline-flex items-center space-x-1.5 px-2.5 py-1.5 text-[11px] font-medium text-white bg-rose-600/90 hover:bg-rose-500 disabled:opacity-50 border border-rose-500/40 rounded transition"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>{bugReportBusy ? 'Opening…' : 'Submit logs to GitHub'}</span>
+                  </button>
+                </div>
               </div>
             </div>
 

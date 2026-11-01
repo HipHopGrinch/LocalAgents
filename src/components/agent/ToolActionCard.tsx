@@ -11,6 +11,8 @@ export interface ToolActionCardProps {
   onOpenFileInEditor: (filePath: string) => void;
   onRunSingleTool?: (tool: ToolCall) => Promise<ToolCall>;
   onDiffFailed?: () => void;
+  /** Hide Apply / Run — Reviewer never applies code changes */
+  hideApply?: boolean;
 }
 
 export const ToolActionCard: React.FC<ToolActionCardProps> = ({
@@ -20,7 +22,8 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
   onExecuteToolCommand,
   onOpenFileInEditor,
   onRunSingleTool,
-  onDiffFailed
+  onDiffFailed,
+  hideApply
 }) => {
   const [applied, setApplied] = useState(tool.status === 'done');
   const [loading, setLoading] = useState(false);
@@ -65,24 +68,31 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
         </div>
 
         <div className="flex items-center space-x-2 pt-1">
-          <button
-            onClick={handleApply}
-            disabled={applied || loading}
-            className={`flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-sans font-medium transition ${
-              applied
-                ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
-                : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-            }`}
-          >
-            {applied ? (
-              <>
-                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                <span>Applied</span>
-              </>
-            ) : (
-              <span>Apply to Workspace</span>
-            )}
-          </button>
+          {!hideApply && (
+            <button
+              onClick={handleApply}
+              disabled={applied || loading}
+              className={`flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-sans font-medium transition ${
+                applied
+                  ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+              }`}
+            >
+              {applied ? (
+                <>
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  <span>Applied</span>
+                </>
+              ) : (
+                <span>Apply to Workspace</span>
+              )}
+            </button>
+          )}
+          {hideApply && (
+            <span className="text-[10px] text-zinc-500 font-sans">
+              Reviewer cannot apply — Send to Planner
+            </span>
+          )}
 
           <button
             onClick={() => onOpenFileInEditor(filePath)}
@@ -144,24 +154,31 @@ export const ToolActionCard: React.FC<ToolActionCardProps> = ({
         </div>
 
         <div className="flex items-center space-x-2 pt-1">
-          <button
-            onClick={handleApplyEdit}
-            disabled={applied || loading}
-            className={`flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-sans font-medium transition ${
-              applied
-                ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
-                : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-            }`}
-          >
-            {applied ? (
-              <>
-                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                <span>Diff Applied</span>
-              </>
-            ) : (
-              <span>Apply Diff to File</span>
-            )}
-          </button>
+          {!hideApply && (
+            <button
+              onClick={handleApplyEdit}
+              disabled={applied || loading}
+              className={`flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-sans font-medium transition ${
+                applied
+                  ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+              }`}
+            >
+              {applied ? (
+                <>
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  <span>Diff Applied</span>
+                </>
+              ) : (
+                <span>Apply Diff to File</span>
+              )}
+            </button>
+          )}
+          {hideApply && (
+            <span className="text-[10px] text-zinc-500 font-sans">
+              Reviewer cannot apply — Send to Planner
+            </span>
+          )}
 
           <button
             onClick={() => onOpenFileInEditor(filePath)}

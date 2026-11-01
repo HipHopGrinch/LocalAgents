@@ -235,6 +235,94 @@ ipcMain.handle('logs:openFolder', async () => {
   return err ? { error: err } : { success: true, path: dir };
 });
 
+const GITHUB_ISSUES_NEW =
+  'https://github.com/HipHopGrinch/LocalAgents-Studio/issues/new';
+
+/**
+ * Build a redacted bug-report file, copy-friendly log text, and open a prefilled
+ * GitHub issue in the browser (no API token in the app — user submits while signed in).
+ */
+ipcMain.handle('logs:reportToGitHub', async (_e, opts = {}) => {
+  try {
+    const version = app.getVersion();
+    const note = String(opts?.note || '').trim().slice(0, 2000);
+    const title = String(opts?.title || `Studio error report (v${version})`)
+      .trim()
+      .slice(0, 120);
+    const tail = redactLog(await readLogTail());
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const reportName = `bug-report-${stamp}.txt`;
+    const reportPath = path.join(path.dirname(logFilePath()), reportName);
+    const reportBody = [
+      `LocalAgents Studio bug report`,
+      `Version: ${version}`,
+      `Electron: ${process.versions.electron || '?'}`,
+      `Chrome: ${process.versions.chrome || '?'}`,
+      `Node: ${process.versions.node || '?'}`,
+      `OS: ${process.platform} ${os.release()} (${process.arch})`,
+      `When: ${new Date().toISOString()}`,
+      '',
+      '## User notes',
+      note || '(none)',
+      '',
+      '## Recent logs (redacted)',
+      tail || '(empty)'
+    ].join('\n');
+    await fsp.mkdir(path.dirname(reportPath), { recursive: true });
+    await fsp.writeFile(reportPath, reportBody, 'utf-8');
+
+    // GitHub new-issue URLs truncate around ~8KB — keep a short body and ask to attach the file.
+    const logSnippet = (tail || '').slice(-2800);
+    let issueBody = [
+      '## What happened',
+      note || '_Describe the steps that led to the error._',
+      '',
+      '## Environment',
+      `- App version: \`${version}\``,
+      `- OS: \`${process.platform} ${os.release()} (${process.arch})\``,
+      `- Electron: \`${process.versions.electron || '?'}\``,
+      '',
+      '## Logs',
+      `A redacted report was saved on the reporter's PC as \`${reportName}\` (Hardware Settings → Open logs folder). Please paste or attach it if the snippet below is incomplete.`,
+      '',
+      '```text',
+      logSnippet || '(no log lines yet)',
+      '```'
+    ].join('\n');
+
+    let url = `${GITHUB_ISSUES_NEW}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(issueBody)}`;
+    // Stay under common URL length limits
+    if (url.length > 7000) {
+      issueBody = [
+        '## What happened',
+        note || '_Describe the steps that led to the error._',
+        '',
+        '## Environment',
+        `- App version: \`${version}\``,
+        `- OS: \`${process.platform} ${os.release()} (${process.arch})\``,
+        '',
+        '## Logs',
+        `Attach \`${reportName}\` from the Studio logs folder (full redacted report). Snippet omitted because it was too long for the issue URL.`
+      ].join('\n');
+      url = `${GITHUB_ISSUES_NEW}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(issueBody)}`;
+    }
+
+    await shell.openExternal(url);
+    appendLog('info', `opened GitHub issue draft; report=${reportName}`);
+    return {
+      success: true,
+      url,
+      reportPath,
+      reportName,
+      logText: reportBody,
+      version
+    };
+  } catch (err) {
+    appendLog('error', `logs:reportToGitHub: ${err?.message || err}`);
+    return { error: err.message || String(err) };
+  }
+});
+
 appendLog('info', `studio start ${app.getVersion()}`);
 
 // ==========================================

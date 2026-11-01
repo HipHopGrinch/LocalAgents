@@ -9,12 +9,13 @@ import {
 import {
   getEnabledModelsForNode,
   getPreferredModelForNode,
-  getPreferredRole,
   isFrontierNode,
+  nodeAllowsRole,
   nodeHasExplicitRole,
   pickBestModelForComplexity,
   type ConductorFileJob
 } from './tools';
+import type { NodeRole } from '../types';
 
 export type SwarmComplexity = 'high' | 'medium' | 'low';
 export type SwarmPreferredRole = '@coder' | '@docs' | '@reviewer';
@@ -858,16 +859,32 @@ function nodeTokPerSec(n: EndpointNode, model: string): number {
   return Math.max(Math.round((n.hardware?.gpuBandwidthGBs || 300) / 6), 5);
 }
 
+function preferredToNodeRole(preferred: SwarmPreferredRole): NodeRole {
+  if (preferred === '@docs') return 'docs';
+  if (preferred === '@reviewer') return 'reviewer';
+  return 'coder';
+}
+
 function roleMatches(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
-  const role = getPreferredRole(n);
-  if (preferred === '@coder') return role === 'coder' || role === 'planner';
-  if (preferred === '@docs') return role === 'docs';
-  if (preferred === '@reviewer') return role === 'reviewer';
+  // Explicit allow-list only (Auto does not get a role bonus).
+  if (preferred === '@coder') {
+    return nodeHasExplicitRole(n, 'coder') || nodeHasExplicitRole(n, 'planner');
+  }
+  if (preferred === '@docs') return nodeHasExplicitRole(n, 'docs');
+  if (preferred === '@reviewer') return nodeHasExplicitRole(n, 'reviewer');
   return false;
 }
 
+/** Hard eligibility: Auto or allow-list includes the swarm preferred role. */
+function nodeAllowsPreferred(n: EndpointNode, preferred: SwarmPreferredRole): boolean {
+  if (preferred === '@coder') {
+    return nodeAllowsRole(n, 'coder') || nodeAllowsRole(n, 'planner');
+  }
+  return nodeAllowsRole(n, preferredToNodeRole(preferred));
+}
+
 /**
- * Lead Architect (Pass-1): Preferred Role = Planner wins (frontier allowed).
+ * Lead Architect (Pass-1): Allowed Roles includes Planner wins (frontier allowed).
  * Otherwise high-VRAM local (≥16GB), else best local, else frontier.
  */
 export function findLeadArchitect(
@@ -952,10 +969,12 @@ export function assignSwarmTasksToCluster(
   const nodeLoad = new Map<string, number>(activeNodes.map(n => [n.id, 0]));
 
   return sortedTasks.map(task => {
-    let bestNode = activeNodes[0];
+    const eligible = activeNodes.filter(n => nodeAllowsPreferred(n, task.preferredRole));
+    const candidates = eligible.length > 0 ? eligible : activeNodes;
+    let bestNode = candidates[0];
     let bestScore = Infinity;
 
-    for (const node of activeNodes) {
+    for (const node of candidates) {
       const model = pickBestModelForComplexity(node, toConductorComplexity(task.complexity));
       const speed = nodeTokPerSec(node, model);
       const currentLoad = nodeLoad.get(node.id) ?? 0;
