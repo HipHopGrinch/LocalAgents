@@ -36,8 +36,14 @@ $notes = @"
 ``latest.yml`` is included so electron-updater can check this release.
 "@
 
+# gh writes "release not found" to stderr — don't treat that as a terminating error.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 gh release view $tag 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) {
+$exists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+
+if ($exists) {
   Write-Host "Release $tag already exists — uploading/replacing assets..."
   gh release upload $tag $setup $blockmap $portable $latest --clobber
 } else {
